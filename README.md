@@ -1,12 +1,36 @@
 # Rembr
 
-Durable memory and context infrastructure for AI agents.
+<p align="center">
+  <a href="https://rembr.ai">
+    <img src="https://rembr.ai/logo-new.png" alt="Rembr logo" width="128" />
+  </a>
+</p>
+
+<p align="center">
+  <strong>Durable memory and context infrastructure for AI agents.</strong>
+</p>
+
+<p align="center">
+  <a href="https://rembr.ai">Website</a>
+  ·
+  <a href="https://rembr.ai/docs">Docs</a>
+  ·
+  <a href="https://rembr.ai/portable-memory">Portable Memory</a>
+  ·
+  <a href="https://rembr.ai/agent-memory">Agent Debugging</a>
+  ·
+  <a href="https://rembr.ai/storage-vs-intelligence">Intelligence vs Storage</a>
+</p>
+
+![Rembr - Memory Infrastructure for AI Agents](https://rembr.ai/og-image.png)
 
 Rembr is an open-source memory layer for agents that need more than chat history and vector search. It gives agents a place to store what they learn, retrieve the right context later, hand off focused context to other agents, track how facts change over time, reason over relationships, and keep long-running work resumable.
 
 Most agent memory systems answer: "What past text is semantically similar to this prompt?"
 
 Rembr is built for the harder production question: "What should this agent know right now, why does it believe it, what changed, and what context should another agent receive next?"
+
+The hosted Rembr product is built around a simple idea: one memory layer should follow you across Claude, Cursor, Windsurf, local models, and any MCP-compatible tool. The public site frames this as portable memory for agents: tell one tool once, and the rest of your workflow can remember.
 
 ## Why Agents Need Rembr
 
@@ -39,6 +63,8 @@ Rembr turns agent memory into durable infrastructure:
 Rembr is not just a vector database, and it is not just a chatbot memory store.
 
 It is designed as an **agentic context layer**: a memory system that agents can actively use to construct, validate, version, and transfer context.
+
+The product pages on [rembr.ai](https://rembr.ai) describe this distinction as the gap between storage and intelligence. Storage can hold text. Rembr helps agents decide which memories matter, when they mattered, how they connect, and what should be handed to the next agent.
 
 ### Agent Handoff Is A First-Class Primitive
 
@@ -103,6 +129,17 @@ References:
 - `docs` - Public guides and reference material for using Rembr safely.
 
 Hosted SaaS infrastructure, production manifests, internal runbooks, private operational docs, billing/admin dashboards, and tenant data are intentionally excluded from this public repository.
+
+## Hosted Rembr
+
+This repository is the open-source core. The hosted service at [rembr.ai](https://rembr.ai) adds managed infrastructure, dashboard access, hosted API keys, team plans, higher usage limits, analytics, and operational support.
+
+Useful product pages:
+
+- [Portable Memory](https://rembr.ai/portable-memory) - how Rembr keeps memory continuous across MCP-compatible tools.
+- [Agent Debugging](https://rembr.ai/agent-memory) - why temporal memory and causal traces matter for understanding agent decisions.
+- [Intelligence vs Storage](https://rembr.ai/storage-vs-intelligence) - why memory systems need more than raw storage and vector search.
+- [Documentation](https://rembr.ai/docs) - setup and hosted product docs.
 
 ## Core Capabilities
 
