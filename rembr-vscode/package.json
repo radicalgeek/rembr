@@ -1,0 +1,63 @@
+{
+  "name": "@rembr/vscode",
+  "version": "2.0.0",
+  "description": "VS Code RLM integration - Recursive Language Model patterns with GitHub Copilot agents, skills, and semantic memory",
+  "main": "setup.js",
+  "bin": {
+    "rembr-vscode": "./cli.js"
+  },
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  },
+  "files": [
+    "cli.js",
+    "postinstall.js",
+    "setup.js",
+    "templates/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "vscode",
+    "github-copilot",
+    "mcp",
+    "model-context-protocol",
+    "ai",
+    "memory",
+    "rlm",
+    "recursive-language-model",
+    "agents",
+    "semantic",
+    "rembr",
+    "recursive-learning-machine",
+    "agent",
+    "copilot",
+    "cursor",
+    "windsurf",
+    "claude",
+    "aider",
+    "semantic-memory",
+    "ai-memory",
+    "vector-database",
+    "embeddings",
+    "ai-agent",
+    "multi-agent",
+    "pgvector",
+    "context-management"
+  ],
+  "author": "REMBR <hello@rembr.ai>",
+  "license": "MIT",
+  "homepage": "https://rembr.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/radicalgeek/rembr.git",
+    "directory": "rembr-vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/radicalgeek/rembr/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

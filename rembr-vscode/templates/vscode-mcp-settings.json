@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "rembr": {
+      "command": "node",
+      "args": [
+        "/path/to/rembr-mcp/build/index-http.js"
+      ],
+      "env": {
+        "REMBR_API_URL": "https://api.rembr.ai",
+        "REMBR_API_KEY": "your-api-key-here"
+      }
+    }
+  }
+}

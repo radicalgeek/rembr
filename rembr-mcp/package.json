@@ -1,0 +1,68 @@
+{
+  "name": "@rembr/mcp-server",
+  "version": "1.12.0",
+  "description": "Context infrastructure for Recursive Language Models - Production-ready persistence layer for RLM agents",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index-http.js",
+    "dev": "tsc && node dist/index-http.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:ui": "vitest --ui",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:headless": "xvfb-run --auto-servernum --server-args='-screen 0 1920x1080x24' playwright test",
+    "pretest:e2e": "node ../scripts/check-playwright-version.js"
+  },
+  "keywords": [
+    "mcp",
+    "rlm",
+    "recursive-language-model",
+    "context",
+    "memory",
+    "ai-agents",
+    "semantic-search"
+  ],
+  "author": "Mark @ radicalgeek",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/radicalgeek/rembr.git",
+    "directory": "rembr-mcp"
+  },
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.985.0",
+    "@aws-sdk/s3-request-presigner": "^3.985.0",
+    "@mcp-ui/server": "^6.1.0",
+    "@modelcontextprotocol/ext-apps": "^1.0.1",
+    "@modelcontextprotocol/sdk": "^1.25.3",
+    "@types/express": "^4.17.21",
+    "@types/pg": "^8.11.10",
+    "express": "^4.18.2",
+    "ioredis": "^5.9.2",
+    "jsonwebtoken": "^9.0.2",
+    "ollama": "^0.5.18",
+    "pg": "^8.17.2",
+    "prom-client": "^15.1.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.58.2",
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/node": "^24.2.0",
+    "@vitest/coverage-v8": "^4.1.6",
+    "@vitest/ui": "^4.1.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.6"
+  },
+  "overrides": {
+    "fast-xml-parser": ">=5.3.5"
+  },
+  "engines": {
+    "node": ">=20.0.0 <25.0.0",
+    "npm": ">=9.0.0"
+  }
+}

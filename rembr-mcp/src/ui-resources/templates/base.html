@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{title}} - Rembr</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --rembr-primary: #6366f1; /* Indigo */
+            --rembr-primary-dark: #4f46e5;
+            --rembr-secondary: #8b5cf6; /* Purple */
+            --rembr-accent: #ec4899; /* Pink */
+            --rembr-bg: #0f172a; /* Slate-900 */
+            --rembr-bg-secondary: #1e293b; /* Slate-800 */
+            --rembr-text: #f8fafc; /* Slate-50 */
+            --rembr-text-secondary: #cbd5e1; /* Slate-300 */
+            --rembr-border: #334155; /* Slate-700 */
+            --rembr-success: #10b981;
+            --rembr-warning: #f59e0b;
+            --rembr-error: #ef4444;
+            --rembr-info: #3b82f6;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: var(--rembr-bg);
+            color: var(--rembr-text);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        .rembr-header {
+            background: linear-gradient(135deg, var(--rembr-primary) 0%, var(--rembr-secondary) 100%);
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid var(--rembr-border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .rembr-logo {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .rembr-logo-icon {
+            width: 32px;
+            height: 32px;
+            background: var(--rembr-bg);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 18px;
+            color: var(--rembr-primary);
+        }
+
+        .rembr-logo-text {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--rembr-text);
+        }
+
+        .rembr-subtitle {
+            font-size: 0.875rem;
+            color: var(--rembr-text-secondary);
+            opacity: 0.9;
+        }
+
+        .rembr-container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        .rembr-card {
+            background: var(--rembr-bg-secondary);
+            border: 1px solid var(--rembr-border);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .rembr-card-title {
+            font-size: 1.125rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            color: var(--rembr-text);
+        }
+
+        .rembr-button {
+            background: var(--rembr-primary);
+            color: var(--rembr-text);
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.875rem;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+
+        .rembr-button:hover {
+            background: var(--rembr-primary-dark);
+        }
+
+        .rembr-button-secondary {
+            background: var(--rembr-bg-secondary);
+            border: 1px solid var(--rembr-border);
+        }
+
+        .rembr-button-secondary:hover {
+            background: var(--rembr-border);
+        }
+
+        .rembr-badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+
+        .rembr-badge-primary {
+            background: var(--rembr-primary);
+            color: var(--rembr-text);
+        }
+
+        .rembr-badge-success {
+            background: var(--rembr-success);
+            color: var(--rembr-text);
+        }
+
+        .rembr-badge-warning {
+            background: var(--rembr-warning);
+            color: var(--rembr-bg);
+        }
+
+        .rembr-badge-error {
+            background: var(--rembr-error);
+            color: var(--rembr-text);
+        }
+
+        .rembr-loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid var(--rembr-border);
+            border-top-color: var(--rembr-primary);
+            border-radius: 50%;
+            animation: rembr-spin 0.8s linear infinite;
+        }
+
+        @keyframes rembr-spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .rembr-footer {
+            margin-top: 3rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid var(--rembr-border);
+            text-align: center;
+            font-size: 0.875rem;
+            color: var(--rembr-text-secondary);
+        }
+
+        /* Custom content area */
+        #rembr-content {
+            min-height: 400px;
+        }
+    </style>
+    {{extra_head}}
+</head>
+<body>
+    <div class="rembr-header">
+        <div class="rembr-logo">
+            <div class="rembr-logo-icon">🧠</div>
+            <div>
+                <div class="rembr-logo-text">Rembr</div>
+                <div class="rembr-subtitle">{{subtitle}}</div>
+            </div>
+        </div>
+        <div class="rembr-header-actions">
+            {{header_actions}}
+        </div>
+    </div>
+
+    <div class="rembr-container">
+        <div id="rembr-content">
+            {{content}}
+        </div>
+
+        <div class="rembr-footer">
+            <p>Powered by <strong>Rembr</strong> - Memory Infrastructure for Recursive Language Models</p>
+            <p style="margin-top: 0.5rem; font-size: 0.75rem;">
+                <a href="https://rembr.ai" target="_blank" style="color: var(--rembr-primary); text-decoration: none;">rembr.ai</a> | 
+                <a href="https://docs.rembr.ai" target="_blank" style="color: var(--rembr-primary); text-decoration: none;">Documentation</a>
+            </p>
+        </div>
+    </div>
+
+    {{extra_scripts}}
+</body>
+</html>

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+build/
+.next/
+coverage/
+test-results.xml
+**/test-results.xml
+.env
+.env.*
+!.env.example
+*.local
+*.log
+.DS_Store
