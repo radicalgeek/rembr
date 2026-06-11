@@ -1,5 +1,6 @@
 {
-  "version": 1,
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "rembr",
   "owner": {
     "name": "Rembr",
     "url": "https://rembr.ai"
@@ -9,10 +10,7 @@
     {
       "name": "rembr",
       "description": "Persistent cross-session memory for Claude Code backed by Rembr: bundled MCP server, session-start recall injection, trigger-phrase auto-capture, and /rembr:remember + /rembr:recall skills.",
-      "source": {
-        "type": "local",
-        "path": "./claude-code-rembr"
-      }
+      "source": "./claude-code-rembr"
     }
   ]
 }
