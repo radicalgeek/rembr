@@ -2,8 +2,8 @@
  * Unified Authentication Middleware (REM-248)
  *
  * Problem:
- *   rembr supports three independent auth mechanisms — OAuth access tokens,
- *   API keys, and MCP session cookies — each with its own validation path in
+ *   rembr supports multiple independent auth mechanisms — OAuth access tokens,
+ *   API keys, and JWTs — each with its own validation path in
  *   `index-http.ts#authenticate()`.  There is no shared enforcement layer, so
  *   security policies (credential precedence, fail-fast on invalid credentials,
  *   audit-method tagging, consistent error format) must be duplicated or are
@@ -11,13 +11,16 @@
  *
  * Solution:
  *   `authenticateRequest()` is a single entry-point that:
- *     1. Detects which credential is present (precedence: API key > OAuth Bearer > Session).
+ *     1. Detects which credential is present (precedence: API key > OAuth Bearer > JWT).
  *     2. Validates it with the appropriate verifier.
  *     3. Returns a typed `AuthorizationContext` (from REM-253) so callers always
  *        know which mechanism succeeded and can make policy decisions downstream.
  *     4. Enforces fail-fast on ambiguous credentials (e.g. API key present but invalid
- *        → reject immediately, do not fall through to session auth).
+ *        → reject immediately, do not fall through to other mechanisms).
  *     5. Emits structured audit events via the `onAuditEvent` callback.
+ *
+ * MCP 2026-07-28 (SEP-2575): the former tier-4 session fallback (mcp-session-id
+ * header → mcp_sessions table) was removed along with protocol sessions.
  *
  * Usage (drop-in for the existing `authenticate()` private method):
  *
@@ -103,13 +106,11 @@ function emit(
  *   1. API key (`x-api-key` header)  — always wins if the header is present
  *   2. OAuth Bearer token            — `Authorization: Bearer mcp_oauth_*`
  *   3. JWT Bearer token              — `Authorization: Bearer <jwt>`
- *   4. MCP session cookie            — `mcp-session-id` header
  *
  * Fail-fast rules:
  *   - If an `x-api-key` header is present but the key is invalid → 401, no fallthrough.
  *   - If an `Authorization` header is present but cannot be parsed or verified → 401,
- *     no fallthrough to session auth.
- *   - Only fall through to session auth when no explicit credential header is present.
+ *     no fallthrough.
  */
 export async function authenticateRequest(
   pool: Pool,
@@ -231,59 +232,10 @@ export async function authenticateRequest(
     };
   }
 
-  // ── 3. MCP session ────────────────────────────────────────
-  const sessionId = req.headers['mcp-session-id'] as string | undefined;
-  if (sessionId) {
-    const sessionResult = await pool.query<{
-      tenant_id: string;
-      project_id: string | null;
-      user_id: string | null;
-    }>(
-      `SELECT tenant_id, project_id, user_id
-       FROM mcp_sessions
-       WHERE session_id = $1
-         AND expires_at > NOW()`,
-      [sessionId],
-    );
-
-    const row = sessionResult.rows[0];
-    if (!row) {
-      emit(options, {
-        method: 'session',
-        success: false,
-        sessionId,
-        error: 'Session not found or expired',
-        timestamp: new Date(),
-      });
-      return {
-        success: false,
-        error: 'Session not found or expired',
-        attemptedMethod: 'session',
-        statusCode: 401,
-      };
-    }
-
-    emit(options, {
-      method: 'session',
-      success: true,
-      tenantId: row.tenant_id,
-      userId: row.user_id ?? undefined,
-      sessionId,
-      timestamp: new Date(),
-    });
-
-    return {
-      success: true,
-      tenantId: row.tenant_id,
-      projectId: row.project_id ?? undefined,
-      userId: row.user_id ?? undefined,
-      sessionId,
-      authMethod: 'session',
-      authenticatedAt: new Date(),
-    };
-  }
-
-  // ── 4. No credentials ─────────────────────────────────────
+  // ── 3. No credentials ─────────────────────────────────────
+  // MCP 2026-07-28 (SEP-2575): Mcp-Session-Id is removed from the protocol,
+  // so the former session-auth fallback (tier 4) no longer exists. Clients
+  // that relied on session cookies must migrate to API keys or OAuth.
   emit(options, {
     method: 'none',
     success: false,
@@ -295,8 +247,9 @@ export async function authenticateRequest(
     success: false,
     error:
       'No valid authentication credentials provided. ' +
-      'Use OAuth (Authorization: Bearer mcp_oauth_*), ' +
-      'API key (X-API-Key), or MCP session (mcp-session-id).',
+      'Use OAuth (Authorization: Bearer mcp_oauth_*) ' +
+      'or an API key (X-API-Key). Session-based authentication was removed ' +
+      'with MCP 2026-07-28.',
     statusCode: 401,
   };
 }

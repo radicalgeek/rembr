@@ -4,6 +4,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { Pool } from 'pg';
+import { createTestPool } from './test-utils/test-db.js';
 import { IterationTrackingService } from './iteration-tracking.js';
 
 const TEST_TENANT_ID = '550e8400-e29b-41d4-a716-446655440000';
@@ -14,9 +15,7 @@ let pool: Pool;
 let svc: IterationTrackingService;
 
 beforeEach(async () => {
-  pool = new Pool({
-    connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rembr_test',
-  });
+  pool = createTestPool('it_iteration_tracking');
   svc = new IterationTrackingService(pool);
 
   await pool.query(`

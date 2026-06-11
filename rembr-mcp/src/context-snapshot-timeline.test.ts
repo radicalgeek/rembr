@@ -26,9 +26,12 @@ function makeRow(overrides: Partial<{
   };
 }
 
-function makePool(rows: ReturnType<typeof makeRow>[]) {
+function makePool(rows: ReturnType<typeof makeRow>[], contextRows: ReturnType<typeof makeRow>[] = []) {
   return {
-    query: vi.fn().mockResolvedValue({ rows }),
+    query: vi.fn()
+      .mockResolvedValueOnce({ rows })
+      .mockResolvedValueOnce({ rows: contextRows })
+      .mockResolvedValue({ rows: [] }),
   } as any;
 }
 

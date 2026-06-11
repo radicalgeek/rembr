@@ -2,7 +2,7 @@
  * Task Handoff Service Tests (REM-73)
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import { Pool } from 'pg';
 import {
   createHandoff,
@@ -12,6 +12,14 @@ import {
   getHandoff,
   getTaskHandoffHistory,
 } from './task-handoff.js';
+import { createTestPool, ensureTenantsTable, applyMigrations } from './test-utils/test-db.js';
+
+beforeAll(async () => {
+  const bootstrapPool = createTestPool('it_task_handoff');
+  await ensureTenantsTable(bootstrapPool);
+  await applyMigrations(bootstrapPool, '012-task-handoff-schema.sql');
+  await bootstrapPool.end();
+});
 
 const TEST_TENANT_ID = '550e8400-e29b-41d4-a716-446655440000';
 const TEST_TASK_ID = 'task-123';
@@ -21,9 +29,7 @@ const AGENT_BOB = 'bob';
 let testPool: Pool;
 
 beforeEach(async () => {
-  testPool = new Pool({
-    connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rembr_test',
-  });
+  testPool = createTestPool('it_task_handoff');
 
   // Set tenant context
   await testPool.query(`SET app.current_tenant_id = '${TEST_TENANT_ID}'`);
@@ -295,7 +301,7 @@ describe('Task Handoff Service (REM-73)', () => {
     });
 
     it('should return null if handoff not found', async () => {
-      const retrieved = await getHandoff(testPool, TEST_TENANT_ID, 'nonexistent-id');
+      const retrieved = await getHandoff(testPool, TEST_TENANT_ID, '00000000-0000-0000-0000-000000000000');
 
       expect(retrieved).toBeNull();
     });

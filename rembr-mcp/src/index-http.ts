@@ -4,11 +4,11 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express, { Request, Response, NextFunction } from 'express';
 import { randomUUID } from 'node:crypto';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
-  Tool
+  Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import { MemoryDatabase } from './database.js';
 import { MemoryService, MEMORY_CATEGORIES } from './memory-service.js';
@@ -33,11 +33,10 @@ import { AnalyticsReportingService, type CustomReportConfig, type Granularity, t
 import { EnhancedSearchService, type AdvancedFilter, type ExportFormat as SearchExportFormat } from './enhanced-search.js';
 import { PIINLPEngine, type SensitivityLevel as NLPSensitivity, type RedactionMode as NLPRedactionMode } from './pii-nlp-engine.js';
 import { ContextSnapshotTimelineService } from './context-snapshot-timeline.js';
-import { OllamaEmbeddingProvider } from './ollama-provider.js';
+import { EmbeddingProvider, OllamaEmbeddingProvider, OpenAICompatibleEmbeddingProvider } from './ollama-provider.js';
 import { validateToolInput } from './schemas.js';
 import { AuthService, verifyApiKey, verifyOAuthToken, AuthResult } from './auth.js';
 import { getMetrics, trackHttpRequest, trackMemoryOperation, trackAuthentication, trackMcpToolCall, trackMcpToolError, trackSearchOperation, updateEmbeddingBacklog } from './metrics.js';
-import { RedisSessionStore, SessionData } from './session-store.js';
 import { logger } from './logger.js';
 import { OptimizationScheduler } from './optimization/scheduler.js';
 import { DeduplicationService } from './optimization/deduplication-service.js';
@@ -59,6 +58,9 @@ import { compressContent, previewCompression } from './smart-compression.js';
 import { checkDailyTenantQuota, checkTransportRateLimit } from './rate-limiter.js';
 import { createAdminRouter } from './routes/admin.js';
 import { adminAuthMiddleware } from './middleware/admin-auth.js';
+import { mcpHeaderValidationMiddleware } from './middleware/mcp-header-validation.js';
+import { extractMcpMeta } from './middleware/mcp-meta.js';
+import { z } from 'zod';
 import { validateMemoryInput, validateContent, validateCategory, validateMetadata, validateRelevanceScore } from './validation/memory-input.js';
 import { renderContradictionDashboard } from './ui-resources/contradiction-dashboard.js';
 import { renderSnapshotTimeline } from './ui-resources/snapshot-timeline.js';
@@ -83,6 +85,17 @@ interface AuthContext {
   projectId?: string;
   userId?: string;
 }
+
+// MCP 2026-07-28 (SEP-2575): protocol revision advertised by server/discover.
+const MCP_DISCOVER_PROTOCOL_VERSION = '2026-07-28';
+
+// SEP-2575: server/discover replaces the initialize handshake. The SDK does
+// not ship this method yet (1.29.0 targets 2025-11-25), so it is registered
+// as a custom request handler alongside the legacy initialize flow.
+const ServerDiscoverRequestSchema = z.object({
+  method: z.literal('server/discover'),
+  params: z.record(z.string(), z.unknown()).optional(),
+});
 
 // UUID regex for validation
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -230,16 +243,18 @@ function addPaginationToResponse(data: {
 
 class RembrServer {
   private db: MemoryDatabase;
-  private embeddingProvider?: OllamaEmbeddingProvider;
+  private embeddingProvider?: EmbeddingProvider;
+  private embeddingInitPromise: Promise<void>;
   private app: express.Application;
   private port: number;
-  private sessions: Map<string, { transport: StreamableHTTPServerTransport; server: Server }>;
-  private sessionStore: RedisSessionStore;
   private authService: AuthService;
   private pool: PoolType;
   private optimizationScheduler?: OptimizationScheduler;
   private auditLogger!: AuditLogger;
   private serverType: ServerType;
+  private intervalHandles: Array<ReturnType<typeof setInterval>> = [];
+  private closing = false;
+  private closed = false;
 
   constructor(port: number = 3000, serverType: ServerType = 'all') {
     this.port = port;
@@ -266,8 +281,6 @@ class RembrServer {
       next();
     });
     
-    this.sessions = new Map();
-    this.sessionStore = new RedisSessionStore();
     this.authService = new AuthService();
 
     // Initialize database (single shared pool)
@@ -278,25 +291,16 @@ class RembrServer {
     this.auditLogger = new AuditLogger(this.pool);
 
     // Initialize embedding provider
-    this.initializeEmbeddings();
+    this.embeddingInitPromise = this.initializeEmbeddings();
 
     // Initialize optimization scheduler if enabled
     if (process.env.ENABLE_OPTIMIZATION === 'true') {
       this.initializeOptimizationScheduler();
     }
 
-    // Clean up inactive sessions periodically (every 30 minutes)
-    setInterval(() => {
-      const now = Date.now();
-      for (const [sessionId, session] of this.sessions.entries()) {
-        // Clean up sessions that haven't been used in 30 minutes
-        // We'll check if the transport is still active
-        if ((session.server as any).lastUsed && now - (session.server as any).lastUsed > 30 * 60 * 1000) {
-          console.log(`🗑️ Cleaning up inactive session: ${sessionId}`);
-          this.sessions.delete(sessionId);
-        }
-      }
-    }, 30 * 60 * 1000); // 30 minutes
+    // MCP 2026-07-28 (SEP-2575): the protocol is stateless — no Mcp-Session-Id,
+    // no session map, no Redis session store, no periodic session sweep.
+    // Tenant scoping rides on the credential (API key / OAuth) on every request.
 
     // Ensure default structure for all tenants
     this.ensureDefaults();
@@ -311,7 +315,6 @@ class RembrServer {
           'content-type': req.headers['content-type'],
           'content-length': req.headers['content-length'],
           'has-auth': !!(req.headers.authorization || req.headers['x-api-key']),
-          'mcp-session-id': req.headers['mcp-session-id'] || undefined,
           'user-agent': req.headers['user-agent'],
           // Body keys only — never log body values (may contain PII/memory content)
           'body-keys': req.body && typeof req.body === 'object' ? Object.keys(req.body) : undefined
@@ -424,13 +427,9 @@ class RembrServer {
         health.ollama_models = [];
       }
 
-      // Redis: check session store liveness
-      try {
-        await this.sessionStore.listSessions();
-        health.redis = true;
-      } catch {
-        health.redis = false;
-      }
+      // Redis is no longer a hard dependency: MCP protocol sessions were
+      // removed (MCP 2026-07-28, SEP-2575). Rate limiting degrades to an
+      // in-process fallback when Redis is down, so it is not health-gating.
 
       // Error counts — read from Prometheus registry (process-lifetime totals)
       try {
@@ -460,7 +459,7 @@ class RembrServer {
       health.check_duration_ms = Date.now() - t0;
 
       // Degrade overall status if any critical check failed
-      if (health.db === false || health.redis === false) {
+      if (health.db === false) {
         health.status = 'degraded';
       }
 
@@ -487,27 +486,27 @@ class RembrServer {
       pool: this.pool,
     }));
 
-    // Claude Desktop start-auth endpoint
-    this.app.get('/mcp/start-auth/:sessionId', async (req: Request, res: Response) => {
-      const { sessionId } = req.params;
-      const redirectUrl = req.query.redirect_url as string;
-      
-      if (process.env.NODE_ENV !== 'production') console.log(`Start auth request - sessionId: ${sessionId}, redirectUrl: ${redirectUrl}`);
-      
-      if (!process.env.PUBLIC_URL) {
-        return res.status(500).json({ error: 'PUBLIC_URL environment variable not configured' });
-      }
-      
-      // Redirect to the UI's OAuth flow with session tracking
-      const authUrl = `${process.env.PUBLIC_URL}/api/mcp-auth?session_id=${sessionId}&redirect_url=${encodeURIComponent(redirectUrl || '')}`;
-      res.redirect(authUrl);
+    // Claude Desktop start-auth endpoint — retired with session auth
+    // (MCP 2026-07-28, SEP-2575). Clients must use API keys or OAuth.
+    this.app.get('/mcp/start-auth/:sessionId', (req: Request, res: Response) => {
+      res.status(410).json({
+        error: 'Session-based authentication was removed with MCP 2026-07-28.',
+        migration: 'Authenticate with an API key (X-API-Key header) or OAuth Bearer token instead. See https://rembr.ai/docs/authentication.'
+      });
     });
 
     // MCP endpoint with proper session management
     this.app.post('/mcp', async (req: Request, res: Response) => {
+      // SEP-2243: Validate Mcp-Method/Mcp-Name headers before processing
+      mcpHeaderValidationMiddleware(req, res, () => {});
+      if (res.writableEnded) return;
+
       const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       const startTime = Date.now();
-      
+
+      // SEP-2575/SEP-414: client metadata + W3C trace context ride on _meta.
+      const mcpMeta = extractMcpMeta(req.body);
+
       // Production-safe request log: no raw credentials, no body content.
       if (process.env.NODE_ENV === 'development') {
         console.log('=== MCP POST REQUEST START ===', {
@@ -518,58 +517,19 @@ class RembrServer {
           method: req.body?.method,
           id: req.body?.id,
           hasAuth: !!(req.headers.authorization || req.headers['x-api-key']),
-          sessionId: req.headers['mcp-session-id'] || undefined,
+          protocolVersion: mcpMeta.protocolVersion,
+          clientName: mcpMeta.clientInfo?.name,
+          traceparent: mcpMeta.traceparent,
           // Body param keys only — never log values (may contain PII/memory content)
           paramsKeys: req.body?.params ? Object.keys(req.body.params) : []
         });
       }
 
       try {
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
-        
-        // Check if this is an existing session - if so, skip authentication
-        let authResult: AuthResult;
-        if (sessionId && this.sessions.has(sessionId)) {
-          // Session exists - get auth info from session store
-          if (process.env.NODE_ENV !== 'production') console.log('🔓 Using cached auth from existing session:', {
-            requestId,
-            sessionId,
-            timestamp: new Date().toISOString()
-          });
-          
-          // Get tenant/project from the database session
-          const sessionDbResult = await this.pool.query(
-            'SELECT tenant_id, project_id FROM mcp_sessions WHERE session_id = $1 AND expires_at > NOW()',
-            [sessionId]
-          );
-          
-          if (sessionDbResult.rows.length > 0) {
-            authResult = {
-              success: true,
-              tenantId: sessionDbResult.rows[0].tenant_id,
-              projectId: sessionDbResult.rows[0].project_id
-            };
-          } else {
-            // Session exists in memory but not in DB - authenticate again
-            if (process.env.NODE_ENV !== 'production') console.log('⚠️ Session in memory but not in DB, re-authenticating...', {
-              requestId,
-              sessionId,
-              timestamp: new Date().toISOString()
-            });
-            authResult = await this.authenticate(req);
-          }
-        } else {
-          // No existing session - authenticate
-          if (process.env.NODE_ENV !== 'production') console.log('📞 Starting authentication...', {
-            requestId,
-            hasAuthHeader: !!req.headers.authorization,
-            authHeaderLength: req.headers.authorization ? req.headers.authorization.length : 0,
-            hasSessionId: !!sessionId,
-            timestamp: new Date().toISOString()
-          });
-          authResult = await this.authenticate(req);
-        }
-        
+        // Stateless protocol (SEP-2575): every request authenticates via its
+        // own credential — API key, OAuth Bearer, or JWT. No session cache.
+        const authResult: AuthResult = await this.authenticate(req);
+
         if (!authResult.success) {
           console.error('❌ Authentication failed:', {
             requestId,
@@ -641,310 +601,26 @@ class RembrServer {
           userAgent
         });
 
-        let transport: StreamableHTTPServerTransport;
-
-        // Session management — verbose log gated to non-production (session keys are sensitive)
-        if (process.env.NODE_ENV !== 'production') console.log('🔧 Session management...', {
-          requestId,
-          sessionId,
-          method: req.body?.method,
-          hasExistingSession: sessionId ? this.sessions.has(sessionId) : false,
-          isInitialize: isInitializeRequest(req.body),
-          // Note: activeSessions omitted in production logs (session IDs are sensitive)
-          totalSessions: this.sessions.size,
-          timestamp: new Date().toISOString()
+        // ── Stateless transport (MCP 2026-07-28, SEP-2575/SEP-2567) ──────
+        // A fresh Server + StreamableHTTPServerTransport pair is created per
+        // request and torn down when the response finishes. No Mcp-Session-Id
+        // is issued, read, or validated. Legacy `initialize` requests from
+        // 2025-xx clients are still answered by the SDK but create no state;
+        // 2026-07-28 clients use `server/discover` (registered in
+        // createMCPServer) and per-request _meta instead.
+        const mcpServer = this.createMCPServer(authResult.tenantId!, authResult.projectId, authResult.userId);
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: undefined,
+          enableJsonResponse: true
         });
 
-        if (sessionId && this.sessions.has(sessionId)) {
-          // Reuse existing session
-          const session = this.sessions.get(sessionId)!;
-          transport = session.transport;
-          console.log('♻️ Reusing existing session:', {
-            requestId,
-            sessionId,
-            method: req.body?.method,
-            timestamp: new Date().toISOString()
-          });
-        } else if (isInitializeRequest(req.body)) {
-          // New session initialization - regardless of whether sessionId is provided
-          console.log('🆕 Creating new session for initialize request:', {
-            requestId,
-            providedSessionId: sessionId,
-            timestamp: new Date().toISOString()
-          });
-
-          // Create MCP server first
-          console.log('🏗️ Creating MCP server instance for new session...', {
-            requestId,
-            tenantId: authResult.tenantId,
-            timestamp: new Date().toISOString()
-          });
-          
-          const mcpServer = this.createMCPServer(authResult.tenantId!, authResult.projectId, authResult.userId);
-          
-          transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => {
-              // Use the provided session ID if available, otherwise generate one
-              const id = sessionId || `mcp_${Date.now()}_${Math.random().toString(36).substring(2)}`;
-              console.log('🎫 Using session ID:', id);
-              return id;
-            },
-            onsessioninitialized: async (id) => {
-              console.log('✅ Session initialized:', {
-                sessionId: id,
-                requestId,
-                timestamp: new Date().toISOString()
-              });
-              
-              // Store session in both Redis, in-memory, AND database for auth caching
-              const sessionData: SessionData = {
-                transport,
-                server: mcpServer,
-                createdAt: Date.now(),
-                lastAccessed: Date.now()
-              };
-              
-              this.sessions.set(id, { transport, server: mcpServer });
-              await this.sessionStore.set(id, sessionData);
-              
-              // Store in database for authentication caching
-              try {
-                const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
-                await this.pool.query(
-                  `INSERT INTO mcp_sessions (session_id, tenant_id, project_id, expires_at) 
-                   VALUES ($1, $2, $3, $4)
-                   ON CONFLICT (session_id) DO UPDATE SET 
-                     tenant_id = EXCLUDED.tenant_id,
-                     project_id = EXCLUDED.project_id,
-                     expires_at = EXCLUDED.expires_at`,
-                  [id, authResult.tenantId, authResult.projectId || null, expiresAt]
-                );
-                console.log('💾 Session stored in database for auth caching:', {
-                  sessionId: id,
-                  tenantId: authResult.tenantId,
-                  projectId: authResult.projectId,
-                  timestamp: new Date().toISOString()
-                });
-              } catch (error) {
-                console.error('❌ Failed to store session in database:', {
-                  sessionId: id,
-                  error: error instanceof Error ? error.message : String(error),
-                  timestamp: new Date().toISOString()
-                });
-              }
-              
-              console.log('💾 Session stored in Redis + memory:', {
-                sessionId: id,
-                totalSessions: this.sessions.size,
-                allSessionIds: Array.from(this.sessions.keys()),
-                timestamp: new Date().toISOString()
-              });
-            },
-            onsessionclosed: async (id) => {
-              console.log('🗑️ Session closed:', {
-                sessionId: id,
-                requestId,
-                timestamp: new Date().toISOString()
-              });
-              // Remove from Redis, in-memory, AND database
-              this.sessions.delete(id);
-              await this.sessionStore.delete(id);
-              try {
-                await this.pool.query('DELETE FROM mcp_sessions WHERE session_id = $1', [id]);
-                console.log('🗑️ Session removed from database:', id);
-              } catch (error) {
-                console.error('❌ Failed to remove session from database:', error);
-              }
-            },
-            enableJsonResponse: true
-          });
-
-          transport.onclose = async () => {
-            if (transport.sessionId) {
-              console.log('🔌 Transport connection closed:', {
-                sessionId: transport.sessionId,
-                timestamp: new Date().toISOString()
-              });
-              // Remove from Redis, in-memory, AND database
-              this.sessions.delete(transport.sessionId);
-              await this.sessionStore.delete(transport.sessionId);
-              try {
-                await this.pool.query('DELETE FROM mcp_sessions WHERE session_id = $1', [transport.sessionId]);
-                console.log('🗑️ Session removed from database on transport close:', transport.sessionId);
-              } catch (error) {
-                console.error('❌ Failed to remove session from database:', error);
-              }
-            }
-          };
-
-          console.log('🔗 Connecting MCP server to transport...', {
-            requestId,
-            timestamp: new Date().toISOString()
-          });
-          await mcpServer.connect(transport);
-          
-          console.log('🔍 Transport state after connection:', {
-            requestId,
-            transportSessionId: transport.sessionId,
-            transportHasSessionId: !!transport.sessionId,
-            timestamp: new Date().toISOString()
-          });
-          
-          // Session should already be stored in onsessioninitialized callback
-          if (!transport.sessionId) {
-            console.error('❌ Transport has no session ID after connection:', {
-              requestId,
-              timestamp: new Date().toISOString()
-            });
-          }
-        } else if (sessionId) {
-          // Session ID provided but doesn't exist - this might be from a server restart
-          console.log('⚠️ Session ID provided but not found, treating as new session:', {
-            requestId,
-            sessionId,
-            method: req.body?.method,
-            activeSessions: Array.from(this.sessions.keys()),
-            timestamp: new Date().toISOString()
-          });
-          
-          // Create a new session with the provided session ID
-          transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => sessionId,
-            onsessioninitialized: (id) => {
-              console.log('✅ Session re-initialized:', {
-                sessionId: id,
-                requestId,
-                timestamp: new Date().toISOString()
-              });
-            },
-            onsessionclosed: async (id) => {
-              console.log('🗑️ Session closed:', {
-                sessionId: id,
-                requestId,
-                timestamp: new Date().toISOString()
-              });
-              // Remove from Redis, in-memory, AND database
-              this.sessions.delete(id);
-              await this.sessionStore.delete(id);
-              try {
-                await this.pool.query('DELETE FROM mcp_sessions WHERE session_id = $1', [id]);
-                console.log('🗑️ Session removed from database:', id);
-              } catch (error) {
-                console.error('❌ Failed to remove session from database:', error);
-              }
-            },
-            enableJsonResponse: true
-          });
-
-          // CRITICAL FIX: Mark transport as initialized for session recreation
-          // When a session ID is provided but doesn't exist (after pod restart), we need to
-          // set the internal _initialized flag and sessionId to prevent "Server not initialized" errors
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const webTransport = (transport as any)._webStandardTransport;
-          if (webTransport) {
-            webTransport._initialized = true;
-            webTransport.sessionId = sessionId;
-            console.log('🔧 Marked transport as initialized for POST session recreation:', {
-              sessionId,
-              requestId,
-              timestamp: new Date().toISOString()
-            });
-          }
-
-          const mcpServer = this.createMCPServer(authResult.tenantId!, authResult.projectId, authResult.userId);
-          await mcpServer.connect(transport);
-          
-          console.log('🔍 Transport state after re-connection:', {
-            requestId,
-            transportSessionId: transport.sessionId,
-            providedSessionId: sessionId,
-            transportHasSessionId: !!transport.sessionId,
-            timestamp: new Date().toISOString()
-          });
-          
-          if (transport.sessionId) {
-            const sessionData: SessionData = {
-              transport,
-              server: mcpServer,
-              createdAt: Date.now(),
-              lastAccessed: Date.now()
-            };
-            
-            this.sessions.set(transport.sessionId, { transport, server: mcpServer });
-            await this.sessionStore.set(transport.sessionId, sessionData);
-            
-            // Store in database for authentication caching
-            try {
-              const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
-              await this.pool.query(
-                `INSERT INTO mcp_sessions (session_id, tenant_id, project_id, expires_at) 
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (session_id) DO UPDATE SET 
-                   tenant_id = EXCLUDED.tenant_id,
-                   project_id = EXCLUDED.project_id,
-                   expires_at = EXCLUDED.expires_at`,
-                [transport.sessionId, authResult.tenantId, authResult.projectId || null, expiresAt]
-              );
-              console.log('💾 Session re-stored in database for auth caching:', {
-                sessionId: transport.sessionId,
-                tenantId: authResult.tenantId,
-                projectId: authResult.projectId,
-                timestamp: new Date().toISOString()
-              });
-            } catch (error) {
-              console.error('❌ Failed to store session in database:', {
-                sessionId: transport.sessionId,
-                error: error instanceof Error ? error.message : String(error),
-                timestamp: new Date().toISOString()
-              });
-            }
-            
-            console.log('💾 Session re-created and stored in Redis + memory:', {
-              sessionId: transport.sessionId,
-              totalSessions: this.sessions.size,
-              allSessionIds: Array.from(this.sessions.keys()),
-              timestamp: new Date().toISOString()
-            });
-          } else {
-            console.error('❌ Transport has no session ID after re-connection:', {
-              requestId,
-              providedSessionId: sessionId,
-              timestamp: new Date().toISOString()
-            });
-          }
-        } else {
-          // No session ID and not initialize - invalid
-          console.error('❌ Invalid session state:', {
-            requestId,
-            sessionId,
-            method: req.body?.method,
-            isInitialize: isInitializeRequest(req.body),
-            activeSessions: Array.from(this.sessions.keys()),
-            timestamp: new Date().toISOString()
-          });
-          return res.status(400).json({
-            jsonrpc: '2.0',
-            error: { code: -32000, message: 'Invalid session or missing session ID' },
-            id: req.body?.id || null
-          });
-        }
-
-        console.log('📨 Handling MCP request...', {
-          requestId,
-          method: req.body?.method,
-          timestamp: new Date().toISOString()
+        // Tear down the per-request pair when the client connection closes.
+        res.on('close', () => {
+          transport.close();
+          mcpServer.close();
         });
-        
-        // Set session ID in response headers if available
-        if (transport.sessionId) {
-          res.setHeader('mcp-session-id', transport.sessionId);
-          console.log('🆔 Setting session ID in response headers:', {
-            sessionId: transport.sessionId,
-            requestId,
-            timestamp: new Date().toISOString()
-          });
-        }
-        
+
+        await mcpServer.connect(transport);
         await transport.handleRequest(req, res, req.body);
         
         console.log('✅ MCP request completed successfully', {
@@ -970,227 +646,40 @@ class RembrServer {
       }
     });
 
-    this.app.get('/mcp', async (req: Request, res: Response) => {
-      const sessionId = req.headers['mcp-session-id'] as string;
-      console.log(`🌊 GET /mcp SSE connection attempt`, {
-        providedSessionId: sessionId || 'none',
-        allHeaders: {
-          'mcp-session-id': req.headers['mcp-session-id'],
-          'user-agent': req.headers['user-agent'],
-          'connection': req.headers['connection'],
-          'accept': req.headers['accept']
-        },
-        totalSessions: this.sessions.size,
-        availableSessionIds: Array.from(this.sessions.keys()),
-        timestamp: new Date().toISOString()
+    // MCP 2026-07-28 (SEP-2567): the standalone SSE notification stream and
+    // session termination are gone with the session layer. Stateless servers
+    // answer GET/DELETE /mcp with 405 per the Streamable HTTP transport spec.
+    this.app.get('/mcp', (req: Request, res: Response) => {
+      res.status(405).set('Allow', 'POST').json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Method Not Allowed: this server is stateless and does not offer a standalone SSE stream' },
+        id: null
       });
-
-      let session;
-      let actualSessionId: string | undefined;
-      
-      if (sessionId && this.sessions.has(sessionId)) {
-        session = this.sessions.get(sessionId);
-        actualSessionId = sessionId;
-        console.log('✅ Found session by provided ID:', sessionId);
-      } else if (sessionId && await this.sessionStore.exists(sessionId)) {
-        // Session exists in Redis but not in local memory - recreate it
-        console.log('🔄 Session exists in Redis but not locally - recreating session:', {
-          sessionId,
-          podId: process.env.HOSTNAME || 'unknown',
-          timestamp: new Date().toISOString()
-        });
-        
-        // Get auth info from database
-        const sessionDbResult = await this.pool.query(
-          'SELECT tenant_id, project_id FROM mcp_sessions WHERE session_id = $1 AND expires_at > NOW()',
-          [sessionId]
-        );
-        
-        if (sessionDbResult.rows.length > 0) {
-          const { tenant_id, project_id } = sessionDbResult.rows[0];
-          
-          // Recreate transport and server for this session
-          const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => sessionId,
-            onsessioninitialized: (id) => {
-              console.log('✅ Session re-initialized for GET:', {
-                sessionId: id,
-                timestamp: new Date().toISOString()
-              });
-            },
-            onsessionclosed: async (id) => {
-              console.log('🗑️ Session closed:', {
-                sessionId: id,
-                timestamp: new Date().toISOString()
-              });
-              this.sessions.delete(id);
-              await this.sessionStore.delete(id);
-              try {
-                await this.pool.query('DELETE FROM mcp_sessions WHERE session_id = $1', [id]);
-              } catch (error) {
-                console.error('❌ Failed to remove session from database:', error);
-              }
-            },
-            enableJsonResponse: true
-          });
-
-          // CRITICAL FIX: Mark transport as initialized for session recreation
-          // When recreating a session from Redis/DB, we're rejoining an existing session
-          // so we need to set the internal _initialized flag to prevent "Server not initialized" errors
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const webTransport = (transport as any)._webStandardTransport;
-          if (webTransport) {
-            webTransport._initialized = true;
-            webTransport.sessionId = sessionId;
-            console.log('🔧 Marked transport as initialized for session recreation:', {
-              sessionId,
-              timestamp: new Date().toISOString()
-            });
-          }
-
-          const mcpServer = this.createMCPServer(tenant_id, project_id, undefined);
-          await mcpServer.connect(transport);
-          
-          // Store in local memory
-          this.sessions.set(sessionId, { transport, server: mcpServer });
-          
-          session = this.sessions.get(sessionId);
-          actualSessionId = sessionId;
-          
-          console.log('✅ Session recreated from Redis/DB for GET request:', {
-            sessionId,
-            tenantId: tenant_id,
-            totalSessions: this.sessions.size,
-            timestamp: new Date().toISOString()
-          });
-        } else {
-          console.error('❌ Session in Redis but not in database:', {
-            sessionId,
-            timestamp: new Date().toISOString()
-          });
-          // Clean up orphaned Redis session
-          await this.sessionStore.delete(sessionId);
-          return res.status(400).json({
-            jsonrpc: '2.0',
-            error: { code: -32000, message: 'Session expired, please reinitialize' },
-            id: null
-          });
-        }
-      } else if (this.sessions.size === 1) {
-        // If no session ID provided but only one active session, use it
-        const [onlySessionId] = this.sessions.keys();
-        session = this.sessions.get(onlySessionId);
-        actualSessionId = onlySessionId;
-        console.log('📡 Using only available session for GET request:', {
-          requestedId: sessionId,
-          usedId: onlySessionId,
-          timestamp: new Date().toISOString()
-        });
-      } else if (this.sessions.size > 1) {
-        // Try to find the most recent session if multiple exist
-        const sessionIds = Array.from(this.sessions.keys());
-        const mostRecentId = sessionIds[sessionIds.length - 1];
-        session = this.sessions.get(mostRecentId);
-        actualSessionId = mostRecentId;
-        console.log('🔄 Multiple sessions, using most recent:', {
-          requestedId: sessionId,
-          usedId: mostRecentId,
-          allSessions: sessionIds,
-          timestamp: new Date().toISOString()
-        });
-      }
-
-      if (!session) {
-        console.error('❌ Session not found for GET request:', {
-          requestedSessionId: sessionId,
-          availableSessionIds: Array.from(this.sessions.keys()),
-          totalSessions: this.sessions.size,
-          timestamp: new Date().toISOString()
-        });
-        return res.status(400).json({
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Bad Request: Server not initialized' },
-          id: null
-        });
-      }
-
-      console.log('📡 Handling SSE stream for session:', actualSessionId);
-      
-      // Set up SSE heartbeat to keep connection alive through proxies
-      // Most proxies have 60-300 second timeouts, so send heartbeat every 30 seconds
-      const heartbeatInterval = setInterval(() => {
-        if (!res.writableEnded && !res.destroyed) {
-          try {
-            // SSE comment format - doesn't trigger event handlers but keeps connection alive
-            res.write(': heartbeat\n\n');
-          } catch (e) {
-            // Connection closed, cleanup
-            clearInterval(heartbeatInterval);
-          }
-        } else {
-          clearInterval(heartbeatInterval);
-        }
-      }, 30000); // 30 second heartbeat
-
-      // Clean up heartbeat on connection close
-      res.on('close', () => {
-        clearInterval(heartbeatInterval);
-        console.log('🔌 SSE connection closed for session:', actualSessionId);
-      });
-
-      await session.transport.handleRequest(req, res);
     });
 
-    this.app.delete('/mcp', async (req: Request, res: Response) => {
-      const sessionId = req.headers['mcp-session-id'] as string;
-      
-      if (!sessionId) {
-        return res.status(400).json({
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Session ID required for DELETE requests' },
-          id: null
-        });
-      }
-
-      const session = this.sessions.get(sessionId);
-      if (!session) {
-        // Check if session exists in Redis or database and clean it up
-        if (await this.sessionStore.exists(sessionId)) {
-          await this.sessionStore.delete(sessionId);
-          console.log('🗑️ Cleaned up orphaned session from Redis:', sessionId);
-        }
-        try {
-          await this.pool.query('DELETE FROM mcp_sessions WHERE session_id = $1', [sessionId]);
-          console.log('🗑️ Cleaned up orphaned session from database:', sessionId);
-        } catch (error) {
-          console.error('❌ Failed to clean up session from database:', error);
-        }
-        return res.status(400).json({
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Invalid session ID' },
-          id: null
-        });
-      }
-
-      console.log('🗑️ Handling session termination for:', sessionId);
-      // Clean up Redis, database, and in-memory
-      await this.sessionStore.delete(sessionId);
-      try {
-        await this.pool.query('DELETE FROM mcp_sessions WHERE session_id = $1', [sessionId]);
-        console.log('🗑️ Session removed from database:', sessionId);
-      } catch (error) {
-        console.error('❌ Failed to remove session from database:', error);
-      }
-      await session.transport.handleRequest(req, res);
+    this.app.delete('/mcp', (req: Request, res: Response) => {
+      res.status(405).set('Allow', 'POST').json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Method Not Allowed: this server is stateless and has no sessions to terminate' },
+        id: null
+      });
     });
 
-    // Initialize schema
-    this.initializeDatabase();
+    // Schema changes are owned by migrations. Keep this dev-only to avoid
+    // production app-role DDL attempts and noisy permission errors.
+    if (process.env.NODE_ENV !== 'production' || process.env.ALLOW_STARTUP_SCHEMA_INIT === 'true') {
+      this.initializeDatabase();
+    }
 
     console.log('Member Berry MCP Server initialized');
   }
 
   private async initializeDatabase() {
+    if (process.env.INITIALIZE_SCHEMA === 'false') {
+      console.log('Database schema initialization skipped (INITIALIZE_SCHEMA=false)');
+      return;
+    }
+
     try {
       await this.db.initializeSchema();
       console.log('Database schema initialized');
@@ -1201,16 +690,26 @@ class RembrServer {
 
   private async initializeEmbeddings() {
     try {
-      const ollamaHost = process.env.OLLAMA_HOST || 'http://localhost:11434';
-      console.log(`🔮 Initializing embedding provider with host: ${ollamaHost}`);
-      this.embeddingProvider = OllamaEmbeddingProvider.createDefault(ollamaHost);
+      const provider = process.env.EMBEDDING_PROVIDER || 'ollama';
+      const model = process.env.EMBEDDING_MODEL || process.env.OLLAMA_EMBEDDING_MODEL || 'nomic-embed-text';
+      const dimensions = parseInt(process.env.EMBEDDING_DIMENSIONS || '768', 10);
+
+      if (provider === 'openai-compatible') {
+        const baseUrl = process.env.EMBEDDING_BASE_URL || process.env.LM_STUDIO_BASE_URL || 'http://localhost:1234/v1';
+        console.log(`🔮 Initializing OpenAI-compatible embedding provider: ${baseUrl} (${model})`);
+        this.embeddingProvider = new OpenAICompatibleEmbeddingProvider(baseUrl, model, dimensions);
+      } else {
+        const ollamaHost = process.env.OLLAMA_HOST || 'http://localhost:11434';
+        console.log(`🔮 Initializing Ollama embedding provider with host: ${ollamaHost}`);
+        this.embeddingProvider = OllamaEmbeddingProvider.createDefault(ollamaHost);
+      }
 
       const isAvailable = await this.embeddingProvider.isAvailable();
       if (isAvailable) {
-        console.log(`✅ Ollama embeddings available at ${ollamaHost}`);
+        console.log(`✅ ${this.embeddingProvider.name} embeddings available`);
         console.log(`📊 Embedding model: ${this.embeddingProvider.model}, dimensions: ${this.embeddingProvider.dimensions}`);
       } else {
-        console.warn('⚠️  Ollama not available at startup, but embedding provider will retry on each request');
+        console.warn('⚠️  Embedding provider not available at startup, but it will retry on each request');
         // Don't set to undefined - let it retry on each request
       }
     } catch (error) {
@@ -3009,7 +2508,29 @@ class RembrServer {
     const tools: Tool[] = [...consolidatedTools, ...legacyTools];
 
     // Register handlers
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+
+    // MCP 2026-07-28 (SEP-2575): server/discover replaces the initialize
+    // handshake. The legacy initialize flow is still served by the SDK for
+    // 2025-xx clients; both return the same capability surface.
+    server.setRequestHandler(ServerDiscoverRequestSchema, async () => ({
+      protocolVersion: MCP_DISCOVER_PROTOCOL_VERSION,
+      serverInfo: {
+        name: 'rembr-server',
+        version: '1.0.0',
+        websiteUrl: 'https://rembr.ai'
+      },
+      capabilities: {
+        tools: {}
+      }
+    }));
+
+    // SEP-2549: tool list is stable per tenant — let clients cache it.
+    // cacheScope is private because tool availability can vary by tenant plan.
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools,
+      ttlMs: 300_000,
+      cacheScope: 'private'
+    }));
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: rawArgs } = request.params;
@@ -4719,6 +4240,7 @@ case 'context_analytics': {
 
             const client = await this.pool.connect();
             try {
+              await client.query('BEGIN');
               await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant', tenantId]);
 
               // Recursive CTE: BFS traversal up to maxDepth hops with cycle detection.
@@ -4800,6 +4322,7 @@ case 'context_analytics': {
               );
 
               if (startResult.rows.length === 0) {
+                await client.query('ROLLBACK');
                 return {
                   content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Starting memory not found or access denied' }) }],
                   isError: true
@@ -4807,6 +4330,7 @@ case 'context_analytics': {
               }
 
               const neighborResult = await client.query(traversalQuery, queryParams);
+              await client.query('COMMIT');
               const duration = (Date.now() - startTime) / 1000;
 
               trackMcpToolCall('explore_relationships', 'success', tenantId, duration);
@@ -4848,6 +4372,9 @@ case 'context_analytics': {
                 ]
               };
             } finally {
+              if (client) {
+                try { await client.query('ROLLBACK'); } catch {}
+              }
               client.release();
             }
           }
@@ -4928,6 +4455,7 @@ case 'context_analytics': {
 
             let contradictionQuery: string;
             let contradictionParams: any[];
+            const client = await this.pool.connect();
 
             if (contextId) {
               // Scoped to a context: get contradictions for memories in that context
@@ -4938,11 +4466,14 @@ case 'context_analytics': {
                 FROM memory_relationships mr
                 JOIN memories ms ON mr.source_memory_id = ms.id
                 JOIN memories mt ON mr.target_memory_id = mt.id
-                JOIN context_memories cm ON (cm.memory_id = mr.source_memory_id OR cm.memory_id = mr.target_memory_id)
+                JOIN memory_contexts cm ON (cm.memory_id = mr.source_memory_id OR cm.memory_id = mr.target_memory_id)
                 WHERE mr.relationship_type = 'contradicts'
                   AND mr.confidence >= $1
                   AND cm.context_id = $2
                   AND ms.tenant_id = $3
+                  AND mt.tenant_id = $3
+                  AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains opposing terms:%')
+                  AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains contradictory information or opposing statements. Semantic similarity:%')
                 ORDER BY mr.confidence DESC
               `;
               contradictionParams = [minConfidence, contextId, tenantId];
@@ -4958,14 +4489,28 @@ case 'context_analytics': {
                 WHERE mr.relationship_type = 'contradicts'
                   AND mr.confidence >= $1
                   AND ms.tenant_id = $2
+                  AND mt.tenant_id = $2
+                  AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains opposing terms:%')
+                  AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains contradictory information or opposing statements. Semantic similarity:%')
                 ORDER BY mr.confidence DESC
                 LIMIT 50
               `;
               contradictionParams = [minConfidence, tenantId];
             }
 
-            const contradictionResult = await this.pool.query(contradictionQuery, contradictionParams);
-            const contradictions = contradictionResult.rows.map((row: any) => ({
+            let contradictionResult: any;
+            try {
+              await client.query('BEGIN');
+              await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant', tenantId]);
+              contradictionResult = await client.query(contradictionQuery, contradictionParams);
+              await client.query('COMMIT');
+            } catch (error) {
+              try { await client.query('ROLLBACK'); } catch {}
+              throw error;
+            } finally {
+              client.release();
+            }
+            const contradictions: any[] = contradictionResult.rows.map((row: any) => ({
               memory_a: {
                 id: row.source_memory_id,
                 content: row.source_content,
@@ -6493,8 +6038,9 @@ case 'context_analytics': {
             let result: unknown;
 
             if (operation === 'create') {
+              const taskId = (args?.task_id as string | undefined) || `rlm-${randomUUID()}`;
               result = await rlm.createSession(
-                args?.task_id as string,
+                taskId,
                 args?.task_title as string,
                 (args?.acceptance_criteria as string[]) ?? [],
                 args?.initial_plan as string | undefined,
@@ -6593,6 +6139,9 @@ case 'context_analytics': {
             let data;
             try {
               data = await reportingService.getUsageAnalytics(from, to, granularity);
+              if (data.length === 0) {
+                data = await reportingService.getUsageAnalyticsFallback(from, to, granularity);
+              }
             } catch {
               data = await reportingService.getUsageAnalyticsFallback(from, to, granularity);
             }
@@ -7496,21 +7045,13 @@ case 'context_analytics': {
   }
 
   async cleanup() {
-    console.log('🧹 Cleaning up Redis sessions...');
-    try {
-      // Clear all sessions from Redis
-      const sessionIds = await this.sessionStore.listSessions();
-      for (const sessionId of sessionIds) {
-        await this.sessionStore.delete(sessionId);
-      }
-      await this.sessionStore.cleanup();
-      console.log('✅ Redis session cleanup completed');
-    } catch (error) {
-      console.error('❌ Error during Redis cleanup:', error);
-    }
+    // No session state to clean up — the MCP transport is stateless
+    // (MCP 2026-07-28, SEP-2575).
   }
 
   async start(): Promise<void> {
+    await this.embeddingInitPromise;
+
     console.log('🚀 Starting REMBR MCP server initialization...');
     console.log(`   - Port: ${this.port}`);
     console.log(`   - Environment: ${process.env.NODE_ENV || 'development'}`);
@@ -7533,7 +7074,9 @@ case 'context_analytics': {
 
     // Periodic embedding backlog gauge update (every 60s)
     // Updates Prometheus gauge so alerting can detect growing backlogs
-    setInterval(async () => {
+    this.intervalHandles.push(setInterval(async () => {
+      if (this.closing) return;
+
       try {
         const result = await this.db.query(`
           SELECT m.tenant_id, COUNT(*) - COUNT(e.memory_id) as backlog
@@ -7548,12 +7091,14 @@ case 'context_analytics': {
       } catch (error) {
         console.error('Failed to update embedding backlog gauge:', error);
       }
-    }, 60_000);
+    }, 60_000));
 
     // Periodic embedding backfill (every 5 minutes)
     // Catches any orphaned memories from transient failures
     if (this.embeddingProvider) {
-      setInterval(async () => {
+      this.intervalHandles.push(setInterval(async () => {
+        if (this.closing) return;
+
         try {
           const result = await this.db.query(`
             SELECT m.id, m.content, m.tenant_id
@@ -7578,7 +7123,8 @@ case 'context_analytics': {
                 row.tenant_id,
                 embedding,
                 this.embeddingProvider!.name,
-                this.embeddingProvider!.model
+                this.embeddingProvider!.model,
+                this.embeddingProvider!.getModelFingerprint()
               );
               generated++;
             } catch (error: any) {
@@ -7598,7 +7144,7 @@ case 'context_analytics': {
         } catch (error) {
           console.error('Backfill job failed:', error);
         }
-      }, 5 * 60_000); // Every 5 minutes
+      }, 5 * 60_000)); // Every 5 minutes
       console.log('✅ Embedding backfill job scheduled (every 5 minutes)');
     }
 
@@ -7704,17 +7250,18 @@ case 'context_analytics': {
     });
 
     // Add periodic server status logging to track connection patterns
-    setInterval(() => {
+    this.intervalHandles.push(setInterval(() => {
+      if (this.closing) return;
+
       console.log('📊 Server Status Report:', {
         timestamp: new Date().toISOString(),
-        activeSessions: this.sessions.size,
         uptime: Math.round(process.uptime()),
         memory: {
           used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
           total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024) + 'MB'
         }
       });
-    }, 5 * 60 * 1000); // Every 5 minutes - same interval as the timeout pattern
+    }, 5 * 60 * 1000)); // Every 5 minutes - same interval as the timeout pattern
 
     // Add process-level error handlers
     process.on('uncaughtException', (error) => {
@@ -7736,7 +7283,18 @@ case 'context_analytics': {
   }
 
   async close(): Promise<void> {
+    if (this.closed || this.closing) {
+      console.log('✅ Server shutdown already in progress or complete');
+      return;
+    }
+
+    this.closing = true;
     console.log('🛑 Shutting down REMBR MCP server...');
+
+    for (const interval of this.intervalHandles) {
+      clearInterval(interval);
+    }
+    this.intervalHandles = [];
     
     // Stop optimization scheduler first
     if (this.optimizationScheduler) {
@@ -7747,7 +7305,7 @@ case 'context_analytics': {
     
     await this.cleanup();
     await this.db.close();
-    await this.pool.end();
+    this.closed = true;
     console.log('✅ Server shutdown complete');
   }
 }

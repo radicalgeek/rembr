@@ -86,6 +86,25 @@ export class AnalyticsReportingService {
     this.tenantId = tenantId;
   }
 
+  private async queryWithTenant<T extends Record<string, unknown>>(
+    sql: string,
+    params: unknown[],
+  ) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant', this.tenantId]);
+      const result = await client.query<T>(sql, params);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   // ─── Usage Analytics ────────────────────────────────────
 
   /**
@@ -101,7 +120,7 @@ export class AnalyticsReportingService {
                   : granularity === 'month' ? 'month'
                   : 'day';
 
-    const result = await this.pool.query<{
+    const result = await this.queryWithTenant<{
       period: Date;
       memories_stored: string;
       memories_deleted: string;
@@ -149,7 +168,7 @@ export class AnalyticsReportingService {
   ): Promise<UsageDataPoint[]> {
     const truncFn = granularity === 'hour' ? 'hour' : granularity === 'week' ? 'week' : granularity === 'month' ? 'month' : 'day';
 
-    const result = await this.pool.query<{
+    const result = await this.queryWithTenant<{
       period: Date;
       memories_stored: string;
       pii_detected: string;
@@ -193,7 +212,7 @@ export class AnalyticsReportingService {
     const truncFn = granularity === 'hour' ? 'hour' : granularity === 'week' ? 'week' : granularity === 'month' ? 'month' : 'day';
 
     try {
-      const result = await this.pool.query<{
+      const result = await this.queryWithTenant<{
         period: Date;
         avg_store_ms: string | null;
         avg_search_ms: string | null;

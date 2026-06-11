@@ -289,35 +289,13 @@ export class OptimizationScheduler {
         relationshipType: 'semantic_similarity'
       });
 
-      // 4. Contradiction detection
-      console.log(`[OptimizationScheduler] ${tenantId}: Detecting contradictions...`);
-      const contradictionStart = Date.now();
-      const recentMemories = await this.db.query(
-        `SELECT id FROM memories 
-         WHERE tenant_id = $1 
-         AND created_at > NOW() - INTERVAL '7 days'
-         ORDER BY created_at DESC
-         LIMIT 500`,
-        [tenantId]
-      );
-      
-      if (recentMemories.rows.length > 1) {
-        const compilationService = await import('../compilation-service.js').then(m => m.CompilationService);
-        const service = new compilationService(this.db);
-        const memoryIds = recentMemories.rows.map((r: any) => r.id);
-        
-        // Extract relationships (includes contradiction detection)
-        const detected = await service.extractRelationships(
-          memoryIds,
-          { tenant_id: tenantId, project_id: undefined }
-        );
-        
-        const contradictions = detected.filter(r => r.relationship_type === 'contradicts');
-        trackOptimization('contradictions', tenantId, (Date.now() - contradictionStart) / 1000, {
-          contradictionsDetected: contradictions.length,
-          memoriesScanned: memoryIds.length
-        });
-      }
+      // 4. Contradiction detection is handled by the LLM-backed background path
+      // during memory ingestion. Do not run the legacy O(n²) keyword extractor here:
+      // it creates high-confidence false positives from generic words like "is not".
+      trackOptimization('contradictions', tenantId, 0, {
+        contradictionsDetected: 0,
+        memoriesScanned: 0
+      });
 
       // 5. Update last optimized timestamp in optimization_config
       await this.db.query(`

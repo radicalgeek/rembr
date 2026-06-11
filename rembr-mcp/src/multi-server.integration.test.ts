@@ -8,8 +8,12 @@
  * 4. Backward compatibility is maintained
  */
 
-import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawn, ChildProcess } from 'child_process';
+
+// Spawns real server processes from dist/ and needs PostgreSQL + Redis on
+// localhost. Opt in explicitly: RUN_MULTI_SERVER_TESTS=true npm run test:integration
+const RUN_MULTI_SERVER = process.env.RUN_MULTI_SERVER_TESTS === 'true';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
 // Helper to start a server with specific SERVER_TYPE
@@ -66,7 +70,7 @@ async function fetchTools(port: number): Promise<Tool[]> {
   return data.result?.tools || [];
 }
 
-describe('Multi-Server Split Integration Tests', () => {
+describe.skipIf(!RUN_MULTI_SERVER)('Multi-Server Split Integration Tests', () => {
   const servers: Map<string, ChildProcess> = new Map();
   const ports = {
     core: 4001,

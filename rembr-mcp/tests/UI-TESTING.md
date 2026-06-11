@@ -127,7 +127,7 @@ Unit tests run on every commit via GitLab CI.
 
 Browser tests can be added to CI by:
 1. Installing Playwright browsers in Docker image
-2. Adding `npm run test:e2e` step to CI
+2. Adding `npm run test:e2e` step to `.gitlab-ci.yml`
 
 ## Test Philosophy
 

@@ -1,8 +1,8 @@
 # MCP Tools Reference
 
-> **Rembr MCP Server** — 83 tools across 15 categories  
-> Protocol: Model Context Protocol (MCP) 2024-11-05  
-> Auth: `x-api-key` header + session negotiation via `initialize`
+> **Rembr MCP Server** — 102 tools: 20 consolidated operation-based tools (recommended) plus 82 legacy named tools, across 15 categories
+> Protocol: Model Context Protocol (MCP) — stateless Streamable HTTP
+> Auth: `x-api-key` header, OAuth 2.0 Bearer token, or JWT — every request authenticates independently
 
 ---
 
@@ -19,7 +19,9 @@
 }
 ```
 
-All tools are available after a standard MCP `initialize` handshake. The server returns a `mcp-session-id` header that must be passed on subsequent requests.
+The server is fully stateless: no `initialize` handshake or session header is required. Send `tools/list` or `tools/call` directly — each request authenticates independently via your API key or OAuth token. (`initialize` is still answered for older clients, but it creates no session state.)
+
+This reference documents the legacy named tools. The 20 consolidated operation-based tools (`memory`, `search`, `context`, `snapshot`, `graph`, `audit`, etc.) are the recommended API surface — see the [API Migration Guide](./API-MIGRATION-GUIDE.md) for how each legacy tool maps onto a consolidated tool + operation.
 
 ---
 
@@ -625,11 +627,10 @@ Server info, health check, and capabilities advertisement.
 | API Key | `x-api-key: mb_live_...` | Recommended for agents |
 | OAuth 2.0 | `Authorization: Bearer ...` | Claude Desktop (PKCE flow) |
 | Admin | `X-Admin-Key: ...` | Admin-only endpoints |
-| Session | `mcp-session-id: mcp_...` | Returned by `initialize` |
 
 **Flow:**
-1. `POST /mcp` with `initialize` payload → receive `mcp-session-id` in response headers
-2. Include `mcp-session-id` on all subsequent tool calls
+1. `POST /mcp` with any `tools/call` or `tools/list` payload, authenticated via `x-api-key` or `Authorization: Bearer` — no handshake or session header needed
+2. Session-based auth (`mcp-session-id`) was removed in the stateless protocol migration; any session header sent is ignored
 
 ---
 
@@ -667,6 +668,7 @@ Server info, health check, and capabilities advertisement.
 
 | Version | Change |
 |---------|--------|
+| v1.12.0 (2026-06) | Stateless protocol migration — sessions removed, OAuth issuer binding, SDK 1.29.0; 102 tools (20 consolidated + 82 legacy) |
 | v1.12.0 | 83 tools, context checkpoints, engagement events, admin dashboard |
 | v1.11.0 | PII schema in prod/test, smart compression, budget-aware search |
 | v1.30.0 (staging) | Rate limiting fail-closed fix (Redis → in-process Map fallback) |

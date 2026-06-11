@@ -60,6 +60,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Idempotent: drop-and-recreate so the migration can be safely re-applied
+DROP TRIGGER IF EXISTS tasks_updated_at ON tasks;
 CREATE TRIGGER tasks_updated_at
   BEFORE UPDATE ON tasks
   FOR EACH ROW
@@ -68,6 +70,7 @@ CREATE TRIGGER tasks_updated_at
 -- RLS Policy
 ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS tasks_tenant_isolation ON tasks;
 CREATE POLICY tasks_tenant_isolation ON tasks
   FOR ALL
   USING (tenant_id = current_setting('app.current_tenant_id', TRUE)::UUID);
@@ -102,6 +105,7 @@ CREATE INDEX IF NOT EXISTS idx_task_dependencies_tenant ON task_dependencies(ten
 -- RLS Policy
 ALTER TABLE task_dependencies ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS task_dependencies_tenant_isolation ON task_dependencies;
 CREATE POLICY task_dependencies_tenant_isolation ON task_dependencies
   FOR ALL
   USING (tenant_id = current_setting('app.current_tenant_id', TRUE)::UUID);
@@ -136,6 +140,7 @@ CREATE INDEX IF NOT EXISTS idx_task_state_transitions_tenant ON task_state_trans
 -- RLS Policy
 ALTER TABLE task_state_transitions ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS task_state_transitions_tenant_isolation ON task_state_transitions;
 CREATE POLICY task_state_transitions_tenant_isolation ON task_state_transitions
   FOR ALL
   USING (tenant_id = current_setting('app.current_tenant_id', TRUE)::UUID);
@@ -171,6 +176,7 @@ CREATE INDEX IF NOT EXISTS idx_task_assignments_tenant ON task_assignments(tenan
 -- RLS Policy
 ALTER TABLE task_assignments ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS task_assignments_tenant_isolation ON task_assignments;
 CREATE POLICY task_assignments_tenant_isolation ON task_assignments
   FOR ALL
   USING (tenant_id = current_setting('app.current_tenant_id', TRUE)::UUID);

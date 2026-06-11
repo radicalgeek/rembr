@@ -194,27 +194,30 @@ export class MemoryDatabase {
         )
       `);
 
-      // Create usage tracking table for rate limiting
+      // Create usage tracking table for rate limiting. Shape matches the
+      // production schema (deploy/k8s/02-create-schema.sql) minus FKs to
+      // UI-owned tables, so createMemory's INSERT (id, project_id,
+      // memories_stored, ON CONFLICT (tenant_id, project_id, date)) works on
+      // an engine-only database too. Pre-existing tables are left untouched.
       await client.query(`
         CREATE TABLE IF NOT EXISTS usage_daily (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
           tenant_id UUID NOT NULL,
+          project_id UUID,
+          api_key_id UUID,
+          oauth_app_id UUID,
+          auth_method VARCHAR(50),
           date DATE NOT NULL,
-          searches INTEGER DEFAULT 0,
-          memories_created INTEGER DEFAULT 0,
-          PRIMARY KEY (tenant_id, date)
+          memories_stored INTEGER DEFAULT 0,
+          searches_performed INTEGER DEFAULT 0,
+          embeddings_generated INTEGER DEFAULT 0,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(tenant_id, project_id, date)
         )
       `);
 
-      // Create MCP sessions table for Claude Desktop auth
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS mcp_sessions (
-          session_id TEXT PRIMARY KEY,
-          tenant_id UUID NOT NULL,
-          project_id UUID,
-          created_at TIMESTAMPTZ DEFAULT NOW(),
-          expires_at TIMESTAMPTZ NOT NULL
-        )
-      `);
+      // mcp_sessions removed — MCP 2026-07-28 (SEP-2575) drops protocol
+      // sessions and session-based auth (migration 026).
 
       // Create indexes
       await client.query('CREATE INDEX IF NOT EXISTS idx_memories_tenant_id ON memories(tenant_id)');
@@ -328,13 +331,21 @@ export class MemoryDatabase {
 
       // Inline migration: add hash_algorithm column to api_keys if missing (RAD-5 / REM-252)
       // This is idempotent (IF NOT EXISTS) — safe to run on every startup.
+      // Wrapped in a SAVEPOINT: a failure here (e.g. api_keys does not exist
+      // on an engine-only database) would otherwise abort the surrounding
+      // transaction, turning the final COMMIT into a silent ROLLBACK that
+      // discards the entire schema initialization.
+      await client.query('SAVEPOINT api_keys_inline_migration');
       try {
         await client.query(`
           ALTER TABLE api_keys
           ADD COLUMN IF NOT EXISTS hash_algorithm VARCHAR(20) NOT NULL DEFAULT 'sha256'
         `);
+        await client.query('RELEASE SAVEPOINT api_keys_inline_migration');
       } catch (_colErr) {
-        // Column may already exist with a NOT NULL constraint that conflicts — ignore.
+        // api_keys may not exist yet (it is owned by the UI-side schema), or
+        // the column may conflict — roll back just this statement.
+        await client.query('ROLLBACK TO SAVEPOINT api_keys_inline_migration');
       }
 
       await client.query('COMMIT');
@@ -384,6 +395,7 @@ export class MemoryDatabase {
   async getTenantPlan(tenantId: string): Promise<TenantPlan | null> {
     const client = await this.readDbPool.connect();
     try {
+      await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
       const result = await client.query(
         'SELECT * FROM tenant_plans WHERE tenant_id = $1',
@@ -391,6 +403,7 @@ export class MemoryDatabase {
       );
     
       if (result.rows[0]) {
+        await client.query('COMMIT');
         return result.rows[0];
       }
       
@@ -401,6 +414,7 @@ export class MemoryDatabase {
       );
       
       if (!tenantResult.rows[0]) {
+        await client.query('COMMIT');
         return null;
       }
       
@@ -428,13 +442,18 @@ export class MemoryDatabase {
       );
       
       // Return the plan we just created
-      return {
+      const planInfo = {
         tenant_id: tenantId,
         plan: plan as 'free' | 'pro' | 'team' | 'business' | 'enterprise',
         memory_limit: limits.memory,
         search_limit_daily: limits.search,
         project_limit: limits.project
       };
+      await client.query('COMMIT');
+      return planInfo;
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw err;
     } finally {
       client.release();
     }
@@ -511,8 +530,32 @@ export class MemoryDatabase {
       await this.setTenantContext(client, tenantId);
 
       const embeddingStr = `[${embedding.join(',')}]`;
+
+      const memoryExists = await client.query(
+        'SELECT 1 FROM memories WHERE id = $1 AND tenant_id = $2',
+        [memoryId, tenantId]
+      );
+      if (memoryExists.rowCount === 0) {
+        console.warn(`Skipping embedding storage for ${memoryId}: memory no longer exists or is not visible for tenant ${tenantId}`);
+        await client.query('COMMIT');
+        return;
+      }
       
+      let canStoreFingerprint = false;
       if (modelFingerprint) {
+        const columnCheck = await client.query(
+          `SELECT EXISTS (
+             SELECT 1
+             FROM information_schema.columns
+             WHERE table_schema = 'public'
+               AND table_name = 'memory_embeddings'
+               AND column_name = 'model_fingerprint'
+           ) AS exists`
+        );
+        canStoreFingerprint = columnCheck.rows[0]?.exists === true;
+      }
+
+      if (modelFingerprint && canStoreFingerprint) {
         // REM-249: Store with model fingerprint for consistency tracking
         await client.query(
           `INSERT INTO memory_embeddings (memory_id, embedding, provider, model, dimensions, model_fingerprint, is_stale)
@@ -524,6 +567,9 @@ export class MemoryDatabase {
         );
       } else {
         // Fallback: no fingerprint (backwards compatibility)
+        if (modelFingerprint) {
+          console.warn('memory_embeddings model consistency columns are missing; storing embedding without fingerprint metadata');
+        }
         await client.query(
           `INSERT INTO memory_embeddings (memory_id, embedding, provider, model, dimensions)
            VALUES ($1, $2, $3, $4, $5)
@@ -548,6 +594,7 @@ export class MemoryDatabase {
     console.log(`🔍 Database.getRecentMemories called with tenantId=${tenantId}, limit=${limit}, category=${category}`);
     const client = await this.readDbPool.connect();
     try {
+      await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
       // Explicit tenant filter + RLS via app.current_tenant GUC
       let query = 'SELECT * FROM memories WHERE tenant_id = $1';
@@ -574,7 +621,11 @@ export class MemoryDatabase {
       });
       
       console.log(`✅ Database.getRecentMemories completed successfully`);
+      await client.query('COMMIT');
       return memories;
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw err;
     } finally {
       client.release();
     }
@@ -859,6 +910,7 @@ export class MemoryDatabase {
   async deleteMemory(id: string, tenantId: string): Promise<boolean> {
     const client = await this.pool.connect();
     try {
+      await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
 
       // Explicit tenant filter — superuser bypasses RLS
@@ -867,7 +919,11 @@ export class MemoryDatabase {
         [id, tenantId]
       );
 
+      await client.query('COMMIT');
       return result.rowCount !== null && result.rowCount > 0;
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
     } finally {
       client.release();
     }
@@ -877,13 +933,19 @@ export class MemoryDatabase {
   async getMemoryCount(tenantId: string): Promise<number> {
     const client = await this.readDbPool.connect();
     try {
+      await client.query('BEGIN');
+      await this.setTenantContext(client, tenantId);
       // Explicit tenant filter — cannot rely on RLS because the DB user
       // may be a superuser (which bypasses RLS entirely)
       const result = await client.query(
         'SELECT COUNT(*) as count FROM memories WHERE tenant_id = $1',
         [tenantId]
       );
+      await client.query('COMMIT');
       return parseInt(result.rows[0].count);
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw err;
     } finally {
       client.release();
     }
@@ -893,6 +955,7 @@ export class MemoryDatabase {
   async getTodaySearchCount(tenantId: string): Promise<number> {
     const client = await this.readDbPool.connect();
     try {
+      await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
       const result = await client.query(
         `SELECT COALESCE(searches_performed, 0) as count 
@@ -900,7 +963,11 @@ export class MemoryDatabase {
          WHERE tenant_id = $1 AND date = CURRENT_DATE`,
         [tenantId]
       );
+      await client.query('COMMIT');
       return result.rows[0]?.count || 0;
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw err;
     } finally {
       client.release();
     }
@@ -910,12 +977,17 @@ export class MemoryDatabase {
   async getProjectCount(tenantId: string): Promise<number> {
     const client = await this.readDbPool.connect();
     try {
+      await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
       const result = await client.query(
         'SELECT COUNT(*) as count FROM projects WHERE tenant_id = $1',
         [tenantId]
       );
+      await client.query('COMMIT');
       return parseInt(result.rows[0].count) || 0;
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw err;
     } finally {
       client.release();
     }
@@ -925,6 +997,7 @@ export class MemoryDatabase {
   async incrementSearchCount(tenantId: string, projectId?: string): Promise<void> {
     const client = await this.pool.connect();
     try {
+      await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
       const today = new Date().toISOString().split('T')[0];
       await client.query(
@@ -934,6 +1007,10 @@ export class MemoryDatabase {
          DO UPDATE SET searches_performed = usage_daily.searches_performed + 1`,
         [tenantId, projectId, today]
       );
+      await client.query('COMMIT');
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
     } finally {
       client.release();
     }
@@ -1110,7 +1187,7 @@ export class MemoryDatabase {
     try {
       await client.query(
         `INSERT INTO memory_contexts (id, context_id, memory_id, relevance_score, added_at)
-         VALUES (uuid_generate_v4(), $1, $2, $3, $4)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4)
          ON CONFLICT (memory_id, context_id) DO NOTHING`,
         [
           contextMemory.context_id,
@@ -1131,18 +1208,29 @@ export class MemoryDatabase {
   ): Promise<Memory | null> {
     const client = await this.readDbPool.connect();
     try {
+      await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
       
-      let query = 'SELECT * FROM memories WHERE id = $1 AND tenant_id = $2';
-      const params: any[] = [memoryId, tenantId];
-      
       if (projectId !== undefined && projectId !== null) {
-        query += ' AND project_id = $3';
-        params.push(projectId);
+        const scopedResult = await client.query(
+          'SELECT * FROM memories WHERE id = $1 AND tenant_id = $2 AND project_id = $3',
+          [memoryId, tenantId, projectId]
+        );
+        if (scopedResult.rows[0]) {
+          await client.query('COMMIT');
+          return scopedResult.rows[0];
+        }
       }
-      
-      const result = await client.query(query, params);
+
+      const result = await client.query(
+        'SELECT * FROM memories WHERE id = $1 AND tenant_id = $2',
+        [memoryId, tenantId]
+      );
+      await client.query('COMMIT');
       return result.rows[0] || null;
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
     } finally {
       client.release();
     }
@@ -1151,6 +1239,7 @@ export class MemoryDatabase {
   async getEmbedding(memoryId: string, tenantId: string): Promise<MemoryEmbedding | null> {
     const client = await this.readDbPool.connect();
     try {
+      await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
       
       const result = await client.query(
@@ -1162,6 +1251,7 @@ export class MemoryDatabase {
       );
       
       if (result.rows.length === 0) {
+        await client.query('COMMIT');
         return null;
       }
       
@@ -1181,7 +1271,7 @@ export class MemoryDatabase {
       }
       console.log('Parsed embedding array length:', embedding.length);
       
-      return {
+      const embeddingResult = {
         memory_id: row.memory_id,
         embedding,
         provider: row.provider,
@@ -1189,6 +1279,11 @@ export class MemoryDatabase {
         dimensions: row.dimensions,
         created_at: row.created_at
       };
+      await client.query('COMMIT');
+      return embeddingResult;
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw err;
     } finally {
       client.release();
     }
@@ -1197,6 +1292,7 @@ export class MemoryDatabase {
   async getEmbeddingCount(tenantId: string, projectId?: string): Promise<number> {
     const client = await this.readDbPool.connect();
     try {
+      await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
       
       let query = `
@@ -1213,7 +1309,11 @@ export class MemoryDatabase {
       }
       
       const result = await client.query(query, params);
+      await client.query('COMMIT');
       return parseInt(result.rows[0].count, 10);
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw err;
     } finally {
       client.release();
     }
@@ -1226,6 +1326,7 @@ export class MemoryDatabase {
   async markStaleEmbeddings(tenantId: string, currentFingerprint: string): Promise<number> {
     const client = await this.pool.connect();
     try {
+      await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
       
       const result = await client.query(
@@ -1240,7 +1341,11 @@ export class MemoryDatabase {
         [tenantId, currentFingerprint]
       );
 
+      await client.query('COMMIT');
       return result.rowCount || 0;
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw err;
     } finally {
       client.release();
     }

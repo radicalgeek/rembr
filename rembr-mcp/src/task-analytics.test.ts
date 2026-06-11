@@ -2,9 +2,16 @@
  * Unit tests for Task Analytics Service (REM-56)
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import { Pool } from 'pg';
 import { TaskAnalyticsService } from './task-analytics.js';
+import { createTestPool, applyMigrations } from './test-utils/test-db.js';
+
+beforeAll(async () => {
+  const bootstrapPool = createTestPool('it_task_analytics');
+  await applyMigrations(bootstrapPool, '012-task-management-schema.sql');
+  await bootstrapPool.end();
+});
 
 const TEST_TENANT_ID = '550e8400-e29b-41d4-a716-446655440000';
 const TEST_PROJECT_ID = '550e8400-e29b-41d4-a716-446655440001';
@@ -16,9 +23,7 @@ describe('TaskAnalyticsService', () => {
   let service: TaskAnalyticsService;
 
   beforeEach(async () => {
-    pool = new Pool({
-      connectionString: process.env.TEST_DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rembr_test'
-    });
+    pool = createTestPool('it_task_analytics');
 
     service = new TaskAnalyticsService(pool);
 

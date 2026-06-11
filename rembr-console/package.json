@@ -1,0 +1,33 @@
+{
+  "name": "rembr-console",
+  "version": "0.1.0",
+  "description": "Single-tenant, self-hosted web console for Rembr — a pure MCP client with zero runtime dependencies.",
+  "type": "module",
+  "main": "server.mjs",
+  "bin": {
+    "rembr-console": "server.mjs"
+  },
+  "files": [
+    "server.mjs",
+    "lib.mjs",
+    "public",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "rembr",
+    "mcp",
+    "memory",
+    "dashboard",
+    "self-hosted"
+  ],
+  "author": "Mark @ radicalgeek",
+  "license": "MIT",
+  "devDependencies": {
+    "vitest": "^1.6.1"
+  }
+}

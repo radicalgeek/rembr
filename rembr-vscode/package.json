@@ -51,11 +51,10 @@
   "homepage": "https://rembr.ai",
   "repository": {
     "type": "git",
-    "url": "https://github.com/radicalgeek/rembr.git",
-    "directory": "rembr-vscode"
+    "url": "https://github.com/radicalgeek/rembr-client.git"
   },
   "bugs": {
-    "url": "https://github.com/radicalgeek/rembr/issues"
+    "url": "https://github.com/radicalgeek/rembr-client/issues"
   },
   "engines": {
     "node": ">=18.0.0"

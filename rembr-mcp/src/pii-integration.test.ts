@@ -8,31 +8,94 @@
  * - All 5 PII tool operations
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { Pool } from 'pg';
 import { MemoryService } from './memory-service.js';
+import { MemoryDatabase } from './database.js';
 import { piiDetector } from './pii-detector.js';
+import {
+  createDbPool,
+  dbConnectionString,
+  ensureTestDatabase,
+  ensureTenantsTable,
+  ensureVectorExtension,
+  applyMigrations,
+} from './test-utils/test-db.js';
+
+// Dedicated database: MemoryDatabase manages its own pool, so this file
+// cannot be search_path-namespaced like the other integration tests, and
+// sharing public-schema tables with other files caused order-dependent
+// shape conflicts.
+const TEST_DB = 'rembr_test_pii';
 
 const TEST_TENANT_ID = '550e8400-e29b-41d4-a716-446655440000';
 const TEST_PROJECT_ID = '550e8400-e29b-41d4-a716-446655440001';
+// Must be a UUID: searchMemories compares it against projects.owner_id.
+const TEST_USER_ID = '550e8400-e29b-41d4-a716-446655440002';
 
 describe('PII Integration (REM-50)', () => {
   let pool: Pool;
+  let db: MemoryDatabase;
   let memoryService: MemoryService;
 
+  beforeAll(async () => {
+    await ensureTestDatabase(TEST_DB);
+
+    // memory_embeddings (created by initializeSchema) needs pgvector
+    const bootstrapPool = createDbPool(TEST_DB);
+    await ensureVectorExtension(bootstrapPool);
+    await bootstrapPool.end();
+
+    db = new MemoryDatabase(dbConnectionString(TEST_DB));
+    await db.initializeSchema();
+
+    const migrationPool = createDbPool(TEST_DB);
+    await applyMigrations(migrationPool, '002-pii-detection.sql');
+
+    // initializeSchema owns memories/memory_embeddings/usage_daily but not
+    // tenants/projects (UI-side tables) — searchMemories joins projects, so
+    // seed minimal stand-ins plus the tenant and project rows.
+    await migrationPool.query(`
+      CREATE TABLE IF NOT EXISTS projects (
+        id UUID PRIMARY KEY,
+        tenant_id UUID,
+        name VARCHAR(255) NOT NULL DEFAULT 'test',
+        description TEXT,
+        is_personal BOOLEAN NOT NULL DEFAULT false,
+        owner_id UUID,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await ensureTenantsTable(migrationPool);
+    await migrationPool.query(
+      `INSERT INTO tenants (id, name, email) VALUES ($1, 'PII Test Tenant', 'pii-test@test.local')
+       ON CONFLICT (id) DO NOTHING`,
+      [TEST_TENANT_ID],
+    );
+    await migrationPool.query(
+      `INSERT INTO projects (id, tenant_id, name) VALUES ($1, $2, 'pii-test-project')
+       ON CONFLICT (id) DO NOTHING`,
+      [TEST_PROJECT_ID, TEST_TENANT_ID],
+    );
+    await migrationPool.end();
+  });
+
+  afterAll(async () => {
+    await db.close();
+  });
+
   beforeEach(async () => {
-    pool = new Pool({
-      connectionString: process.env.TEST_DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rembr_test'
-    });
+    pool = createDbPool(TEST_DB);
 
     // Set tenant context
     await pool.query(`SET app.current_tenant_id = '${TEST_TENANT_ID}'`);
 
     // Clean up test data
-    await pool.query('DELETE FROM memories WHERE tenant_id = $1', [TEST_TENANT_ID]);
     await pool.query('DELETE FROM pii_access_logs WHERE tenant_id = $1', [TEST_TENANT_ID]);
+    await pool.query('DELETE FROM memories WHERE tenant_id = $1', [TEST_TENANT_ID]);
 
-    memoryService = new MemoryService(pool, TEST_TENANT_ID, TEST_PROJECT_ID, 'test-user');
+    memoryService = new MemoryService(TEST_TENANT_ID, TEST_PROJECT_ID, db, undefined, TEST_USER_ID);
   });
 
   afterEach(async () => {
@@ -169,7 +232,7 @@ describe('PII Integration (REM-50)', () => {
       });
 
       await memoryService.storeMemory({
-        content: 'Regular note about project planning',
+        content: 'Regular contact note about project planning',
         category: 'notes',
         metadata: {}
       });
@@ -192,7 +255,7 @@ describe('PII Integration (REM-50)', () => {
 
     it('should return all memories when exclude_pii is false', async () => {
       const results = await memoryService.searchMemory({
-        query: 'contact note',
+        query: 'contact',
         limit: 10,
         search_mode: 'text',
         exclude_pii: false
@@ -207,7 +270,7 @@ describe('PII Integration (REM-50)', () => {
 
     it('should exclude PII memories when exclude_pii is true', async () => {
       const results = await memoryService.searchMemory({
-        query: 'contact note',
+        query: 'contact',
         limit: 10,
         search_mode: 'text',
         exclude_pii: true
@@ -277,10 +340,10 @@ describe('PII Integration (REM-50)', () => {
       const ids: string[] = [];
       for (let i = 0; i < 3; i++) {
         const result = await pool.query(
-          `INSERT INTO memories (tenant_id, project_id, content, category, created_by)
-           VALUES ($1, $2, $3, $4, $5)
+          `INSERT INTO memories (id, tenant_id, project_id, content, category)
+           VALUES (gen_random_uuid(), $1, $2, $3, $4)
            RETURNING id`,
-          [TEST_TENANT_ID, TEST_PROJECT_ID, `Test memory ${i} with email test${i}@example.com`, 'notes', 'test-user']
+          [TEST_TENANT_ID, TEST_PROJECT_ID, `Test memory ${i} with email test${i}@example.com`, 'notes']
         );
         ids.push(result.rows[0].id);
       }

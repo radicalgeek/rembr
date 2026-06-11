@@ -183,8 +183,8 @@ describe('Startup validation — placeholder secret detection', () => {
 describe('Security headers — CSP content', () => {
   const CSP = [
     "default-src 'self'",
-    "script-src 'self' https://js.stripe.com https://www.googletagmanager.com",
-    "style-src 'self'",
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://js.stripe.com https://www.googletagmanager.com",
+    "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: blob: https:",
     "object-src 'none'",
     "base-uri 'self'",

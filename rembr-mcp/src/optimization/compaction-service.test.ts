@@ -4,6 +4,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import { Pool } from 'pg';
+import { createTestPool } from '../test-utils/test-db.js';
 import {
   compactMemories,
   getPlanMemoryLimit,
@@ -32,16 +33,14 @@ vi.mock('../ollama-client.js', () => {
   };
 });
 
-const testPool = new Pool({
-  connectionString: process.env.TEST_DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rembr_test',
-});
+const testPool = createTestPool('it_compaction');
 
 const TEST_TENANT_ID = '550e8400-e29b-41d4-a716-446655440000';
 
 describe('Memory Compaction Service', () => {
   beforeAll(async () => {
     // Enable pgvector extension
-    await testPool.query(`CREATE EXTENSION IF NOT EXISTS vector`);
+    await testPool.query(`CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public`);
     
     // Set tenant context
     
@@ -269,9 +268,12 @@ describe('Memory Compaction Service', () => {
 
     it('should log audit trail on successful compaction', async () => {
       // Add similar memories with dummy embeddings
-      // Create 2 groups of similar memories to test merge logic
-      const embeddingA = Array(1536).fill(0.1);
-      const embeddingB = Array(1536).fill(0.9);
+      // Create 2 groups of similar memories to test merge logic.
+      // The groups must be orthogonal in cosine space (uniform fills of 0.1
+      // and 0.9 are scalar multiples — cosine similarity 1.0 — which collapses
+      // everything into one over-budget group that compaction then discards).
+      const embeddingA = Array.from({ length: 1536 }, (_, i) => (i % 2 === 0 ? 1 : 0));
+      const embeddingB = Array.from({ length: 1536 }, (_, i) => (i % 2 === 0 ? 0 : 1));
       const embeddingStrA = '[' + embeddingA.join(',') + ']';
       const embeddingStrB = '[' + embeddingB.join(',') + ']';
       

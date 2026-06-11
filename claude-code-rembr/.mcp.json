@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "rembr": {
+      "type": "http",
+      "url": "${REMBR_URL:-https://rembr.ai/mcp}",
+      "headers": {
+        "x-api-key": "${REMBR_API_KEY}"
+      },
+      "timeout": 30000
+    }
+  }
+}

@@ -4,6 +4,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { Pool } from 'pg';
+import { createTestPool } from './test-utils/test-db.js';
 import { TaskExportService } from './task-export.js';
 import { TaskService } from './task-service.js';
 
@@ -18,9 +19,7 @@ let exportService: TaskExportService;
 let taskService: TaskService;
 
 beforeAll(async () => {
-  testPool = new Pool({
-    connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rembr_test',
-  });
+  testPool = createTestPool('it_task_export');
 
   // Create tasks table
   await testPool.query(`

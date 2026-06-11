@@ -37,4 +37,4 @@
 --   }
 -- }
 
-COMMENT ON COLUMN tenants.stripe_customer_id IS 'Encrypted Stripe customer ID. Plaintext format before encryption: cus_xxxxx';
+COMMENT ON COLUMN tenants.stripe_customer_id IS 'Encrypted Stripe customer ID (AES-256-ECB). Plaintext format: cus_xxxxx';

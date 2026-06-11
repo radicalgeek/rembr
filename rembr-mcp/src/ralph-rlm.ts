@@ -126,10 +126,27 @@ const SCHEMA_SQL = `
 // ─────────────────────────────────────────────────────────
 
 export class RalphRLMService {
+  private schemaEnsured = false;
+
   constructor(private pool: Pool, private tenantId: string) {}
 
   private async ensureSchema(): Promise<void> {
+    if (this.schemaEnsured) return;
+    const existing = await this.pool.query(`
+      SELECT
+        to_regclass('public.rlm_sessions') AS sessions_table,
+        to_regclass('public.rlm_iterations') AS iterations_table
+    `);
+    if (
+      existing.rows.length === 0 ||
+      (existing.rows[0]?.sessions_table && existing.rows[0]?.iterations_table)
+    ) {
+      this.schemaEnsured = true;
+      return;
+    }
+
     await this.pool.query(SCHEMA_SQL);
+    this.schemaEnsured = true;
   }
 
   // ─── Session Management ──────────────────────────────────

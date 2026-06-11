@@ -96,23 +96,13 @@ Then add Rembr as an MCP server in your VS Code settings or `.vscode/mcp.json`:
 ### Direct API / Custom agents
 
 ```bash
-# Step 1: Initialize session
+# The server is stateless — no initialize handshake or session header needed.
+# Store a memory in a single call:
 curl -X POST https://rembr.ai/mcp \
   -H "x-api-key: mb_live_YOUR_KEY" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -D - \
-  -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"my-agent","version":"1.0"}},"id":1}'
-
-# Note the mcp-session-id from response headers
-
-# Step 2: Store a memory
-curl -X POST https://rembr.ai/mcp \
-  -H "x-api-key: mb_live_YOUR_KEY" \
-  -H "mcp-session-id: mcp_XXXXXXXXX" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"store_memory","arguments":{"content":"Hello from Rembr!","category":"facts"}},"id":2}'
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"store_memory","arguments":{"content":"Hello from Rembr!","category":"facts"}},"id":1}'
 ```
 
 ---
@@ -185,7 +175,7 @@ Rembr has a built-in NLP engine that detects 21 types of personal information (e
 
 ## Next steps
 
-- [MCP Tools Reference](/docs/mcp-tools) — all 83 tools documented across 15 categories
+- [MCP Tools Reference](/docs/mcp-tools) — all 102 tools documented across 15 categories
 - [Agent Guide](/docs/agent-guide) — building AI agents with Rembr
 - [Patterns Guide](/docs/patterns) — best practices and common patterns
 - [Security](/docs/security) — authentication, PII detection, GDPR compliance

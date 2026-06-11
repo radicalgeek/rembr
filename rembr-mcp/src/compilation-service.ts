@@ -416,34 +416,104 @@ export class CompilationService {
     confidence: number;
     evidence: string | null;
   } {
-    const negationPairs = [
+    const t1Lower = this.normalizeForContradiction(text1);
+    const t2Lower = this.normalizeForContradiction(text2);
+    const sharedTerms = this.sharedContradictionTerms(t1Lower, t2Lower);
+
+    if (sharedTerms.size < 2 && this.calculateTextSimilarity(t1Lower, t2Lower) < 0.35) {
+      return { isContradiction: false, confidence: 0, evidence: null };
+    }
+
+    const valuePairs = [
       ['yes', 'no'],
       ['true', 'false'],
       ['correct', 'incorrect'],
       ['valid', 'invalid'],
-      ['is', 'is not'],
-      ['was', 'was not'],
-      ['will', 'will not'],
-      ['can', 'cannot'],
+      ['enabled', 'disabled'],
+      ['available', 'unavailable'],
+      ['allowed', 'forbidden'],
+      ['supported', 'unsupported'],
     ];
 
-    const t1Lower = text1.toLowerCase();
-    const t2Lower = text2.toLowerCase();
-
-    for (const [pos, neg] of negationPairs) {
+    for (const [pos, neg] of valuePairs) {
       if (
-        (t1Lower.includes(pos) && t2Lower.includes(neg)) ||
-        (t1Lower.includes(neg) && t2Lower.includes(pos))
+        (this.hasWord(t1Lower, pos) && this.hasWord(t2Lower, neg)) ||
+        (this.hasWord(t1Lower, neg) && this.hasWord(t2Lower, pos))
       ) {
         return {
           isContradiction: true,
-          confidence: 0.7,
-          evidence: `Contains opposing terms: "${pos}" vs "${neg}"`
+          confidence: Math.min(0.85, 0.65 + sharedTerms.size * 0.05),
+          evidence: `Shared subject with opposing values: "${pos}" vs "${neg}"`
         };
       }
     }
 
+    const negation = this.detectPredicateNegation(t1Lower, t2Lower) ||
+      this.detectPredicateNegation(t2Lower, t1Lower);
+
+    if (negation) {
+      return {
+        isContradiction: true,
+        confidence: Math.min(0.9, 0.7 + sharedTerms.size * 0.04),
+        evidence: `Shared subject with negated predicate: "${negation}"`
+      };
+    }
+
     return { isContradiction: false, confidence: 0, evidence: null };
+  }
+
+  private normalizeForContradiction(text: string): string {
+    return text
+      .toLowerCase()
+      .replace(/cannot/g, 'can not')
+      .replace(/[^\p{L}\p{N}\s-]/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private hasWord(text: string, word: string): boolean {
+    return new RegExp(`\\b${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(text);
+  }
+
+  private sharedContradictionTerms(text1: string, text2: string): Set<string> {
+    const stopWords = new Set([
+      'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'onto', 'was', 'were',
+      'will', 'would', 'should', 'could', 'can', 'not', 'are', 'is', 'been', 'being',
+      'have', 'has', 'had', 'yes', 'no', 'true', 'false', 'valid', 'invalid', 'correct',
+      'incorrect', 'enabled', 'disabled', 'available', 'unavailable', 'allowed', 'forbidden',
+      'supported', 'unsupported'
+    ]);
+
+    const words = (text: string) => new Set(
+      text.split(/\s+/).filter(word => word.length > 3 && !stopWords.has(word))
+    );
+
+    const words1 = words(text1);
+    const words2 = words(text2);
+    return new Set([...words1].filter(word => words2.has(word)));
+  }
+
+  private detectPredicateNegation(positiveText: string, negatedText: string): string | null {
+    const patterns = [
+      /\b(is|are|was|were|can|should|will)\s+not\s+([a-z0-9-]+(?:\s+[a-z0-9-]+){0,2})\b/g,
+      /\b(can)\s+not\s+([a-z0-9-]+(?:\s+[a-z0-9-]+){0,2})\b/g,
+      /\b(no longer)\s+([a-z0-9-]+(?:\s+[a-z0-9-]+){0,2})\b/g
+    ];
+
+    for (const pattern of patterns) {
+      for (const match of negatedText.matchAll(pattern)) {
+        const predicate = match[2].trim();
+        const positivePhrase = match[1] === 'no longer'
+          ? predicate
+          : `${match[1]} ${predicate}`;
+
+        if (predicate.length > 2 && positiveText.includes(positivePhrase)) {
+          return predicate;
+        }
+      }
+    }
+
+    return null;
   }
 
   private calculateTextSimilarity(text1: string, text2: string): number {

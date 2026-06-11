@@ -1,0 +1,35 @@
+{
+  "name": "opencode-rembr",
+  "version": "0.1.0",
+  "description": "OpenCode plugin that gives agents persistent, cross-session memory backed by Rembr",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "memory",
+    "mcp",
+    "rembr",
+    "ai-agents"
+  ],
+  "author": "Mark @ radicalgeek",
+  "license": "MIT",
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.16.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.2.0",
+    "typescript": "^5.9.3",
+    "vitest": "^1.6.1"
+  }
+}

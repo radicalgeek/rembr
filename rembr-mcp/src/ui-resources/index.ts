@@ -17,7 +17,11 @@
 
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import { dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { createUIResource } from '@mcp-ui/server';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Template rendering options

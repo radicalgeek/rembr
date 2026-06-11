@@ -1,0 +1,38 @@
+{
+  "name": "codex-rembr",
+  "version": "0.1.0",
+  "description": "Rembr memory for OpenAI Codex: stdio MCP bridge with curated memory tools, plus config recipes and an agent skill.",
+  "type": "module",
+  "main": "dist/server.js",
+  "bin": {
+    "codex-rembr": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "codex",
+    "mcp",
+    "memory",
+    "rembr",
+    "ai-agents"
+  ],
+  "author": "Mark @ radicalgeek",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^24.2.0",
+    "typescript": "^5.9.3",
+    "vitest": "^1.6.1"
+  }
+}

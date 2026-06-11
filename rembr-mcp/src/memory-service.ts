@@ -230,6 +230,7 @@ export class MemoryService {
   /** Max concurrent embedding generation jobs */
   private static readonly MAX_INFLIGHT_EMBEDDINGS = 3;
   private static inflightEmbeddings = 0;
+  private static missingEmbeddingBackfills = new Set<string>();
   /** Max concurrent contradiction detection jobs (uses LLM — exclusive GPU time) */
   private static readonly MAX_INFLIGHT_CONTRADICTIONS = 1;
   private static inflightContradictions = 0;
@@ -639,7 +640,7 @@ export class MemoryService {
         LIMIT 50  -- Cap connected memories to avoid explosion
       `;
 
-      const result = await this.db.query(query, [memoryIds, this.tenantId]);
+      const result = await this.db.query(query, [memoryIds, this.tenantId], this.tenantId);
       const connectedRows = result.rows;
 
       // Group connected memories by source memory
@@ -809,6 +810,10 @@ export class MemoryService {
       dimensions = this.embeddingProvider.dimensions;
     }
 
+    if (backlog > 0) {
+      this.scheduleMissingEmbeddingBackfill(backlog);
+    }
+
     return {
       total_embeddings: embeddingCount,
       embedding_provider: provider,
@@ -840,14 +845,14 @@ export class MemoryService {
     }
 
     // Query memories without embeddings
-    const result = await this.db.dbPool.query(`
+    const result = await this.db.query(`
       SELECT m.id, m.content, m.tenant_id
       FROM memories m
       LEFT JOIN memory_embeddings me ON m.id = me.memory_id
       WHERE m.tenant_id = $1 AND me.memory_id IS NULL
       ORDER BY m.created_at DESC
       LIMIT $2
-    `, [this.tenantId, batchSize]);
+    `, [this.tenantId, batchSize], this.tenantId);
 
     let generated = 0;
     let failed = 0;
@@ -888,11 +893,31 @@ export class MemoryService {
       }
     }
 
-    // Update backlog gauge
-    const stats = await this.getEmbeddingStats();
-    console.log(`📊 Backfill complete: ${generated} generated, ${failed} failed, ${stats.memories_without_embeddings} remaining`);
+    // Update backlog gauge without recursively scheduling another backfill.
+    const totalMemories = await this.db.getMemoryCount(this.tenantId);
+    const embeddingCount = await this.db.getEmbeddingCount(this.tenantId);
+    const remaining = Math.max(0, totalMemories - embeddingCount);
+    updateEmbeddingBacklog(this.tenantId, remaining);
+    console.log(`📊 Backfill complete: ${generated} generated, ${failed} failed, ${remaining} remaining`);
 
     return { generated, failed, total: result.rows.length };
+  }
+
+  private scheduleMissingEmbeddingBackfill(backlog: number): void {
+    if (!this.embeddingProvider || MemoryService.missingEmbeddingBackfills.has(this.tenantId)) {
+      return;
+    }
+
+    MemoryService.missingEmbeddingBackfills.add(this.tenantId);
+    setTimeout(async () => {
+      try {
+        await this.backfillMissingEmbeddings(Math.min(25, Math.max(1, backlog)));
+      } catch (error) {
+        console.error(`Tenant embedding backfill failed for ${this.tenantId}:`, error);
+      } finally {
+        MemoryService.missingEmbeddingBackfills.delete(this.tenantId);
+      }
+    }, 0);
   }
 
   // Week 13: Context Intelligence Methods
@@ -1044,7 +1069,7 @@ export class MemoryService {
     `;
     
     const params = this.projectId ? [this.tenantId, this.projectId, ...ids] : [this.tenantId, null, ...ids];
-    const result = await this.db.query(query, params);
+    const result = await this.db.query(query, params, this.tenantId);
     
     return result.rows.map((row: any) => ({
       ...row,
@@ -1070,7 +1095,7 @@ export class MemoryService {
     `;
     
     const params = this.projectId ? [this.tenantId, this.projectId, since] : [this.tenantId, since];
-    const result = await this.db.query(query, params);
+    const result = await this.db.query(query, params, this.tenantId);
     
     return {
       category_patterns: result.rows,
@@ -1082,14 +1107,16 @@ export class MemoryService {
   private async getRelationshipInsights(since: Date): Promise<any> {
     try {
       const query = `
-        SELECT relationship_type, COUNT(*) as count, AVG(confidence) as avg_confidence
-        FROM memory_relationships 
-        WHERE created_at >= $1
-        GROUP BY relationship_type
+        SELECT mr.relationship_type, COUNT(*) as count, AVG(mr.confidence) as avg_confidence
+        FROM memory_relationships mr
+        JOIN memories m ON m.id = mr.source_memory_id
+        WHERE m.tenant_id = $1
+          AND mr.created_at >= $2
+        GROUP BY mr.relationship_type
         ORDER BY count DESC
       `;
       
-      const result = await this.db.query(query, [since]);
+      const result = await this.db.query(query, [this.tenantId, since], this.tenantId);
       
       return {
         relationship_types: result.rows,
@@ -1120,7 +1147,7 @@ export class MemoryService {
     `;
     
     const params = this.projectId ? [this.tenantId, this.projectId, since] : [this.tenantId, since];
-    const result = await this.db.query(query, params);
+    const result = await this.db.query(query, params, this.tenantId);
     
     return {
       daily_usage: result.rows,
@@ -1148,7 +1175,7 @@ export class MemoryService {
     `;
     
     const params = this.projectId ? [this.tenantId, this.projectId, since] : [this.tenantId, since];
-    const result = await this.db.query(query, params);
+    const result = await this.db.query(query, params, this.tenantId);
     
     const categoryStats = result.rows.map((row: any) => ({
       category: row.category,
@@ -1177,7 +1204,7 @@ export class MemoryService {
     `;
     
     const params = this.projectId ? [this.tenantId, this.projectId, since] : [this.tenantId, since];
-    const result = await this.db.query(query, params);
+    const result = await this.db.query(query, params, this.tenantId);
     
     // Analyze content for domain indicators
     const domainKeywords = {

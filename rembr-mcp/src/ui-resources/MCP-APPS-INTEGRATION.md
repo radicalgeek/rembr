@@ -78,8 +78,8 @@ registerAppResource(
     _meta: {
       ui: {
         csp: {
-          'script-src': ["'self'", 'https://d3js.org'],
-          'style-src': ["'self'"]
+          'script-src': ["'unsafe-inline'", 'https://d3js.org'],
+          'style-src': ["'unsafe-inline'"]
         }
       }
     }
@@ -311,8 +311,8 @@ The UIs use inline scripts and external CDN libraries (D3.js, Chart.js, Diff.js)
 _meta: {
   ui: {
     csp: {
-      'script-src': ["'self'", 'https://d3js.org', 'https://cdn.jsdelivr.net'],
-      'style-src': ["'self'"]
+      'script-src': ["'unsafe-inline'", 'https://d3js.org', 'https://cdn.jsdelivr.net'],
+      'style-src': ["'unsafe-inline'"]
     }
   }
 }

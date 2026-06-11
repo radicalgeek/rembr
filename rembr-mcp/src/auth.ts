@@ -96,14 +96,7 @@ export class AuthService {
     this.jwtSecret = secret;
     this.apiKeySecret = process.env.API_KEY_SECRET;
 
-    if (!this.apiKeySecret) {
-      if (process.env.NODE_ENV === 'production') {
-        throw new Error(
-          'API_KEY_SECRET environment variable is not set. ' +
-          'Refusing to start in production with plain SHA-256 API key hashing.'
-        );
-      }
-
+    if (!this.apiKeySecret && process.env.NODE_ENV !== 'production') {
       console.warn(
         '[AuthService] API_KEY_SECRET is not set. API key hashing uses plain SHA-256 ' +
         '(vulnerable to rainbow table attacks). Set API_KEY_SECRET to enable ' +
@@ -141,6 +134,9 @@ export class AuthService {
    */
   hashApiKeyHmac(apiKey: string): string {
     if (!this.apiKeySecret) {
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error('API_KEY_SECRET is required to verify hmac-sha256 API keys in production');
+      }
       return this.hashApiKey(apiKey);
     }
     return createHmac('sha256', this.apiKeySecret).update(apiKey).digest('hex');
@@ -225,7 +221,16 @@ export class AuthService {
 // Standalone functions (used in middleware / index-http.ts)
 // ---------------------------------------------------------------------------
 
-/** Verify an OAuth access token via DB lookup. */
+/**
+ * Verify an OAuth access token via DB lookup.
+ *
+ * SEP-837 / RFC 9207 (MCP 2026-07-28): tokens are bound to the authorization
+ * server that issued them. When the `issuer` column is populated and an
+ * expected issuer is configured (`OAUTH_EXPECTED_ISSUER`, falling back to
+ * `PUBLIC_URL`), a mismatch is logged — and rejected when
+ * `OAUTH_ENFORCE_ISSUER=true`. Advisory-first so tokens issued before the
+ * issuer column existed keep working during rollout.
+ */
 export async function verifyOAuthToken(
   pool: any,
   accessToken: string
@@ -237,12 +242,28 @@ export async function verifyOAuthToken(
 
     if (process.env.NODE_ENV !== 'production') console.log('Querying oauth_tokens table for token verification');
 
-    const result = await pool.query(
-      `SELECT tenant_id, user_id, scope, expires_at
-       FROM oauth_tokens
-       WHERE access_token = $1`,
-      [hashOAuthToken(accessToken)]
-    );
+    // Include issuer when the column exists; fall back for pre-migration DBs
+    // (42703 = undefined_column), mirroring verifyApiKey's hash_algorithm shim.
+    let result;
+    try {
+      result = await pool.query(
+        `SELECT tenant_id, user_id, scope, expires_at, issuer
+         FROM oauth_tokens
+         WHERE access_token = $1`,
+        [hashOAuthToken(accessToken)]
+      );
+    } catch (colErr: any) {
+      if (colErr?.code === '42703') {
+        result = await pool.query(
+          `SELECT tenant_id, user_id, scope, expires_at
+           FROM oauth_tokens
+           WHERE access_token = $1`,
+          [hashOAuthToken(accessToken)]
+        );
+      } else {
+        throw colErr;
+      }
+    }
 
     if (result.rows.length === 0) {
       return { success: false, error: 'Invalid or expired OAuth token' };
@@ -252,6 +273,18 @@ export async function verifyOAuthToken(
 
     if (new Date(tokenData.expires_at) < new Date()) {
       return { success: false, error: 'OAuth token expired' };
+    }
+
+    // Issuer binding (SEP-837 / RFC 9207)
+    const expectedIssuer = process.env.OAUTH_EXPECTED_ISSUER || process.env.PUBLIC_URL;
+    if (expectedIssuer && tokenData.issuer && tokenData.issuer !== expectedIssuer) {
+      if (process.env.OAUTH_ENFORCE_ISSUER === 'true') {
+        return { success: false, error: 'OAuth token issuer mismatch' };
+      }
+      console.warn(
+        `[OAuth] Token issuer mismatch (advisory): expected "${expectedIssuer}", got "${tokenData.issuer}". ` +
+        'Set OAUTH_ENFORCE_ISSUER=true to reject these tokens.'
+      );
     }
 
     return {

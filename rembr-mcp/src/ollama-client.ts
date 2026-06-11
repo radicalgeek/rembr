@@ -1,4 +1,5 @@
 import { Ollama } from 'ollama';
+import { createHash } from 'node:crypto';
 import { trackEmbeddingGeneration } from './metrics.js';
 import { EmbeddingCache } from './embedding-cache.js';
 
@@ -10,7 +11,8 @@ import { EmbeddingCache } from './embedding-cache.js';
  * Ollama is a local/in-cluster service with no built-in HA. To avoid making it
  * a hard single point of failure, this client implements:
  *
- * 1. **Timeouts** — embedding calls abort after 30 s; text generation after 60 s.
+ * 1. **Timeouts** — embedding calls abort after 30 s; text generation defaults
+ *    to 60 s for Ollama and 180 s for OpenAI-compatible endpoints.
  *
  * 2. **Retry with exponential backoff** — transient network blips (connection
  *    refused, 503, timeout) are retried up to `MAX_RETRIES` times with jittered
@@ -31,9 +33,15 @@ import { EmbeddingCache } from './embedding-cache.js';
  *    called before batch operations to gate work that requires embeddings.
  *
  * ## Environment Variables
- * - `OLLAMA_HOST`              — Ollama base URL (default: cluster-local service)
+ * - `OLLAMA_HOST`              — Ollama base URL for embeddings (default: cluster-local service)
+ * - `OLLAMA_TEXT_HOST`         — Optional Ollama base URL for text generation
+ * - `TEXT_GENERATION_PROVIDER` — "ollama" or "openai-compatible" (also accepts "lmstudio")
+ * - `LM_STUDIO_BASE_URL`       — LM Studio/OpenAI-compatible base URL, e.g. http://host:1234/v1
+ * - `LM_STUDIO_MODEL`          — LM Studio model id for text generation
+ * - `LM_STUDIO_API_KEY`        — Optional LM Studio bearer token (defaults to a non-empty local token)
  * - `OLLAMA_EMBEDDING_MODEL`   — embedding model name (default: nomic-embed-text)
  * - `OLLAMA_TEXT_MODEL`        — text-gen model name (default: llama3.1:8b)
+ * - `TEXT_GENERATION_TIMEOUT_MS` — text generation timeout override in milliseconds
  * - `OLLAMA_FALLBACK_EMBEDDING`— set to "zero" to enable zero-vector fallback
  * - `OLLAMA_MAX_RETRIES`       — override retry count (default: 3)
  *
@@ -45,7 +53,11 @@ import { EmbeddingCache } from './embedding-cache.js';
 export class OllamaClient {
   private static instance: OllamaClient;
   private client: Ollama;
+  private textClient: Ollama;
   private host: string;
+  private textHost: string;
+  private textProvider: 'ollama' | 'openai-compatible';
+  private openAICompatibleApiKey: string;
   private embeddingModel: string;
   private textModel: string;
   private embeddingCache: EmbeddingCache;
@@ -53,6 +65,7 @@ export class OllamaClient {
   // Resilience config
   private readonly MAX_RETRIES: number;
   private readonly FALLBACK_MODE: 'throw' | 'zero';
+  private readonly TEXT_GENERATION_TIMEOUT_MS: number;
   private readonly CIRCUIT_OPEN_THRESHOLD = 5;
   private readonly CIRCUIT_RESET_MS = 30_000;
 
@@ -62,14 +75,31 @@ export class OllamaClient {
 
   private constructor() {
     this.host = process.env.OLLAMA_HOST || 'http://ollama.ai.svc.cluster.local:11434';
+    this.textHost = process.env.LM_STUDIO_BASE_URL
+      || process.env.OPENAI_COMPATIBLE_TEXT_BASE_URL
+      || process.env.OLLAMA_TEXT_HOST
+      || this.host;
+    this.textProvider = this.resolveTextProvider(this.textHost);
+    this.openAICompatibleApiKey = process.env.LM_STUDIO_API_KEY
+      || process.env.OPENAI_COMPATIBLE_API_KEY
+      || 'lm-studio';
     this.embeddingModel = process.env.OLLAMA_EMBEDDING_MODEL || 'nomic-embed-text';
-    this.textModel = process.env.OLLAMA_TEXT_MODEL || 'llama3.1:8b';
+    this.textModel = process.env.LM_STUDIO_MODEL
+      || process.env.OPENAI_COMPATIBLE_TEXT_MODEL
+      || process.env.OLLAMA_TEXT_MODEL
+      || 'llama3.1:8b';
     this.client = new Ollama({ host: this.host });
+    this.textClient = new Ollama({ host: this.textHost });
     this.embeddingCache = EmbeddingCache.getInstance();
     this.MAX_RETRIES = parseInt(process.env.OLLAMA_MAX_RETRIES || '3', 10);
     this.FALLBACK_MODE = process.env.OLLAMA_FALLBACK_EMBEDDING === 'zero' ? 'zero' : 'throw';
+    const defaultTextTimeout = this.textProvider === 'openai-compatible' ? 180_000 : 60_000;
+    this.TEXT_GENERATION_TIMEOUT_MS = this.parsePositiveInt(
+      process.env.TEXT_GENERATION_TIMEOUT_MS,
+      defaultTextTimeout
+    );
 
-    console.log(`OllamaClient initialized: host=${this.host}, embedding=${this.embeddingModel}, text=${this.textModel}, maxRetries=${this.MAX_RETRIES}, fallback=${this.FALLBACK_MODE}`);
+    console.log(`OllamaClient initialized: host=${this.host}, textHost=${this.textHost}, textProvider=${this.textProvider}, embedding=${this.embeddingModel}, text=${this.textModel}, textTimeoutMs=${this.TEXT_GENERATION_TIMEOUT_MS}, maxRetries=${this.MAX_RETRIES}, fallback=${this.FALLBACK_MODE}`);
   }
 
   /**
@@ -289,27 +319,119 @@ export class OllamaClient {
   ): Promise<string> {
     try {
       const timeoutPromise = new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error('Text generation timeout after 60 seconds')), 60000);
+        setTimeout(
+          () => reject(new Error(`Text generation timeout after ${this.TEXT_GENERATION_TIMEOUT_MS}ms`)),
+          this.TEXT_GENERATION_TIMEOUT_MS
+        );
       });
 
-      const generatePromise = this.client.generate({
-        model: this.textModel,
-        prompt,
-        system: systemPrompt,
-        stream: false,
-        options: {
-          temperature: options?.temperature ?? 0.7,
-          num_predict: options?.maxTokens ?? 500,
-          stop: options?.stopSequences
-        }
-      });
+      const generatePromise = this.textProvider === 'openai-compatible'
+        ? this.generateOpenAICompatibleText(prompt, systemPrompt, options)
+        : this.textClient.generate({
+            model: this.textModel,
+            prompt,
+            system: systemPrompt,
+            stream: false,
+            options: {
+              temperature: options?.temperature ?? 0.7,
+              num_predict: options?.maxTokens ?? 500,
+              stop: options?.stopSequences
+            }
+          }).then(response => response.response);
 
-      const response = await Promise.race([generatePromise, timeoutPromise]);
-      return response.response;
+      return await Promise.race([generatePromise, timeoutPromise]);
     } catch (error) {
-      console.error('Ollama text generation failed:', error);
+      console.error('Text generation failed:', error);
       throw error;
     }
+  }
+
+  private async generateOpenAICompatibleText(
+    prompt: string,
+    systemPrompt?: string,
+    options?: {
+      temperature?: number;
+      maxTokens?: number;
+      stopSequences?: string[];
+    }
+  ): Promise<string> {
+    const baseUrl = this.normalizedOpenAICompatibleBaseUrl();
+    const disableThinking = process.env.OPENAI_COMPATIBLE_DISABLE_THINKING !== 'false';
+    const defaultMaxTokens = Number(process.env.OPENAI_COMPATIBLE_MAX_TOKENS ?? 4096);
+    const messages = [
+      ...(systemPrompt ? [{ role: 'system', content: disableThinking ? `/no_think\n${systemPrompt}` : systemPrompt }] : []),
+      { role: 'user', content: prompt }
+    ];
+
+    if (disableThinking && !systemPrompt) {
+      messages[0].content = `/no_think\n${messages[0].content}`;
+    }
+
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.openAICompatibleApiKey}`
+      },
+      body: JSON.stringify({
+        model: this.textModel,
+        messages,
+        stream: false,
+        temperature: options?.temperature ?? 0.7,
+        max_tokens: options?.maxTokens ?? defaultMaxTokens,
+        stop: options?.stopSequences,
+        ...(disableThinking ? { chat_template_kwargs: { enable_thinking: false } } : {})
+      })
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(`OpenAI-compatible text generation failed (${response.status}): ${body.slice(0, 500)}`);
+    }
+
+    const data = await response.json() as {
+      choices?: Array<{ message?: { content?: string; reasoning_content?: string }; text?: string; finish_reason?: string }>;
+      error?: { message?: string };
+      usage?: unknown;
+    };
+
+    const choice = data.choices?.[0];
+    const text = choice?.message?.content ?? choice?.text;
+    if (!text) {
+      const reasoningLength = choice?.message?.reasoning_content?.length ?? 0;
+      const finishReason = choice?.finish_reason ?? 'unknown';
+      throw new Error(
+        data.error?.message ||
+        `OpenAI-compatible text generation returned no content (finish_reason=${finishReason}, reasoning_content_chars=${reasoningLength})`
+      );
+    }
+
+    return text;
+  }
+
+  private resolveTextProvider(textHost: string): 'ollama' | 'openai-compatible' {
+    const configured = process.env.TEXT_GENERATION_PROVIDER?.toLowerCase();
+    if (configured === 'openai-compatible' || configured === 'lmstudio' || configured === 'lm-studio') {
+      return 'openai-compatible';
+    }
+    if (configured === 'ollama') {
+      return 'ollama';
+    }
+    if (process.env.LM_STUDIO_BASE_URL || process.env.OPENAI_COMPATIBLE_TEXT_BASE_URL) {
+      return 'openai-compatible';
+    }
+    return textHost.replace(/\/$/, '').endsWith('/v1') ? 'openai-compatible' : 'ollama';
+  }
+
+  private normalizedOpenAICompatibleBaseUrl(): string {
+    const trimmed = this.textHost.replace(/\/+$/, '');
+    return trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`;
+  }
+
+  private parsePositiveInt(value: string | undefined, fallback: number): number {
+    if (!value) return fallback;
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
   }
 
   /**
@@ -344,6 +466,14 @@ export class OllamaClient {
     return this.host;
   }
 
+  getTextHost(): string {
+    return this.textHost;
+  }
+
+  getTextProvider(): string {
+    return this.textProvider;
+  }
+
   /**
    * Get embedding model name
    */
@@ -364,8 +494,7 @@ export class OllamaClient {
    * Used to detect incompatible embeddings when the model changes.
    */
   getModelFingerprint(): string {
-    const crypto = require('crypto');
     const canonical = `ollama|${this.embeddingModel}|768`;
-    return crypto.createHash('sha256').update(canonical).digest('hex');
+    return createHash('sha256').update(canonical).digest('hex');
   }
 }

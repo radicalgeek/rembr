@@ -14,8 +14,8 @@ DECLARE
   deleted_count INTEGER;
 BEGIN
   DELETE FROM oauth_tokens
-  WHERE length(access_token) = 74
-    AND access_token LIKE 'mcp_oauth_%';
+  WHERE (length(access_token) = 74 AND access_token LIKE 'mcp_oauth_%')
+     OR (length(refresh_token) = 76 AND refresh_token LIKE 'mcp_refresh_%');
 
   GET DIAGNOSTICS deleted_count = ROW_COUNT;
   RAISE NOTICE 'Purged % plaintext OAuth tokens', deleted_count;

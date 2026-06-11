@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "owner": {
+    "name": "Rembr",
+    "url": "https://rembr.ai"
+  },
+  "description": "Rembr plugins: persistent, structured memory for AI coding agents",
+  "plugins": [
+    {
+      "name": "rembr",
+      "description": "Persistent cross-session memory for Claude Code backed by Rembr: bundled MCP server, session-start recall injection, trigger-phrase auto-capture, and /rembr:remember + /rembr:recall skills.",
+      "source": {
+        "type": "local",
+        "path": "./claude-code-rembr"
+      }
+    }
+  ]
+}

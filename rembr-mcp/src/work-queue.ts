@@ -115,7 +115,6 @@ const SCHEMA_SQL = `
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (tenant_id, idempotency_key)
-      DEFERRABLE INITIALLY DEFERRED
   );
 
   CREATE INDEX IF NOT EXISTS idx_work_queue_claim
@@ -172,6 +171,12 @@ export class WorkQueueService {
 
   private async ensureSchema(): Promise<void> {
     if (this.schemaEnsured) return;
+    const existing = await this.pool.query(`SELECT to_regclass('public.work_queue') AS table_name`);
+    if (existing.rows.length === 0 || existing.rows[0]?.table_name) {
+      this.schemaEnsured = true;
+      return;
+    }
+
     await this.pool.query(SCHEMA_SQL);
     this.schemaEnsured = true;
   }
@@ -449,22 +454,35 @@ export class WorkQueueService {
     if (queueName) params.push(queueName);
 
     const result = await this.pool.query(`
+      WITH queue_rollup AS (
+        SELECT
+          queue_name,
+          COUNT(*) FILTER (WHERE status = 'pending')     AS pending,
+          COUNT(*) FILTER (WHERE status = 'claimed')     AS claimed,
+          COUNT(*) FILTER (WHERE status = 'completed')   AS completed,
+          COUNT(*) FILTER (WHERE status = 'failed')      AS failed,
+          COUNT(*) FILTER (WHERE status = 'dead_letter') AS dead_letter,
+          COUNT(*) AS total,
+          MIN(created_at) FILTER (WHERE status = 'pending') AS oldest_pending_at,
+          AVG(EXTRACT(EPOCH FROM (completed_at - claimed_at)))
+            FILTER (WHERE status = 'completed' AND claimed_at IS NOT NULL AND completed_at IS NOT NULL)
+            AS avg_completion_seconds
+        FROM work_queue
+        WHERE tenant_id = $1 ${queueFilter}
+        GROUP BY queue_name
+      )
       SELECT
         queue_name,
         $1::text AS tenant_id,
-        COUNT(*) FILTER (WHERE status = 'pending')     AS pending,
-        COUNT(*) FILTER (WHERE status = 'claimed')     AS claimed,
-        COUNT(*) FILTER (WHERE status = 'completed')   AS completed,
-        COUNT(*) FILTER (WHERE status = 'failed')      AS failed,
-        COUNT(*) FILTER (WHERE status = 'dead_letter') AS dead_letter,
-        COUNT(*) AS total,
-        EXTRACT(EPOCH FROM (NOW() - MIN(created_at) FILTER (WHERE status = 'pending')))
-          AS oldest_pending_age_seconds,
-        AVG(EXTRACT(EPOCH FROM (completed_at - claimed_at)) FILTER (WHERE status = 'completed' AND claimed_at IS NOT NULL))
-          AS avg_completion_seconds
-      FROM work_queue
-      WHERE tenant_id = $1 ${queueFilter}
-      GROUP BY queue_name
+        pending,
+        claimed,
+        completed,
+        failed,
+        dead_letter,
+        total,
+        EXTRACT(EPOCH FROM (NOW() - oldest_pending_at)) AS oldest_pending_age_seconds,
+        avg_completion_seconds
+      FROM queue_rollup
       ORDER BY queue_name
     `, params);
 

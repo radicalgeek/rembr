@@ -144,4 +144,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tool-specific configuration for each supported editor
 - Examples for all search modes and metadata filtering
 
-[1.0.0]: https://github.com/radicalgeek/rembr/releases/tag/v1.0.0
+[1.0.0]: https://github.com/radicalgeek/rembr-client/releases/tag/v1.0.0

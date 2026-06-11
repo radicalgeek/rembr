@@ -32,8 +32,8 @@ registerAppResource(
       ui: {
         // Optional: CSP configuration
         csp: {
-          'script-src': ["'self'", 'https://d3js.org'],
-          'style-src': ["'self'"]
+          'script-src': ["'unsafe-inline'", 'https://d3js.org'],
+          'style-src': ["'unsafe-inline'"]
         }
       }
     }

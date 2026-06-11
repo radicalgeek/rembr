@@ -154,15 +154,22 @@ export class RelationshipMaintainerService {
     let created = 0;
     for (const rel of relationships) {
       try {
-        await this.db.query(`
+        const result = await this.db.query(`
           INSERT INTO memory_relationships (
             source_memory_id,
             target_memory_id,
             relationship_type,
             confidence,
             evidence
-          ) VALUES ($1, $2, $3, $4, $5)
-          ON CONFLICT (source_memory_id, target_memory_id) DO NOTHING
+          )
+          SELECT $1, $2, $3, $4, $5
+          WHERE NOT EXISTS (
+            SELECT 1
+            FROM memory_relationships
+            WHERE (source_memory_id = $1 AND target_memory_id = $2)
+               OR (source_memory_id = $2 AND target_memory_id = $1)
+          )
+          RETURNING id
         `, [
           rel.sourceMemoryId,
           rel.targetMemoryId,
@@ -170,7 +177,7 @@ export class RelationshipMaintainerService {
           rel.confidence,
           rel.evidence
         ]);
-        created++;
+        created += result.rowCount ?? result.rows?.length ?? 0;
       } catch (error) {
         console.error(`Failed to create relationship: ${error}`);
       }

@@ -5,7 +5,7 @@
  * Enables "why" questions and counterfactual analysis.
  */
 
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { OllamaClient } from './ollama-client.js';
 
 export interface CausalLink {
@@ -51,6 +51,32 @@ export class CausalReasoningService {
     private ollama: OllamaClient
   ) {}
 
+  private async withTenantContext<T>(
+    tenantId: string,
+    projectId: string | undefined,
+    fn: (client: PoolClient) => Promise<T>
+  ): Promise<T> {
+    const client = await this.db.connect();
+
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `SELECT set_config('app.current_tenant', $1, true),
+                set_config('app.current_project', $2, true)`,
+        [tenantId, projectId || '']
+      );
+
+      const result = await fn(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   /**
    * Infer potential causal relationship between two memories using LLM
    */
@@ -69,11 +95,13 @@ export class CausalReasoningService {
         AND ($3::uuid IS NULL OR project_id = $3)
     `;
     
-    const result = await this.db.query(memoriesQuery, [
-      [causeMemoryId, effectMemoryId],
-      tenantId,
-      projectId
-    ]);
+    const result = await this.withTenantContext(tenantId, projectId, (client) =>
+      client.query(memoriesQuery, [
+        [causeMemoryId, effectMemoryId],
+        tenantId,
+        projectId
+      ])
+    );
 
     if (result.rows.length !== 2) {
       return null;
@@ -137,8 +165,13 @@ Respond ONLY with valid JSON (no markdown):
       const analysis = JSON.parse(cleanResponse);
 
       if (!analysis.has_causality || analysis.strength < 0.60) {
-        console.log('No significant causal relationship detected');
-        return null;
+        const explicitFallback = this.detectExplicitCausalMarkers(cause.content, effect.content);
+        if (!explicitFallback) {
+          console.log('No significant causal relationship detected');
+          return null;
+        }
+
+        Object.assign(analysis, explicitFallback);
       }
 
       // 5. Store causal relationship
@@ -172,8 +205,58 @@ Respond ONLY with valid JSON (no markdown):
       return insertResult.rows[0];
     } catch (error) {
       console.error('Error inferring causality:', error);
+      const explicitFallback = this.detectExplicitCausalMarkers(cause.content, effect.content);
+      if (explicitFallback) {
+        const insertQuery = `
+          INSERT INTO causal_relationships
+          (tenant_id, project_id, cause_memory_id, effect_memory_id, causal_type, causal_strength,
+           inferred_by, inference_model, inference_prompt, confidence_score, metadata)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+          RETURNING *
+        `;
+
+        const insertResult = await this.db.query(insertQuery, [
+          tenantId,
+          projectId,
+          causeMemoryId,
+          effectMemoryId,
+          explicitFallback.causal_type,
+          explicitFallback.strength,
+          'system',
+          'explicit-causal-marker',
+          'Explicit Cause:/Effect: markers detected after LLM inference failed',
+          explicitFallback.strength,
+          JSON.stringify({
+            explanation: explicitFallback.explanation,
+            fallback: true,
+            cause_category: cause.category,
+            effect_category: effect.category
+          })
+        ]);
+
+        return insertResult.rows[0];
+      }
       return null;
     }
+  }
+
+  private detectExplicitCausalMarkers(
+    causeContent: string,
+    effectContent: string
+  ): { has_causality: true; causal_type: 'causes'; strength: number; explanation: string } | null {
+    const hasCauseMarker = /\bcause\s*:/i.test(causeContent);
+    const hasEffectMarker = /\beffect\s*:/i.test(effectContent);
+
+    if (!hasCauseMarker || !hasEffectMarker) {
+      return null;
+    }
+
+    return {
+      has_causality: true,
+      causal_type: 'causes',
+      strength: 0.70,
+      explanation: 'Explicit Cause:/Effect: markers indicate an agent-authored causal relationship.'
+    };
   }
 
   /**
@@ -194,12 +277,15 @@ Respond ONLY with valid JSON (no markdown):
       total_links: 0
     };
 
-    await this._traceRecursive(tenantId, memoryId, direction, maxDepth, 0, chain, new Set([memoryId]), projectId);
+    await this.withTenantContext(tenantId, projectId, (client) =>
+      this._traceRecursive(client, tenantId, memoryId, direction, maxDepth, 0, chain, new Set([memoryId]), projectId)
+    );
     
     return chain;
   }
 
   private async _traceRecursive(
+    client: PoolClient,
     tenantId: string,
     memoryId: string,
     direction: 'causes' | 'caused_by',
@@ -229,7 +315,7 @@ Respond ONLY with valid JSON (no markdown):
       LIMIT 10
     `;
 
-    const result = await this.db.query(query, [memoryId, tenantId, projectId]);
+    const result = await client.query(query, [memoryId, tenantId, projectId]);
 
     for (const row of result.rows) {
       const targetId = row[targetColumn];
@@ -252,6 +338,7 @@ Respond ONLY with valid JSON (no markdown):
 
       // Recurse
       await this._traceRecursive(
+        client,
         tenantId,
         targetId,
         direction,
@@ -363,7 +450,9 @@ Respond ONLY with valid JSON (no markdown):
 
     query += ` ORDER BY cr.causal_strength DESC`;
 
-    const result = await this.db.query(query, params);
+    const result = await this.withTenantContext(tenantId, projectId, (client) =>
+      client.query(query, params)
+    );
     return result.rows;
   }
 

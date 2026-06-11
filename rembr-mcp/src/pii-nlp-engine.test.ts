@@ -48,7 +48,7 @@ describe('pattern detection — original types', () => {
   });
 
   it('detects AWS access key', () => {
-    const r = engine.detect('Key: AWS_ACCESS_KEY_ID_EXAMPLE', 'low');
+    const r = engine.detect('Key: AKIAIOSFODNN7EXAMPLE', 'low');
     expect(r.types).toContain('aws_access_key');
   });
 
@@ -221,7 +221,7 @@ describe('sensitivity tiers', () => {
   });
 
   it('result summary is accurate', () => {
-    const r = engine.detect('Contact aws@example.com, key AWS_ACCESS_KEY_ID_EXAMPLE', 'low');
+    const r = engine.detect('Contact aws@example.com, key AKIAIOSFODNN7EXAMPLE', 'low');
     expect(r.summary.patternMatches).toBeGreaterThan(0);
     expect(r.summary.nlpMatches).toBe(0);
     expect(r.summary.highConfidence + r.summary.mediumConfidence + r.summary.lowConfidence).toBe(r.matches.length);
