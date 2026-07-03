@@ -4,14 +4,15 @@ import { Client } from '../node_modules/@modelcontextprotocol/sdk/dist/esm/clien
 import { StreamableHTTPClientTransport } from '../node_modules/@modelcontextprotocol/sdk/dist/esm/client/streamableHttp.js';
 import crypto from 'crypto';
 
-// Test configuration
+// Live e2e test against a running Rembr server. Opt in by pointing
+// TEST_MCP_URL at it (plus TEST_API_KEY); skipped otherwise.
 const TEST_CONFIG = {
   baseUrl: process.env.TEST_MCP_URL || 'http://localhost:3001/mcp',
   apiKey: process.env.TEST_API_KEY || 'mb_live_test1234',
   timeout: 30000
 };
 
-describe('Week 14 Features: Causal, Temporal & Audit', () => {
+describe.skipIf(!process.env.TEST_MCP_URL)('Week 14 Features: Causal, Temporal & Audit', () => {
   let client: Client;
   let transport: StreamableHTTPClientTransport;
   let testMemoryId1: string;

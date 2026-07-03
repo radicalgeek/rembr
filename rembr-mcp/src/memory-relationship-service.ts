@@ -34,8 +34,8 @@ export class MemoryRelationshipService {
   // Thresholds for relationship detection
   private readonly SIMILARITY_THRESHOLD = 0.65; // Semantic similarity threshold (balanced)
   private readonly CONTRADICTION_KEYWORDS = [
-    'however', 'but', 'although', 'despite', 'contrary', 'opposite', 'instead', 'different',
-    'wrong', 'incorrect', 'not', 'never', 'no longer', 'changed', 'updated', 'replaced'
+    'contradicts', 'conflicts with', 'mutually exclusive', 'opposite of',
+    'is wrong', 'is incorrect', 'no longer true'
   ];
   private readonly SUPPORT_KEYWORDS = [
     'also', 'additionally', 'furthermore', 'moreover', 'similarly', 'likewise', 'confirms',
@@ -102,7 +102,7 @@ export class MemoryRelationshipService {
     `;
 
     const params = projectId ? [tenantId, projectId, excludeId] : [tenantId, excludeId];
-    const result = await this.database.query(query, params);
+    const result = await this.database.query(query, params, tenantId);
     
     // Parse embeddings from PostgreSQL vector format "[1,2,3]" to JavaScript arrays
     return result.rows.map((row: any) => ({
@@ -162,12 +162,10 @@ export class MemoryRelationshipService {
    * Detect the type of relationship between two memory contents
    */
   private detectRelationshipType(contentA: string, contentB: string): string {
-    const combinedContent = `${contentA} ${contentB}`.toLowerCase();
-    
-    // Check for contradiction patterns
-    if (this.hasContradictionPattern(contentA, contentB)) {
-      return 'contradicts';
-    }
+    // This service maintains semantic graph relationships. Contradiction rows are
+    // produced by AdvancedAnalyticsService, where an LLM can verify same-topic
+    // incompatibility. Treat keyword-level opposition as a normal relation here
+    // so graph optimization cannot pollute the contradiction review queue.
     
     // Check for support patterns
     if (this.hasSupportPattern(contentA, contentB)) {
@@ -192,8 +190,14 @@ export class MemoryRelationshipService {
    * Check for contradiction patterns between two texts
    */
   private hasContradictionPattern(textA: string, textB: string): boolean {
-    const lowerA = textA.toLowerCase();
-    const lowerB = textB.toLowerCase();
+    const lowerA = this.normalizeForContradiction(textA);
+    const lowerB = this.normalizeForContradiction(textB);
+    const sharedTerms = this.sharedContradictionTerms(lowerA, lowerB);
+    const similarity = this.textSimilarity(lowerA, lowerB);
+
+    if (sharedTerms.size < 2 && similarity < 0.35) {
+      return false;
+    }
     
     // Look for explicit contradiction keywords
     const hasContradictionWords = this.CONTRADICTION_KEYWORDS.some(keyword => 
@@ -213,17 +217,66 @@ export class MemoryRelationshipService {
     const opposingPairs = [
       ['true', 'false'],
       ['enabled', 'disabled'],
-      ['on', 'off'],
       ['yes', 'no'],
       ['should', 'should not'],
       ['will', 'will not'],
-      ['recommended', 'not recommended']
+      ['can', 'can not'],
+      ['recommended', 'not recommended'],
+      ['supported', 'unsupported'],
+      ['available', 'unavailable']
     ];
     
-    return opposingPairs.some(([positive, negative]) => 
-      (textA.includes(positive) && textB.includes(negative)) ||
-      (textA.includes(negative) && textB.includes(positive))
-    );
+    return opposingPairs.some(([positive, negative]) => {
+      const positiveWord = new RegExp(`\\b${positive.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+      const negativeWord = new RegExp(`\\b${negative.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+      return (positiveWord.test(textA) && negativeWord.test(textB)) ||
+        (negativeWord.test(textA) && positiveWord.test(textB));
+    }) || !!this.detectPredicateNegation(textA, textB) || !!this.detectPredicateNegation(textB, textA);
+  }
+
+  private normalizeForContradiction(text: string): string {
+    return text
+      .toLowerCase()
+      .replace(/cannot/g, 'can not')
+      .replace(/[^\p{L}\p{N}\s-]/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private sharedContradictionTerms(textA: string, textB: string): Set<string> {
+    const stopWords = new Set([
+      'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'onto', 'was', 'were',
+      'will', 'would', 'should', 'could', 'can', 'not', 'are', 'is', 'been', 'being',
+      'have', 'has', 'had', 'yes', 'no', 'true', 'false', 'valid', 'invalid', 'correct',
+      'incorrect', 'enabled', 'disabled', 'available', 'unavailable', 'recommended',
+      'supported', 'unsupported'
+    ]);
+
+    const wordsA = new Set(textA.split(/\s+/).filter(word => word.length > 3 && !stopWords.has(word)));
+    const wordsB = new Set(textB.split(/\s+/).filter(word => word.length > 3 && !stopWords.has(word)));
+    return new Set([...wordsA].filter(word => wordsB.has(word)));
+  }
+
+  private detectPredicateNegation(positiveText: string, negatedText: string): string | null {
+    const patterns = [
+      /\b(is|are|was|were|can|should|will)\s+not\s+([a-z0-9-]+(?:\s+[a-z0-9-]+){0,2})\b/g,
+      /\b(no longer)\s+([a-z0-9-]+(?:\s+[a-z0-9-]+){0,2})\b/g
+    ];
+
+    for (const pattern of patterns) {
+      for (const match of negatedText.matchAll(pattern)) {
+        const predicate = match[2].trim();
+        const positivePhrase = match[1] === 'no longer'
+          ? predicate
+          : `${match[1]} ${predicate}`;
+
+        if (predicate.length > 2 && positiveText.includes(positivePhrase)) {
+          return predicate;
+        }
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -300,7 +353,6 @@ export class MemoryRelationshipService {
     const similarityPercent = Math.round(similarity * 100);
     
     const typeExplanations = {
-      contradicts: 'Contains contradictory information or opposing statements',
       supports: 'Contains supporting information or confirms details',
       refines: 'Provides additional detail or clarification',
       supersedes: 'Contains updated or newer information',
@@ -322,7 +374,8 @@ export class MemoryRelationshipService {
         `SELECT id FROM memory_relationships 
          WHERE ((source_memory_id = $1 AND target_memory_id = $2) OR (source_memory_id = $2 AND target_memory_id = $1))
            AND relationship_type = $3`,
-        [rel.source_memory_id, rel.target_memory_id, rel.relationship_type]
+        [rel.source_memory_id, rel.target_memory_id, rel.relationship_type],
+        tenantId
       );
       
       if (existingCheck.rows.length === 0) {
@@ -341,7 +394,7 @@ export class MemoryRelationshipService {
             rel.relationship_type,
             rel.confidence,
             rel.evidence
-          ]);
+          ], tenantId);
           console.log(`💾 Stored new ${rel.relationship_type} relationship: ${rel.source_memory_id} -> ${rel.target_memory_id}`);
         } catch (error) {
           console.error('Error storing relationship:', error);
@@ -410,7 +463,7 @@ export class MemoryRelationshipService {
       tenantId,
       cursor,
       batchSize,
-    ]);
+    ], tenantId);
 
     const orphans = orphanResult.rows;
 
@@ -464,7 +517,7 @@ export class MemoryRelationshipService {
       LEFT JOIN memory_embeddings me ON m.id = me.memory_id
       WHERE m.id = $1 AND m.tenant_id = $2
     `;
-    const result = await this.database.query(query, [id, tenantId]);
+    const result = await this.database.query(query, [id, tenantId], tenantId);
     const row = result.rows[0];
     
     // Parse embedding from PostgreSQL vector format to JavaScript array

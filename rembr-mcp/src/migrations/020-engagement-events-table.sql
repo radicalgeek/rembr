@@ -3,7 +3,7 @@
 -- Unified intake log for social mentions, support emails, feedback, usage signals.
 -- =============================================================================
 --
--- Source: growth analytics implementation notes
+-- Source: docs/internal/GROWTH-ENGINE-IMPLEMENTATION.md
 -- Used by the growth intelligence layer to classify and route engagement
 -- signals (feature requests, praise, issues) from all external channels.
 -- =============================================================================

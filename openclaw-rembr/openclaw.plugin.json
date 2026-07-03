@@ -1,0 +1,91 @@
+{
+  "id": "memory-rembr",
+  "name": "Memory (Rembr)",
+  "description": "OpenClaw memory plugin backed by Rembr: persistent, structured, cross-agent memory with auto-recall and auto-capture. Embeddings are handled server-side by Rembr.",
+  "kind": "memory",
+  "contracts": {
+    "tools": ["memory_recall", "memory_store", "memory_forget"]
+  },
+  "uiHints": {
+    "url": {
+      "label": "Rembr Server URL",
+      "placeholder": "https://rembr.ai/mcp",
+      "help": "Rembr MCP endpoint; point at your own instance if self-hosting"
+    },
+    "apiKey": {
+      "label": "Rembr API Key",
+      "sensitive": true,
+      "placeholder": "${REMBR_API_KEY}",
+      "help": "API key for Rembr; supports ${ENV_VAR} expansion. Falls back to the REMBR_API_KEY environment variable."
+    },
+    "autoRecall": {
+      "label": "Auto-Recall",
+      "help": "Automatically inject relevant Rembr memories into context before each agent turn"
+    },
+    "autoCapture": {
+      "label": "Auto-Capture",
+      "help": "Automatically store memory-worthy user statements to Rembr after each turn"
+    },
+    "recallLimit": {
+      "label": "Recall Limit",
+      "placeholder": "5",
+      "help": "Maximum memories injected per recall",
+      "advanced": true
+    },
+    "minSimilarity": {
+      "label": "Min Similarity",
+      "placeholder": "0.7",
+      "help": "Minimum similarity score for recall results",
+      "advanced": true
+    },
+    "recallMaxChars": {
+      "label": "Recall Query Max Chars",
+      "placeholder": "1000",
+      "help": "Maximum prompt/query length sent for memory recall",
+      "advanced": true
+    },
+    "captureMaxChars": {
+      "label": "Capture Max Chars",
+      "placeholder": "500",
+      "help": "Maximum message length eligible for auto-capture",
+      "advanced": true
+    },
+    "customTriggers": {
+      "label": "Custom Triggers",
+      "help": "Literal phrases that should make auto-capture consider a message memory-worthy",
+      "advanced": true
+    },
+    "defaultCategory": {
+      "label": "Default Category",
+      "placeholder": "context",
+      "help": "Rembr category used when none can be detected",
+      "advanced": true
+    },
+    "timeoutMs": {
+      "label": "Request Timeout (ms)",
+      "placeholder": "15000",
+      "advanced": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "url": { "type": "string" },
+      "apiKey": { "type": "string" },
+      "autoRecall": { "type": "boolean" },
+      "autoCapture": { "type": "boolean" },
+      "recallLimit": { "type": "integer", "minimum": 1, "maximum": 50 },
+      "minSimilarity": { "type": "number", "minimum": 0, "maximum": 1 },
+      "recallMaxChars": { "type": "number", "minimum": 100, "maximum": 10000 },
+      "captureMaxChars": { "type": "number", "minimum": 100, "maximum": 10000 },
+      "customTriggers": {
+        "type": "array",
+        "maxItems": 50,
+        "items": { "type": "string", "minLength": 1, "maxLength": 100 }
+      },
+      "defaultCategory": { "type": "string" },
+      "timeoutMs": { "type": "number", "minimum": 1000, "maximum": 120000 }
+    }
+  }
+}

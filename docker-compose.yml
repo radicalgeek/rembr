@@ -1,0 +1,69 @@
+# Rembr self-hosted stack: engine + PostgreSQL/pgvector + web console.
+# See SELF-HOSTING.md for the full walkthrough.
+#
+# Quick start:
+#   docker compose up -d --build
+#   node rembr-mcp/scripts/bootstrap-tenant.mjs | docker compose exec -T postgres psql -U rembr -d rembr
+#   REMBR_API_KEY=<printed key> docker compose up -d rembr-console
+#
+# Embeddings default to a local Ollama (profile "ollama"); set EMBEDDING_*
+# variables in .env to use any OpenAI-compatible endpoint instead.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: rembr
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rembr}
+      POSTGRES_DB: rembr
+    volumes:
+      - rembr-pgdata:/var/lib/postgresql/data
+      - ./deploy/k8s/02-create-schema.sql:/docker-entrypoint-initdb.d/02-create-schema.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rembr -d rembr"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rembr-mcp:
+    build: ./rembr-mcp
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://rembr:${POSTGRES_PASSWORD:-rembr}@postgres:5432/rembr
+      JWT_SECRET: ${JWT_SECRET:-self-host-dev-secret-change-me}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-ollama}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-768}
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+
+  rembr-console:
+    build: ./rembr-console
+    depends_on:
+      - rembr-mcp
+    environment:
+      REMBR_URL: http://rembr-mcp:3000/mcp
+      REMBR_API_KEY: ${REMBR_API_KEY:-}
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+
+  ollama:
+    image: ollama/ollama
+    profiles: ["ollama"]
+    volumes:
+      - rembr-ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+
+volumes:
+  rembr-pgdata:
+  rembr-ollama:

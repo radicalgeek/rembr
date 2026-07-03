@@ -4,6 +4,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { Pool } from 'pg';
+import { createTestPool } from './test-utils/test-db.js';
 import {
   triggerRegeneration,
   getRegenerationHistory,
@@ -18,9 +19,7 @@ const TEST_TASK_ID = 'task-123';
 let testPool: Pool;
 
 beforeEach(async () => {
-  testPool = new Pool({
-    connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rembr_test',
-  });
+  testPool = createTestPool('it_plan_regeneration');
 
   // Create base tables if they don't exist (test setup)
   await testPool.query(`

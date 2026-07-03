@@ -14,7 +14,7 @@
 -- APPLICATION-LAYER ENCRYPTION (already deployed — REM-255)
 -- ----------------------------------------------------------
 -- The `rembr-ui` service encrypts/decrypts `stripe_customer_id` at the
--- application layer using authenticated encryption with `STRIPE_ENCRYPTION_KEY`
+-- application layer using AES-256-ECB with `STRIPE_ENCRYPTION_KEY`
 -- (see migration 005 and rembr-ui/src/lib/crypto.ts).
 --
 -- This migration adds DB-level safety rails:
@@ -101,7 +101,7 @@ COMMENT ON FUNCTION check_stripe_customer_id_encryption() IS
 
 -- 5. Update the column comment to reflect the encryption requirement.
 COMMENT ON COLUMN tenants.stripe_customer_id IS
-  'Encrypted Stripe customer ID. '
+  'AES-256-ECB encrypted Stripe customer ID. '
   'Plaintext format: cus_xxxxxxxxxxxx. '
   'Encrypted by rembr-ui/src/lib/crypto.ts:encryptStripeCustomerId(). '
   'Decrypted on read by rembr-ui/src/lib/crypto.ts:decryptStripeCustomerId(). '

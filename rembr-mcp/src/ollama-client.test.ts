@@ -28,16 +28,32 @@ vi.mock('./embedding-cache.js', () => {
 describe('OllamaClient', () => {
   let client: OllamaClient;
   let mockOllamaInstance: any;
+  let mockTextOllamaInstance: any;
 
   beforeEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.TEXT_GENERATION_PROVIDER;
+    delete process.env.LM_STUDIO_BASE_URL;
+    delete process.env.LM_STUDIO_MODEL;
+    delete process.env.LM_STUDIO_API_KEY;
+    delete process.env.OPENAI_COMPATIBLE_TEXT_BASE_URL;
+    delete process.env.OPENAI_COMPATIBLE_TEXT_MODEL;
+    delete process.env.OPENAI_COMPATIBLE_API_KEY;
+    delete process.env.OPENAI_COMPATIBLE_DISABLE_THINKING;
+    delete process.env.OPENAI_COMPATIBLE_MAX_TOKENS;
+    delete process.env.TEXT_GENERATION_TIMEOUT_MS;
+    delete process.env.OLLAMA_TEXT_HOST;
+
     // Reset singleton for each test
     (OllamaClient as any).instance = undefined;
-    
+    vi.mocked(Ollama).mockClear();
+
     // Get fresh instance
     client = OllamaClient.getInstance();
-    
+
     // Get mock Ollama instance
     mockOllamaInstance = (client as any).client;
+    mockTextOllamaInstance = (client as any).textClient;
 
     // Make retries instant in all tests (override per-test in resilience block when needed)
     vi.spyOn(client as any, 'sleep').mockResolvedValue(undefined);
@@ -66,6 +82,20 @@ describe('OllamaClient', () => {
       expect(customClient.getHost()).toBe('http://custom-host:11434');
       
       delete process.env.OLLAMA_HOST;
+    });
+
+    it('should respect OLLAMA_TEXT_HOST for Ollama text generation', () => {
+      process.env.OLLAMA_HOST = 'http://embeddings:11434';
+      process.env.OLLAMA_TEXT_HOST = 'http://inference:11434';
+      (OllamaClient as any).instance = undefined;
+
+      const customClient = OllamaClient.getInstance();
+      expect(customClient.getHost()).toBe('http://embeddings:11434');
+      expect(customClient.getTextHost()).toBe('http://inference:11434');
+      expect(customClient.getTextProvider()).toBe('ollama');
+
+      delete process.env.OLLAMA_HOST;
+      delete process.env.OLLAMA_TEXT_HOST;
     });
   });
 
@@ -143,14 +173,14 @@ describe('OllamaClient', () => {
 
   describe('generateText', () => {
     it('should generate text with prompt only', async () => {
-      mockOllamaInstance.generate.mockResolvedValue({
+      mockTextOllamaInstance.generate.mockResolvedValue({
         response: 'Generated text response'
       });
 
       const result = await client.generateText('What is the weather?');
 
       expect(result).toBe('Generated text response');
-      expect(mockOllamaInstance.generate).toHaveBeenCalledWith({
+      expect(mockTextOllamaInstance.generate).toHaveBeenCalledWith({
         model: 'llama3.1:8b',
         prompt: 'What is the weather?',
         system: undefined,
@@ -164,7 +194,7 @@ describe('OllamaClient', () => {
     });
 
     it('should generate text with system prompt', async () => {
-      mockOllamaInstance.generate.mockResolvedValue({
+      mockTextOllamaInstance.generate.mockResolvedValue({
         response: 'Helpful response'
       });
 
@@ -174,7 +204,7 @@ describe('OllamaClient', () => {
       );
 
       expect(result).toBe('Helpful response');
-      expect(mockOllamaInstance.generate).toHaveBeenCalledWith(
+      expect(mockTextOllamaInstance.generate).toHaveBeenCalledWith(
         expect.objectContaining({
           system: 'You are a helpful assistant'
         })
@@ -182,7 +212,7 @@ describe('OllamaClient', () => {
     });
 
     it('should respect custom generation options', async () => {
-      mockOllamaInstance.generate.mockResolvedValue({
+      mockTextOllamaInstance.generate.mockResolvedValue({
         response: 'Custom response'
       });
 
@@ -192,7 +222,7 @@ describe('OllamaClient', () => {
         stopSequences: ['\n\n']
       });
 
-      expect(mockOllamaInstance.generate).toHaveBeenCalledWith(
+      expect(mockTextOllamaInstance.generate).toHaveBeenCalledWith(
         expect.objectContaining({
           options: {
             temperature: 0.5,
@@ -203,10 +233,10 @@ describe('OllamaClient', () => {
       );
     });
 
-    it('should handle timeout after 60 seconds', async () => {
+    it('should handle timeout after 60 seconds for Ollama text generation', async () => {
       vi.useFakeTimers();
-      
-      mockOllamaInstance.generate.mockImplementation(() => 
+
+      mockTextOllamaInstance.generate.mockImplementation(() =>
         new Promise(resolve => setTimeout(resolve, 70000))
       );
 
@@ -214,16 +244,191 @@ describe('OllamaClient', () => {
       
       vi.advanceTimersByTime(60000);
       
-      await expect(promise).rejects.toThrow('Text generation timeout after 60 seconds');
+      await expect(promise).rejects.toThrow('Text generation timeout after 60000ms');
       
       vi.useRealTimers();
     });
 
+    it('should use a longer default timeout for OpenAI-compatible text generation', async () => {
+      vi.useFakeTimers();
+      process.env.LM_STUDIO_BASE_URL = 'http://lmstudio.local:1234/v1';
+      process.env.LM_STUDIO_MODEL = 'qwen/qwen3.5-9b';
+      (OllamaClient as any).instance = undefined;
+      const lmStudioClient = OllamaClient.getInstance();
+
+      vi.stubGlobal('fetch', vi.fn(() =>
+        new Promise(resolve => setTimeout(resolve, 190000))
+      ));
+
+      const promise = lmStudioClient.generateText('User question');
+
+      vi.advanceTimersByTime(179999);
+      await Promise.resolve();
+      vi.advanceTimersByTime(1);
+
+      await expect(promise).rejects.toThrow('Text generation timeout after 180000ms');
+
+      vi.useRealTimers();
+    });
+
+    it('should respect TEXT_GENERATION_TIMEOUT_MS override', async () => {
+      vi.useFakeTimers();
+      process.env.TEXT_GENERATION_TIMEOUT_MS = '2500';
+      (OllamaClient as any).instance = undefined;
+      const timeoutClient = OllamaClient.getInstance();
+      const timeoutTextInstance = (timeoutClient as any).textClient;
+
+      timeoutTextInstance.generate.mockImplementation(() =>
+        new Promise(resolve => setTimeout(resolve, 3000))
+      );
+
+      const promise = timeoutClient.generateText('test');
+
+      vi.advanceTimersByTime(2500);
+
+      await expect(promise).rejects.toThrow('Text generation timeout after 2500ms');
+
+      vi.useRealTimers();
+    });
+
     it('should handle generation errors', async () => {
-      mockOllamaInstance.generate.mockRejectedValue(new Error('Model not found'));
+      mockTextOllamaInstance.generate.mockRejectedValue(new Error('Model not found'));
 
       await expect(client.generateText('test'))
         .rejects.toThrow('Model not found');
+    });
+
+    it('should generate text through LM Studio/OpenAI-compatible chat completions', async () => {
+      process.env.LM_STUDIO_BASE_URL = 'http://lmstudio.local:1234/v1';
+      process.env.LM_STUDIO_MODEL = 'qwen/qwen3.5-9b';
+      process.env.LM_STUDIO_API_KEY = 'test-token';
+      (OllamaClient as any).instance = undefined;
+      const lmStudioClient = OllamaClient.getInstance();
+
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          choices: [{ message: { content: 'LM Studio response' } }]
+        })
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const result = await lmStudioClient.generateText('User question', 'System prompt', {
+        temperature: 0.2,
+        maxTokens: 64,
+        stopSequences: ['END']
+      });
+
+      expect(result).toBe('LM Studio response');
+      expect(lmStudioClient.getTextProvider()).toBe('openai-compatible');
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://lmstudio.local:1234/v1/chat/completions',
+        expect.objectContaining({
+          method: 'POST',
+          headers: expect.objectContaining({
+            Authorization: 'Bearer test-token'
+          }),
+          body: JSON.stringify({
+            model: 'qwen/qwen3.5-9b',
+            messages: [
+              { role: 'system', content: '/no_think\nSystem prompt' },
+              { role: 'user', content: 'User question' }
+            ],
+            stream: false,
+            temperature: 0.2,
+            max_tokens: 64,
+            stop: ['END'],
+            chat_template_kwargs: {
+              enable_thinking: false
+            }
+          })
+        })
+      );
+    });
+
+    it('should allow disabling the OpenAI-compatible no-thinking hint', async () => {
+      process.env.LM_STUDIO_BASE_URL = 'http://lmstudio.local:1234/v1';
+      process.env.LM_STUDIO_MODEL = 'qwen/qwen3.5-9b';
+      process.env.OPENAI_COMPATIBLE_DISABLE_THINKING = 'false';
+      (OllamaClient as any).instance = undefined;
+      const lmStudioClient = OllamaClient.getInstance();
+
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          choices: [{ message: { content: 'thinking enabled response' } }]
+        })
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      await lmStudioClient.generateText('User question');
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.chat_template_kwargs).toBeUndefined();
+      expect(body.messages[0].content).toBe('User question');
+    });
+
+    it('should add no-thinking control token to user message when no system prompt is provided', async () => {
+      process.env.LM_STUDIO_BASE_URL = 'http://lmstudio.local:1234/v1';
+      process.env.LM_STUDIO_MODEL = 'qwen/qwen3.5-9b';
+      (OllamaClient as any).instance = undefined;
+      const lmStudioClient = OllamaClient.getInstance();
+
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          choices: [{ message: { content: 'no thinking response' } }]
+        })
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      await lmStudioClient.generateText('User question');
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.messages).toEqual([
+        { role: 'user', content: '/no_think\nUser question' }
+      ]);
+      expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
+    });
+
+    it('should use a larger OpenAI-compatible default token budget for thinking models', async () => {
+      process.env.LM_STUDIO_BASE_URL = 'http://lmstudio.local:1234/v1';
+      process.env.LM_STUDIO_MODEL = 'qwen/qwen3.5-9b';
+      (OllamaClient as any).instance = undefined;
+      const lmStudioClient = OllamaClient.getInstance();
+
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          choices: [{ message: { content: 'budgeted response' } }]
+        })
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      await lmStudioClient.generateText('User question');
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.max_tokens).toBe(4096);
+    });
+
+    it('should include finish reason and reasoning length when OpenAI-compatible response has no content', async () => {
+      process.env.LM_STUDIO_BASE_URL = 'http://lmstudio.local:1234/v1';
+      process.env.LM_STUDIO_MODEL = 'qwen/qwen3.5-9b';
+      (OllamaClient as any).instance = undefined;
+      const lmStudioClient = OllamaClient.getInstance();
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          choices: [{
+            finish_reason: 'length',
+            message: { content: '', reasoning_content: 'internal reasoning only' }
+          }]
+        })
+      }));
+
+      await expect(lmStudioClient.generateText('User question'))
+        .rejects.toThrow('finish_reason=length, reasoning_content_chars=23');
     });
   });
 
@@ -261,17 +466,20 @@ describe('OllamaClient', () => {
 
     it('should respect environment variables', () => {
       process.env.OLLAMA_HOST = 'http://test:11434';
+      process.env.OLLAMA_TEXT_HOST = 'http://text:11434';
       process.env.OLLAMA_EMBEDDING_MODEL = 'custom-embed';
       process.env.OLLAMA_TEXT_MODEL = 'custom-llm';
-      
+
       (OllamaClient as any).instance = undefined;
       const customClient = OllamaClient.getInstance();
 
       expect(customClient.getHost()).toBe('http://test:11434');
+      expect(customClient.getTextHost()).toBe('http://text:11434');
       expect(customClient.getEmbeddingModel()).toBe('custom-embed');
       expect(customClient.getTextModel()).toBe('custom-llm');
 
       delete process.env.OLLAMA_HOST;
+      delete process.env.OLLAMA_TEXT_HOST;
       delete process.env.OLLAMA_EMBEDDING_MODEL;
       delete process.env.OLLAMA_TEXT_MODEL;
     });

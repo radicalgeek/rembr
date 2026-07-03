@@ -10,16 +10,15 @@
 
 import { Router, Request, Response } from 'express';
 import { MemoryDatabase } from '../database.js';
-import { OllamaClient } from '../ollama-client.js';
 import { OptimizationScheduler } from '../optimization/scheduler.js';
 import { MemoryRelationshipService } from '../memory-relationship-service.js';
-import { OllamaEmbeddingProvider } from '../ollama-provider.js';
+import { EmbeddingProvider } from '../ollama-provider.js';
 import { VectorSearchService } from '../vector-search-service.js';
 
 export interface AdminRouterDeps {
   db: MemoryDatabase;
   optimizationScheduler?: OptimizationScheduler;
-  embeddingProvider?: OllamaEmbeddingProvider;
+  embeddingProvider?: EmbeddingProvider;
   /** pg Pool, used by VectorSearchService for index health checks */
   pool?: import('pg').Pool;
 }
@@ -77,8 +76,10 @@ export function createAdminRouter(deps: AdminRouterDeps): Router {
   router.post('/embeddings/:tenantId', async (req: Request, res: Response) => {
     const { tenantId } = req.params;
     try {
+      if (!embeddingProvider) {
+        return res.status(503).json({ error: 'Embedding provider not configured' });
+      }
       console.log(`[Admin] Generating embeddings for tenant ${tenantId}`);
-      const ollamaClient = OllamaClient.getInstance();
 
       const result = await db.query(
         `SELECT m.id, m.content
@@ -95,8 +96,15 @@ export function createAdminRouter(deps: AdminRouterDeps): Router {
 
       for (const row of result.rows) {
         try {
-          const embedding = await ollamaClient.generateEmbedding(row.content);
-          await db.storeEmbedding(row.id, tenantId, embedding, 'ollama', 'nomic-embed-text');
+          const embedding = await embeddingProvider.generateEmbedding(row.content);
+          await db.storeEmbedding(
+            row.id,
+            tenantId,
+            embedding,
+            embeddingProvider.name,
+            embeddingProvider.model,
+            embeddingProvider.getModelFingerprint()
+          );
           generated++;
         } catch (err) {
           console.error(`[Admin] Embedding failed for memory ${row.id}:`, err);

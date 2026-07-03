@@ -1,8 +1,43 @@
 import { defineConfig } from 'vitest/config';
 
-// Skip integration tests in CI (no external services like Ollama)
+/**
+ * The suite is split in two:
+ *
+ *   npm run test:unit         — no external services; runs anywhere
+ *   npm run test:integration  — requires PostgreSQL (blank rembr_test DB is
+ *                               fine; tests bootstrap their own tables via
+ *                               src/test-utils/test-db.ts). Runs files
+ *                               sequentially: they share one database.
+ *   npm test                  — both (requires PostgreSQL)
+ *
+ * Live-service e2e tests gate themselves on env vars instead of being
+ * excluded here: week14-features needs TEST_MCP_URL, multi-server needs
+ * RUN_MULTI_SERVER_TESTS=true.
+ */
+const INTEGRATION_TESTS = [
+  'src/audit-logger.test.ts',
+  'src/budget-management.test.ts',
+  'src/checkpoint-service.test.ts',
+  'src/context-analytics.test.ts',
+  'src/context-monitor.test.ts',
+  'src/embedding-model-consistency.test.ts',
+  'src/iteration-tracking.test.ts',
+  'src/multi-server.integration.test.ts',
+  'src/optimization/compaction-service.test.ts',
+  'src/pii-integration.test.ts',
+  'src/plan-regeneration.test.ts',
+  'src/task-analytics.test.ts',
+  'src/task-export.test.ts',
+  'src/task-handoff.test.ts',
+  'src/task-service.test.ts',
+  'src/token-budget.test.ts',
+  'src/work-queue.test.ts',
+  'tests/integration/**/*.test.ts',
+  'tests/week14-features.test.ts',
+];
+
+const suite = process.env.TEST_SUITE; // 'unit' | 'integration' | undefined = all
 const isCI = process.env.CI === 'true';
-console.log('CI environment:', isCI, 'CI env var:', process.env.CI);
 
 export default defineConfig({
   test: {
@@ -12,26 +47,21 @@ export default defineConfig({
     outputFile: {
       junit: './test-results.xml'
     },
+    ...(suite === 'integration'
+      ? {
+          include: INTEGRATION_TESTS,
+          // Integration tests share one database; run files sequentially to
+          // avoid cross-file table/data races.
+          fileParallelism: false,
+        }
+      : {}),
     exclude: [
       'node_modules/**',
       'dist/**',
-      'tests/e2e/**',  // Playwright e2e tests - run separately
-      ...(isCI ? [
-        '**/ollama-*.test.ts',
-        '**/ollama*.test.ts', 
-        'src/ollama-client.test.ts',
-        '**/week14-features.test.ts',
-        'tests/week14-features.test.ts',
-        '**/*.integration.test.ts',
-        'src/task-analytics.test.ts',  // REM-56: Requires Mission Control schema
-        'src/pii-integration.test.ts', // REM-50: Integration test (requires full DB schema)
-        'src/embedding-model-consistency.test.ts',  // Requires real DB with pgvector extension
-        'src/work-queue.test.ts',  // REM-72: Integration test requiring real DB + Redis
-        'src/task-handoff.test.ts',  // REM-73: Integration test requiring real DB
-        'src/optimization/compaction-service.test.ts'  // REM-88: Requires real DB with pgvector
-      ] : [])
+      'tests/e2e/**', // Playwright e2e tests - run separately
+      ...(suite === 'unit' ? INTEGRATION_TESTS : []),
     ],
-    testTimeout: isCI ? 30000 : 5000,
+    testTimeout: suite === 'integration' || isCI ? 30000 : 5000,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],

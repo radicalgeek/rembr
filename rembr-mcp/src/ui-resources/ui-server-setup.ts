@@ -86,8 +86,8 @@ export function registerUIResources(server: Server) {
       _meta: {
         ui: {
           csp: {
-            'script-src': ["'self'"],
-            'style-src': ["'self'"]
+            'script-src': ["'unsafe-inline'"],
+            'style-src': ["'unsafe-inline'"]
           }
         }
       }

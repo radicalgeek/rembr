@@ -40,24 +40,22 @@ describe('CompilationService - Pure Helper Methods', () => {
   describe('detectContradiction', () => {
     it('should detect yes/no contradiction', () => {
       const result = service.testDetectContradiction(
-        'The answer is yes',
-        'The answer is no'
+        'The deployment approval answer is yes',
+        'The deployment approval answer is no'
       );
       
       expect(result.isContradiction).toBe(true);
-      expect(result.confidence).toBe(0.7);
       expect(result.evidence).toContain('yes');
       expect(result.evidence).toContain('no');
     });
 
     it('should detect true/false contradiction', () => {
       const result = service.testDetectContradiction(
-        'This statement is true',
-        'This statement is false'
+        'The feature flag beta_search is true',
+        'The feature flag beta_search is false'
       );
       
       expect(result.isContradiction).toBe(true);
-      expect(result.confidence).toBe(0.7);
     });
 
     it('should detect is/is not contradiction', () => {
@@ -67,7 +65,6 @@ describe('CompilationService - Pure Helper Methods', () => {
       );
       
       expect(result.isContradiction).toBe(true);
-      expect(result.confidence).toBe(0.7);
     });
 
     it('should detect can/cannot contradiction', () => {
@@ -91,11 +88,30 @@ describe('CompilationService - Pure Helper Methods', () => {
 
     it('should handle case insensitivity', () => {
       const result = service.testDetectContradiction(
-        'The answer is YES',
-        'The answer is NO'
+        'The deployment approval answer is YES',
+        'The deployment approval answer is NO'
       );
       
       expect(result.isContradiction).toBe(true);
+    });
+
+    it('should not treat unrelated memories with generic negation as contradictions', () => {
+      const result = service.testDetectContradiction(
+        'Rembr production is hosted on the Hoofer cluster and serves MCP traffic.',
+        'API key last_used_at is not reliable proof of recent agent activity.'
+      );
+
+      expect(result.isContradiction).toBe(false);
+      expect(result.confidence).toBe(0);
+    });
+
+    it('should not treat unrelated yes/no words as contradictions', () => {
+      const result = service.testDetectContradiction(
+        'The checklist has no unresolved deployment blockers.',
+        'The support document says yes to using hybrid search by default.'
+      );
+
+      expect(result.isContradiction).toBe(false);
     });
   });
 

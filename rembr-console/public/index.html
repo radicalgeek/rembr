@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rembr Console</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>Rembr <span>Console</span></h1>
+    <div id="status" class="status">checking…</div>
+  </header>
+
+  <nav id="tabs">
+    <button data-tab="memories" class="active">Memories</button>
+    <button data-tab="search">Search</button>
+    <button data-tab="contexts">Contexts</button>
+    <button data-tab="snapshots">Snapshots</button>
+    <button data-tab="stats">Stats</button>
+  </nav>
+
+  <main>
+    <section id="tab-memories" class="tab active">
+      <div class="toolbar">
+        <button id="refresh-memories">Refresh</button>
+        <span class="hint">Most recent memories</span>
+      </div>
+      <pre id="memories-output" class="output">Loading…</pre>
+
+      <h2>New memory</h2>
+      <form id="create-form">
+        <textarea id="create-content" rows="3" placeholder="What should be remembered?" required></textarea>
+        <div class="row">
+          <select id="create-category">
+            <option value="facts">facts</option>
+            <option value="preferences">preferences</option>
+            <option value="decisions">decisions</option>
+            <option value="patterns">patterns</option>
+            <option value="workflows">workflows</option>
+            <option value="insights">insights</option>
+            <option value="goals">goals</option>
+            <option value="reminders">reminders</option>
+            <option value="projects">projects</option>
+            <option value="learning">learning</option>
+            <option value="conversations">conversations</option>
+            <option value="context" selected>context</option>
+          </select>
+          <button type="submit">Store</button>
+        </div>
+      </form>
+      <pre id="create-output" class="output small"></pre>
+
+      <h2>Delete memory</h2>
+      <form id="delete-form" class="row">
+        <input id="delete-id" placeholder="memory id" required />
+        <button type="submit" class="danger">Delete</button>
+      </form>
+      <pre id="delete-output" class="output small"></pre>
+    </section>
+
+    <section id="tab-search" class="tab">
+      <form id="search-form" class="row">
+        <input id="search-query" placeholder="Search memories…" required />
+        <select id="search-mode">
+          <option value="hybrid" selected>hybrid</option>
+          <option value="semantic">semantic</option>
+          <option value="text">text</option>
+          <option value="phrase">phrase</option>
+        </select>
+        <button type="submit">Search</button>
+      </form>
+      <pre id="search-output" class="output">Results appear here.</pre>
+    </section>
+
+    <section id="tab-contexts" class="tab">
+      <div class="toolbar"><button id="refresh-contexts">Refresh</button></div>
+      <pre id="contexts-output" class="output">Loading…</pre>
+    </section>
+
+    <section id="tab-snapshots" class="tab">
+      <div class="toolbar"><button id="refresh-snapshots">Refresh</button></div>
+      <pre id="snapshots-output" class="output">Loading…</pre>
+    </section>
+
+    <section id="tab-stats" class="tab">
+      <div class="toolbar"><button id="refresh-stats">Refresh</button></div>
+      <h2>Usage</h2>
+      <pre id="stats-usage" class="output">Loading…</pre>
+      <h2>Embeddings</h2>
+      <pre id="stats-embeddings" class="output">Loading…</pre>
+    </section>
+  </main>
+
+  <footer>
+    Self-hosted Rembr · <a href="https://github.com/radicalgeek/rembr" target="_blank" rel="noreferrer">github.com/radicalgeek/rembr</a>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

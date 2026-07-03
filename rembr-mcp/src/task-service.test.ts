@@ -4,6 +4,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { Pool } from 'pg';
+import { createTestPool } from './test-utils/test-db.js';
 import { TaskService } from './task-service';
 
 const TEST_BOARD_ID = '550e8400-e29b-41d4-a716-446655440000';
@@ -17,9 +18,7 @@ let testPool: Pool;
 let service: TaskService;
 
 beforeAll(async () => {
-  testPool = new Pool({
-    connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rembr_test',
-  });
+  testPool = createTestPool('it_task_service');
 
   // Create base tables
   await testPool.query(`

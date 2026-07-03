@@ -23,7 +23,7 @@ const REQUIRED_ENV_VARS: EnvVar[] = [
   // Admin API key (required — RAD-45: all /admin/* endpoints are guarded by X-Admin-Key)
   { name: 'ADMIN_API_KEY', required: true, description: 'Secret key for /admin/* endpoints. Header: X-Admin-Key. Generate: openssl rand -hex 32', sensitive: true },
 
-  // API key HMAC secret (required — prevents offline/rainbow-table attacks against API key hashes)
+  // API key HMAC secret (new keys use HMAC; existing sha256 keys remain valid)
   { name: 'API_KEY_SECRET', required: true, description: 'HMAC secret for API key hashing. Generate: openssl rand -hex 32', sensitive: true },
 ];
 
@@ -39,6 +39,15 @@ const OPTIONAL_ENV_VARS: EnvVar[] = [
   { name: 'REDIS_PORT', required: false, description: 'Redis port (default: 6379)', sensitive: false },
   { name: 'REDIS_PASSWORD', required: false, description: 'Redis password', sensitive: true },
   { name: 'OLLAMA_HOST', required: false, description: 'Ollama embedding service URL', sensitive: false },
+  { name: 'OLLAMA_TEXT_HOST', required: false, description: 'Ollama text generation service URL', sensitive: false },
+  { name: 'TEXT_GENERATION_PROVIDER', required: false, description: 'Text generation provider: ollama or openai-compatible', sensitive: false },
+  { name: 'LM_STUDIO_BASE_URL', required: false, description: 'LM Studio/OpenAI-compatible text generation base URL', sensitive: false },
+  { name: 'LM_STUDIO_MODEL', required: false, description: 'LM Studio model id for text generation', sensitive: false },
+  { name: 'LM_STUDIO_API_KEY', required: false, description: 'LM Studio bearer token', sensitive: true },
+  { name: 'OPENAI_COMPATIBLE_TEXT_BASE_URL', required: false, description: 'OpenAI-compatible text generation base URL', sensitive: false },
+  { name: 'OPENAI_COMPATIBLE_TEXT_MODEL', required: false, description: 'OpenAI-compatible text generation model id', sensitive: false },
+  { name: 'OPENAI_COMPATIBLE_API_KEY', required: false, description: 'OpenAI-compatible text generation bearer token', sensitive: true },
+  { name: 'TEXT_GENERATION_TIMEOUT_MS', required: false, description: 'Text generation timeout in milliseconds (default: 60000 for Ollama, 180000 for OpenAI-compatible)', sensitive: false },
   { name: 'PORT', required: false, description: 'HTTP server port (default: 3000)', sensitive: false },
   { name: 'NODE_ENV', required: false, description: 'Node environment (development|production)', sensitive: false },
   { name: 'PUBLIC_URL', required: false, description: 'Public-facing URL of the service', sensitive: false },
@@ -82,12 +91,7 @@ export function validateEnvironment(): void {
   // Warn about JWT_SECRET length
   const jwtSecret = process.env.JWT_SECRET || '';
   if (jwtSecret.length < 32) {
-    const msg = `JWT_SECRET is shorter than 32 characters (current: ${jwtSecret.length}). Use: openssl rand -base64 32`;
-    if (process.env.NODE_ENV === 'production') {
-      console.error(`🔴 SECURITY: ${msg}`);
-      process.exit(1);
-    }
-    console.warn(`⚠️  WARNING: ${msg}`);
+    console.warn(`⚠️  WARNING: JWT_SECRET is shorter than 32 characters (current: ${jwtSecret.length}). Use: openssl rand -base64 32`);
   }
 
   // REM-28 / RAD-45: Production security checks
@@ -115,6 +119,7 @@ export function validateEnvironment(): void {
     console.log(`  Database: ${hasDbUrl ? 'DATABASE_URL' : 'DB_HOST'}`);
     console.log(`  Redis: ${process.env.REDIS_URL ? 'REDIS_URL' : process.env.REDIS_HOST ? 'REDIS_HOST' : 'not configured (in-memory fallback)'}`);
     console.log(`  Ollama: ${process.env.OLLAMA_HOST || 'http://localhost:11434 (default)'}`);
+    console.log(`  Text generation: ${process.env.TEXT_GENERATION_PROVIDER || (process.env.LM_STUDIO_BASE_URL ? 'openai-compatible' : 'ollama')} @ ${process.env.LM_STUDIO_BASE_URL || process.env.OPENAI_COMPATIBLE_TEXT_BASE_URL || process.env.OLLAMA_TEXT_HOST || process.env.OLLAMA_HOST || 'http://localhost:11434 (default)'}`);
     console.log(`  Admin: ${process.env.ADMIN_API_KEY ? '✓ protected (ADMIN_API_KEY)' : '✗ ADMIN_API_KEY missing (startup should have failed)'}`);
     console.log(`  Metrics: ${process.env.METRICS_SECRET ? '✓ protected' : '⚠️  unprotected (set METRICS_SECRET)'}`);
   }

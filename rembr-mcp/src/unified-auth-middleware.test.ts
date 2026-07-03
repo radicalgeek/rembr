@@ -15,9 +15,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 vi.mock('./auth.js', () => ({
   verifyApiKey: vi.fn(),
   verifyOAuthToken: vi.fn(),
-  AuthService: vi.fn().mockImplementation(() => ({
-    verifyJWT: vi.fn(),
-  })),
+  // Must be constructible (`new AuthService()`) — arrow functions are not.
+  AuthService: vi.fn(function (this: any) {
+    this.verifyJWT = vi.fn();
+  }),
 }));
 
 import { authenticateRequest } from './unified-auth-middleware.js';
@@ -174,7 +175,9 @@ describe('authenticateRequest — JWT Bearer', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     jwtVerify = vi.fn();
-    vi.mocked(AuthService).mockImplementation(() => ({ verifyJWT: jwtVerify } as any));
+    vi.mocked(AuthService).mockImplementation(function (this: any) {
+      this.verifyJWT = jwtVerify;
+    } as any);
   });
 
   it('returns success with jwt authMethod on valid token', async () => {
@@ -210,36 +213,24 @@ describe('authenticateRequest — JWT Bearer', () => {
 });
 
 // ─────────────────────────────────────────────────────────
-// Session auth tests
+// Session auth removal (MCP 2026-07-28, SEP-2575)
 // ─────────────────────────────────────────────────────────
 
-describe('authenticateRequest — session', () => {
+describe('authenticateRequest — session auth removed', () => {
   beforeEach(() => { vi.clearAllMocks(); });
 
-  it('returns success with session authMethod for valid session', async () => {
+  it('rejects requests carrying only an mcp-session-id header', async () => {
     const pool = makePool({ tenant_id: TENANT_ID, project_id: null, user_id: USER_ID });
 
     const result = await authenticateRequest(pool as any, makeReq({ 'mcp-session-id': SESSION_ID }));
 
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.authMethod).toBe('session');
-      expect(result.sessionId).toBe(SESSION_ID);
-      expect(result.tenantId).toBe(TENANT_ID);
-      expect(result.userId).toBe(USER_ID);
-    }
-  });
-
-  it('returns 401 for expired or missing session', async () => {
-    const pool = makePool(undefined); // no row → session not found
-
-    const result = await authenticateRequest(pool as any, makeReq({ 'mcp-session-id': 'bad-sess' }));
-
     expect(result.success).toBe(false);
     if (!result.success) {
-      expect(result.error).toContain('Session not found or expired');
       expect(result.statusCode).toBe(401);
+      expect(result.error).toContain('Session-based authentication was removed');
     }
+    // mcp_sessions must never be queried
+    expect(pool.query).not.toHaveBeenCalled();
   });
 });
 
@@ -288,7 +279,7 @@ describe('authenticateRequest — credential precedence', () => {
     expect(verifyOAuthToken).not.toHaveBeenCalled();
   });
 
-  it('prefers Bearer over session', async () => {
+  it('uses Bearer and ignores a stale mcp-session-id header', async () => {
     vi.mocked(verifyOAuthToken).mockResolvedValue({ success: true, tenantId: TENANT_ID, userId: USER_ID });
 
     const pool = makePool({ tenant_id: TENANT_ID, project_id: null, user_id: null });

@@ -5,8 +5,10 @@
  * Addresses #1 pain point from 50+ agents surveyed: no visibility into context allocation.
  */
 
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import { randomUUID } from 'crypto';
+
+type Queryable = Pick<Pool | PoolClient, 'query'>;
 
 export interface CategoryBreakdown {
   category: string;
@@ -85,55 +87,68 @@ export async function monitorContext(
   const utilizationPercent = (totalTokensUsed / maxTokens) * 100;
   const tokensRemaining = maxTokens - totalTokensUsed;
   
-  // Create or update session
-  await upsertSession(pool, tenantId, request.session_id, maxTokens, totalTokensUsed);
-  
-  // Log usage snapshot
-  await logUsageSnapshot(pool, tenantId, request.session_id, totalTokensUsed, request.current_usage);
-  
-  // Build category breakdown
-  const breakdownByCategory = buildCategoryBreakdown(request.current_usage, totalTokensUsed);
-  const topConsumers = breakdownByCategory.slice(0, topN);
-  
-  // Generate alerts
-  const alerts = generateAlerts(utilizationPercent, thresholds, tokensRemaining);
-  
-  // Fetch usage trend
-  const usageTrend = await getUsageTrend(pool, tenantId, request.session_id, trendWindowHours);
-  
-  // Calculate peak usage
-  const { peakUsage, peakUsageTime } = calculatePeakUsage(usageTrend, totalTokensUsed);
-  
-  // Determine recommendations
-  const shouldCheckpoint = utilizationPercent >= 70;
-  const shouldCompress = utilizationPercent >= 85;
-  const estimatedTimeToFull = estimateTimeToFull(usageTrend, totalTokensUsed, maxTokens);
-  
-  return {
-    session_id: request.session_id,
-    tenant_id: tenantId,
-    timestamp: new Date(),
-    total_tokens_used: totalTokensUsed,
-    max_tokens: maxTokens,
-    utilization_percent: Math.round(utilizationPercent * 10) / 10,
-    tokens_remaining: tokensRemaining,
-    breakdown_by_category: breakdownByCategory,
-    top_consumers: topConsumers,
-    alerts,
-    usage_trend: usageTrend,
-    peak_usage: peakUsage,
-    peak_usage_time: peakUsageTime,
-    should_checkpoint: shouldCheckpoint,
-    should_compress: shouldCompress,
-    estimated_time_to_full: estimatedTimeToFull,
-  };
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant', tenantId]);
+    await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant_id', tenantId]);
+
+    // Create or update session
+    await upsertSession(client, tenantId, request.session_id, maxTokens, totalTokensUsed);
+
+    // Log usage snapshot
+    await logUsageSnapshot(client, tenantId, request.session_id, totalTokensUsed, request.current_usage);
+
+    // Fetch usage trend
+    const usageTrend = await getUsageTrend(client, tenantId, request.session_id, trendWindowHours);
+    await client.query('COMMIT');
+
+    // Build category breakdown
+    const breakdownByCategory = buildCategoryBreakdown(request.current_usage, totalTokensUsed);
+    const topConsumers = breakdownByCategory.slice(0, topN);
+
+    // Generate alerts
+    const alerts = generateAlerts(utilizationPercent, thresholds, tokensRemaining);
+
+    // Calculate peak usage
+    const { peakUsage, peakUsageTime } = calculatePeakUsage(usageTrend, totalTokensUsed);
+
+    // Determine recommendations
+    const shouldCheckpoint = utilizationPercent >= 70;
+    const shouldCompress = utilizationPercent >= 85;
+    const estimatedTimeToFull = estimateTimeToFull(usageTrend, totalTokensUsed, maxTokens);
+
+    return {
+      session_id: request.session_id,
+      tenant_id: tenantId,
+      timestamp: new Date(),
+      total_tokens_used: totalTokensUsed,
+      max_tokens: maxTokens,
+      utilization_percent: Math.round(utilizationPercent * 10) / 10,
+      tokens_remaining: tokensRemaining,
+      breakdown_by_category: breakdownByCategory,
+      top_consumers: topConsumers,
+      alerts,
+      usage_trend: usageTrend,
+      peak_usage: peakUsage,
+      peak_usage_time: peakUsageTime,
+      should_checkpoint: shouldCheckpoint,
+      should_compress: shouldCompress,
+      estimated_time_to_full: estimatedTimeToFull,
+    };
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch {}
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 /**
  * Upsert context session
  */
 async function upsertSession(
-  pool: Pool,
+  pool: Queryable,
   tenantId: string,
   sessionId: string,
   maxTokens: number,
@@ -158,7 +173,7 @@ async function upsertSession(
  * Log usage snapshot to analytics events
  */
 async function logUsageSnapshot(
-  pool: Pool,
+  pool: Queryable,
   tenantId: string,
   sessionId: string,
   totalTokens: number,
@@ -267,7 +282,7 @@ function generateAlerts(
  * Get usage trend over time window
  */
 async function getUsageTrend(
-  pool: Pool,
+  pool: Queryable,
   tenantId: string,
   sessionId: string,
   windowHours: number
@@ -380,20 +395,32 @@ export async function getSessionState(
     WHERE tenant_id = $1 AND session_id = $2
   `;
   
-  const result = await pool.query(query, [tenantId, sessionId]);
-  
-  if (result.rows.length === 0) {
-    return null;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant', tenantId]);
+    await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant_id', tenantId]);
+    const result = await client.query(query, [tenantId, sessionId]);
+    await client.query('COMMIT');
+
+    if (result.rows.length === 0) {
+      return null;
+    }
+
+    const row = result.rows[0];
+
+    return {
+      current_usage: row.current_usage,
+      peak_usage: row.peak_usage,
+      max_tokens: row.max_tokens,
+      session_state: row.session_state,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    };
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch {}
+    throw error;
+  } finally {
+    client.release();
   }
-  
-  const row = result.rows[0];
-  
-  return {
-    current_usage: row.current_usage,
-    peak_usage: row.peak_usage,
-    max_tokens: row.max_tokens,
-    session_state: row.session_state,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-  };
 }

@@ -168,35 +168,86 @@ export class ContextSnapshotTimelineService {
     to?: Date,
     limit = 100,
   ): Promise<SnapshotRow[]> {
-    const params: unknown[] = [tenantId];
-    const conditions: string[] = ['tenant_id = $1'];
+    const temporalParams: unknown[] = [tenantId];
+    const temporalConditions: string[] = ['tenant_id = $1'];
     let idx = 2;
 
     if (projectId) {
-      conditions.push(`(project_id = $${idx} OR project_id IS NULL)`);
-      params.push(projectId); idx++;
+      temporalConditions.push(`(project_id = $${idx} OR project_id IS NULL)`);
+      temporalParams.push(projectId); idx++;
     }
     if (from) {
-      conditions.push(`snapshot_time >= $${idx}`);
-      params.push(from); idx++;
+      temporalConditions.push(`snapshot_time >= $${idx}`);
+      temporalParams.push(from); idx++;
     }
     if (to) {
-      conditions.push(`snapshot_time <= $${idx}`);
-      params.push(to); idx++;
+      temporalConditions.push(`snapshot_time <= $${idx}`);
+      temporalParams.push(to); idx++;
     }
 
-    params.push(limit); // last param
+    temporalParams.push(limit);
 
-    const sql = `
+    const temporalSql = `
       SELECT id, snapshot_name, snapshot_time, total_memories, categories_snapshot, created_at
       FROM temporal_snapshots
-      WHERE ${conditions.join(' AND ')}
+      WHERE ${temporalConditions.join(' AND ')}
       ORDER BY snapshot_time ASC
       LIMIT $${idx}
     `;
 
-    const result = await this.pool.query<SnapshotRow>(sql, params);
-    return result.rows;
+    const contextParams: unknown[] = [tenantId];
+    const contextConditions: string[] = ['cs.tenant_id = $1'];
+    idx = 2;
+
+    if (projectId) {
+      contextConditions.push(`(cs.project_id = $${idx} OR cs.project_id IS NULL)`);
+      contextParams.push(projectId); idx++;
+    }
+    if (from) {
+      contextConditions.push(`cs.created_at >= $${idx}`);
+      contextParams.push(from); idx++;
+    }
+    if (to) {
+      contextConditions.push(`cs.created_at <= $${idx}`);
+      contextParams.push(to); idx++;
+    }
+
+    contextParams.push(limit);
+
+    const contextSql = `
+      WITH category_counts AS (
+        SELECT snapshot_id, category, COUNT(*)::int AS count
+        FROM snapshot_memories
+        GROUP BY snapshot_id, category
+      ),
+      category_json AS (
+        SELECT snapshot_id, jsonb_object_agg(COALESCE(category, 'uncategorized'), count) AS categories_snapshot
+        FROM category_counts
+        GROUP BY snapshot_id
+      )
+      SELECT
+        cs.id,
+        COALESCE(cs.name, cs.id::text) AS snapshot_name,
+        cs.created_at AS snapshot_time,
+        cs.memory_count AS total_memories,
+        COALESCE(cj.categories_snapshot, '{}'::jsonb) AS categories_snapshot,
+        cs.created_at
+      FROM context_snapshots cs
+      LEFT JOIN category_json cj ON cj.snapshot_id = cs.id
+      WHERE ${contextConditions.join(' AND ')}
+        AND (cs.expires_at IS NULL OR cs.expires_at > NOW())
+      ORDER BY cs.created_at ASC
+      LIMIT $${idx}
+    `;
+
+    const [temporalResult, contextResult] = await Promise.all([
+      this.pool.query<SnapshotRow>(temporalSql, temporalParams),
+      this.pool.query<SnapshotRow>(contextSql, contextParams),
+    ]);
+
+    return [...temporalResult.rows, ...contextResult.rows]
+      .sort((a, b) => toDate(a.snapshot_time).getTime() - toDate(b.snapshot_time).getTime())
+      .slice(0, limit);
   }
 
   /**
@@ -268,14 +319,45 @@ export class ContextSnapshotTimelineService {
     nameA: string,
     nameB: string,
   ): Promise<SnapshotDiff> {
-    const sql = `
+    const temporalSql = `
       SELECT id, snapshot_name, snapshot_time, total_memories, categories_snapshot, created_at
       FROM temporal_snapshots
       WHERE tenant_id = $1 AND snapshot_name = ANY($2)
       ORDER BY snapshot_time ASC
     `;
-    const result = await this.pool.query<SnapshotRow>(sql, [tenantId, [nameA, nameB]]);
-    const rows = result.rows;
+    const contextSql = `
+      WITH category_counts AS (
+        SELECT snapshot_id, category, COUNT(*)::int AS count
+        FROM snapshot_memories
+        GROUP BY snapshot_id, category
+      ),
+      category_json AS (
+        SELECT snapshot_id, jsonb_object_agg(COALESCE(category, 'uncategorized'), count) AS categories_snapshot
+        FROM category_counts
+        GROUP BY snapshot_id
+      )
+      SELECT
+        cs.id,
+        COALESCE(cs.name, cs.id::text) AS snapshot_name,
+        cs.created_at AS snapshot_time,
+        cs.memory_count AS total_memories,
+        COALESCE(cj.categories_snapshot, '{}'::jsonb) AS categories_snapshot,
+        cs.created_at
+      FROM context_snapshots cs
+      LEFT JOIN category_json cj ON cj.snapshot_id = cs.id
+      WHERE cs.tenant_id = $1
+        AND cs.name = ANY($2)
+        AND (cs.expires_at IS NULL OR cs.expires_at > NOW())
+      ORDER BY cs.created_at ASC
+    `;
+
+    const [temporalResult, contextResult] = await Promise.all([
+      this.pool.query<SnapshotRow>(temporalSql, [tenantId, [nameA, nameB]]),
+      this.pool.query<SnapshotRow>(contextSql, [tenantId, [nameA, nameB]]),
+    ]);
+
+    const rows = [...temporalResult.rows, ...contextResult.rows]
+      .sort((a, b) => toDate(a.snapshot_time).getTime() - toDate(b.snapshot_time).getTime());
 
     if (rows.length < 2) {
       const found = rows.map(r => r.snapshot_name).join(', ');
@@ -293,28 +375,20 @@ export class ContextSnapshotTimelineService {
     timestamp: Date,
     projectId?: string,
   ): Promise<NearestSnapshotResult | null> {
-    const params: unknown[] = [tenantId, timestamp];
-    const projectFilter = projectId ? 'AND (project_id = $3 OR project_id IS NULL)' : '';
-    if (projectId) params.push(projectId);
+    const rows = await this.fetchSnapshots(tenantId, projectId, undefined, undefined, 500);
+    if (rows.length === 0) return null;
 
-    const sql = `
-      SELECT id, snapshot_name, snapshot_time, total_memories, categories_snapshot,
-             ABS(EXTRACT(EPOCH FROM (snapshot_time - $2::timestamptz)) ) AS distance_seconds,
-             snapshot_time - $2::timestamptz AS signed_diff
-      FROM temporal_snapshots
-      WHERE tenant_id = $1 ${projectFilter}
-      ORDER BY distance_seconds ASC
-      LIMIT 1
-    `;
+    const targetMs = timestamp.getTime();
+    const row = rows.reduce((best, current) => {
+      const bestDistance = Math.abs(toDate(best.snapshot_time).getTime() - targetMs);
+      const currentDistance = Math.abs(toDate(current.snapshot_time).getTime() - targetMs);
+      return currentDistance < bestDistance ? current : best;
+    });
 
-    const result = await this.pool.query(sql, params);
-    if (result.rows.length === 0) return null;
-
-    const row = result.rows[0];
-    const distSec = Math.round(parseFloat(row.distance_seconds));
-    const signedDiff = parseFloat(row.signed_diff); // positive = snapshot is after target
+    const signedMs = toDate(row.snapshot_time).getTime() - targetMs;
+    const distSec = Math.round(Math.abs(signedMs) / 1000);
     const direction: 'before' | 'after' | 'exact' =
-      distSec === 0 ? 'exact' : signedDiff < 0 ? 'before' : 'after';
+      distSec === 0 ? 'exact' : signedMs < 0 ? 'before' : 'after';
 
     return {
       snapshot_id: row.id,

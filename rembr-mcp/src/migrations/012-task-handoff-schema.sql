@@ -31,22 +31,23 @@ CREATE TABLE IF NOT EXISTS task_handoffs (
 );
 
 -- Indexes for handoff queries
-CREATE INDEX idx_task_handoffs_tenant ON task_handoffs(tenant_id);
-CREATE INDEX idx_task_handoffs_task ON task_handoffs(task_id);
-CREATE INDEX idx_task_handoffs_from_agent ON task_handoffs(from_agent);
-CREATE INDEX idx_task_handoffs_to_agent ON task_handoffs(to_agent);
-CREATE INDEX idx_task_handoffs_status ON task_handoffs(status);
-CREATE INDEX idx_task_handoffs_created_at ON task_handoffs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_handoffs_tenant ON task_handoffs(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_task_handoffs_task ON task_handoffs(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_handoffs_from_agent ON task_handoffs(from_agent);
+CREATE INDEX IF NOT EXISTS idx_task_handoffs_to_agent ON task_handoffs(to_agent);
+CREATE INDEX IF NOT EXISTS idx_task_handoffs_status ON task_handoffs(status);
+CREATE INDEX IF NOT EXISTS idx_task_handoffs_created_at ON task_handoffs(created_at DESC);
 
 -- Composite indexes for common queries
-CREATE INDEX idx_task_handoffs_to_agent_status ON task_handoffs(to_agent, status);
-CREATE INDEX idx_task_handoffs_from_agent_status ON task_handoffs(from_agent, status);
+CREATE INDEX IF NOT EXISTS idx_task_handoffs_to_agent_status ON task_handoffs(to_agent, status);
+CREATE INDEX IF NOT EXISTS idx_task_handoffs_from_agent_status ON task_handoffs(from_agent, status);
 
 -- GIN index for context queries
-CREATE INDEX idx_task_handoffs_context ON task_handoffs USING GIN (context);
+CREATE INDEX IF NOT EXISTS idx_task_handoffs_context ON task_handoffs USING GIN (context);
 
 -- Enable RLS
 ALTER TABLE task_handoffs ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS task_handoffs_tenant_isolation ON task_handoffs;
 CREATE POLICY task_handoffs_tenant_isolation ON task_handoffs
     USING (tenant_id = current_setting('app.current_tenant_id', TRUE)::uuid);
 

@@ -5,6 +5,7 @@
  * Tracks all memory operations and user actions.
  */
 
+import { createHash } from 'node:crypto';
 import { Pool } from 'pg';
 
 export interface AuditEvent {
@@ -523,8 +524,6 @@ export class AuditLogger {
    * hash mismatches.
    */
   private recomputeHash(row: any): string {
-    const crypto = require('crypto');
-    
     // Use the epoch value directly from PostgreSQL (preserves microsecond precision)
     // row.created_at_epoch comes from EXTRACT(EPOCH FROM created_at) in the query
     const epoch = row.created_at_epoch !== undefined 
@@ -544,7 +543,7 @@ export class AuditLogger {
       row.prev_hash || 'GENESIS'
     ].join('|');
 
-    return crypto.createHash('sha256').update(canonical).digest('hex');
+    return createHash('sha256').update(canonical).digest('hex');
   }
 
   /**

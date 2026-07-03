@@ -1,0 +1,50 @@
+{
+  "name": "openclaw-rembr",
+  "version": "0.1.0",
+  "description": "OpenClaw memory-slot plugin backed by Rembr: persistent, structured, cross-agent memory with auto-recall and auto-capture.",
+  "type": "module",
+  "files": [
+    "index.ts",
+    "config.ts",
+    "rembr-client.ts",
+    "capture.ts",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "memory",
+    "mcp",
+    "rembr",
+    "ai-agents"
+  ],
+  "author": "Mark @ radicalgeek",
+  "license": "MIT",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "install": {
+      "npmSpec": "openclaw-rembr",
+      "defaultChoice": "npm"
+    },
+    "compat": {
+      "pluginApi": ">=2026.6.2"
+    }
+  },
+  "dependencies": {
+    "typebox": "1.1.39"
+  },
+  "devDependencies": {
+    "@types/node": "^24.2.0",
+    "openclaw": "^2026.6.5",
+    "typescript": "^5.9.3",
+    "vitest": "^1.6.1"
+  }
+}

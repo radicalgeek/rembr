@@ -5,10 +5,25 @@
  * embedding model changes (e.g., nomic-embed-text → all-minilm-l6-v2).
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest'
 import { Pool } from 'pg'
 import { MemoryDatabase } from './database.js'
 import { OllamaClient } from './ollama-client.js'
+import {
+  createDbPool,
+  dbConnectionString,
+  ensureTestDatabase,
+  applyMigrations,
+} from './test-utils/test-db.js'
+
+// Dedicated database: MemoryDatabase manages its own pool, so this file
+// cannot be search_path-namespaced, and its FK-constrained table shapes
+// conflicted with other files when sharing the public schema.
+const TEST_DB = 'rembr_test_embeddings'
+
+beforeAll(async () => {
+  await ensureTestDatabase(TEST_DB)
+})
 
 describe('Embedding Model Consistency (REM-249)', () => {
   let pool: Pool
@@ -16,14 +31,12 @@ describe('Embedding Model Consistency (REM-249)', () => {
   const TEST_TENANT_ID = '550e8400-e29b-41d4-a716-446655440000'
 
   beforeEach(async () => {
-    pool = new Pool({
-      connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rembr_test'
-    })
+    pool = createDbPool(TEST_DB)
 
-    db = new MemoryDatabase(process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rembr_test')
+    db = new MemoryDatabase(dbConnectionString(TEST_DB))
 
     // Enable pgvector extension first (required for vector type)
-    await pool.query(`CREATE EXTENSION IF NOT EXISTS vector;`)
+    await pool.query(`CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;`)
 
     // Create base tables if they don't exist (test setup)
     await pool.query(`
@@ -42,6 +55,8 @@ describe('Embedding Model Consistency (REM-249)', () => {
         tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
         name VARCHAR(255) NOT NULL,
         description TEXT,
+        is_personal BOOLEAN NOT NULL DEFAULT false,
+        owner_id UUID,
         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
@@ -71,6 +86,10 @@ describe('Embedding Model Consistency (REM-249)', () => {
         stale_since TIMESTAMPTZ
       );
     `)
+
+    // If another file created the canonical memory_embeddings first, the
+    // CREATE above no-ops — converge the shape via the real migration.
+    await applyMigrations(pool, '007-embedding-model-consistency.sql')
 
     // Insert test tenant (required for foreign key constraints)
     await pool.query(`
@@ -115,7 +134,7 @@ describe('Embedding Model Consistency (REM-249)', () => {
     it('should mark embeddings as stale when model changes', async () => {
       // Insert a memory with an embedding
       const memoryResult = await pool.query(
-        'INSERT INTO memories (id, tenant_id, content, created_at) VALUES (gen_random_uuid(), $1, $2, NOW()) RETURNING id',
+        "INSERT INTO memories (id, tenant_id, content, category, created_at) VALUES (gen_random_uuid(), $1, $2, 'notes', NOW()) RETURNING id",
         [TEST_TENANT_ID, 'Test memory content']
       )
       const memoryId = memoryResult.rows[0].id
@@ -157,7 +176,7 @@ describe('Embedding Model Consistency (REM-249)', () => {
 
     it('should NOT mark embeddings as stale when fingerprint matches', async () => {
       const memoryResult = await pool.query(
-        'INSERT INTO memories (id, tenant_id, content, created_at) VALUES (gen_random_uuid(), $1, $2, NOW()) RETURNING id',
+        "INSERT INTO memories (id, tenant_id, content, category, created_at) VALUES (gen_random_uuid(), $1, $2, 'notes', NOW()) RETURNING id",
         [TEST_TENANT_ID, 'Test memory']
       )
       const memoryId = memoryResult.rows[0].id
@@ -190,7 +209,7 @@ describe('Embedding Model Consistency (REM-249)', () => {
       // Insert 3 memories with stale embeddings
       for (let i = 0; i < 3; i++) {
         const memoryResult = await pool.query(
-          'INSERT INTO memories (id, tenant_id, content, created_at) VALUES (gen_random_uuid(), $1, $2, NOW()) RETURNING id',
+          "INSERT INTO memories (id, tenant_id, content, category, created_at) VALUES (gen_random_uuid(), $1, $2, 'notes', NOW()) RETURNING id",
           [TEST_TENANT_ID, `Memory ${i}`]
         )
         const memoryId = memoryResult.rows[0].id
@@ -213,7 +232,7 @@ describe('Embedding Model Consistency (REM-249)', () => {
 
     it('should retrieve stale embeddings for re-embedding', async () => {
       const memoryResult = await pool.query(
-        'INSERT INTO memories (id, tenant_id, content, created_at) VALUES (gen_random_uuid(), $1, $2, NOW()) RETURNING id',
+        "INSERT INTO memories (id, tenant_id, content, category, created_at) VALUES (gen_random_uuid(), $1, $2, 'notes', NOW()) RETURNING id",
         [TEST_TENANT_ID, 'Content to re-embed']
       )
       const memoryId = memoryResult.rows[0].id
@@ -242,7 +261,7 @@ describe('Embedding Model Consistency (REM-249)', () => {
   describe('Re-embedding', () => {
     it('should clear stale flag after successful re-embedding', async () => {
       const memoryResult = await pool.query(
-        'INSERT INTO memories (id, tenant_id, content, created_at) VALUES (gen_random_uuid(), $1, $2, NOW()) RETURNING id',
+        "INSERT INTO memories (id, tenant_id, content, category, created_at) VALUES (gen_random_uuid(), $1, $2, 'notes', NOW()) RETURNING id",
         [TEST_TENANT_ID, 'Memory for re-embedding']
       )
       const memoryId = memoryResult.rows[0].id
