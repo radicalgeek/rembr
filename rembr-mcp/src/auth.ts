@@ -55,6 +55,7 @@ export interface AuthResult {
   sessionId?: string;
   userId?: string;
   apiKeyId?: string;
+  scopes?: string[]; // OAuth scope claim (space-delimited in DB, stored as array here)
   error?: string;
 }
 
@@ -73,6 +74,7 @@ export interface JWTPayload {
   sub: string; // user_id
   tenant_id: string;
   project_id?: string;
+  scope?: string | string[]; // space-delimited or array of scopes (e.g. 'memory:read memory:write')
   iat?: number;
   exp?: number;
 }
@@ -179,8 +181,8 @@ export class AuthService {
   // JWT
   // ---------------------------------------------------------------------------
 
-  /** Verify JWT token and extract tenant info */
-  verifyJWT(token: string): AuthResult {
+  /** Verify JWT token and extract tenant info + scopes */
+  verifyJWT(token: string): AuthResult & { scopes?: string[] } {
     try {
       const payload = jwt.verify(token, this.jwtSecret) as JWTPayload;
 
@@ -188,11 +190,20 @@ export class AuthService {
         return { success: false, error: 'Invalid token: missing tenant_id' };
       }
 
+      // Normalize scope claim to a string array
+      let scopes: string[] | undefined = undefined;
+      if (typeof payload.scope === 'string') {
+        scopes = payload.scope.trim() ? payload.scope.split(/\s+/) : [];
+      } else if (Array.isArray(payload.scope)) {
+        scopes = payload.scope.filter((s): s is string => typeof s === 'string' && s.length > 0);
+      }
+
       return {
         success: true,
         tenantId: payload.tenant_id,
         projectId: payload.project_id,
-        userId: payload.sub
+        userId: payload.sub,
+        scopes
       };
     } catch (error) {
       return {
@@ -211,12 +222,15 @@ export class AuthService {
   }
 
   /** Generate JWT token (for testing or internal use) */
-  generateJWT(tenantId: string, userId: string, projectId?: string): string {
+  generateJWT(tenantId: string, userId: string, projectId?: string, scope?: string | string[]): string {
     const payload: JWTPayload = {
       sub: userId,
       tenant_id: tenantId,
       project_id: projectId
     };
+    if (scope) {
+      payload.scope = Array.isArray(scope) ? scope.join(' ') : scope;
+    }
     return jwt.sign(payload, this.jwtSecret, { expiresIn: '7d' });
   }
 }
@@ -254,10 +268,21 @@ export async function verifyOAuthToken(
       return { success: false, error: 'OAuth token expired' };
     }
 
+    // Normalize scope from DB to array
+    let scopes: string[] | undefined = undefined;
+    if (tokenData.scope) {
+      scopes = typeof tokenData.scope === 'string'
+        ? tokenData.scope.trim().split(/\s+/).filter(Boolean)
+        : Array.isArray(tokenData.scope)
+          ? tokenData.scope.filter((s): s is string => typeof s === 'string' && s.length > 0)
+          : undefined;
+    }
+
     return {
       success: true,
       tenantId: tokenData.tenant_id,
-      userId: tokenData.user_id
+      userId: tokenData.user_id,
+      scopes
     };
   } catch (error) {
     console.error('OAuth token verification error:', error);

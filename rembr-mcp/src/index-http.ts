@@ -59,6 +59,13 @@ import { compressContent, previewCompression } from './smart-compression.js';
 import { checkDailyTenantQuota, checkTransportRateLimit } from './rate-limiter.js';
 import { createAdminRouter } from './routes/admin.js';
 import { adminAuthMiddleware } from './middleware/admin-auth.js';
+import {
+  scopeValidationMiddleware,
+  type AuthScopeContext,
+  TOOL_SCOPE_REQUIREMENTS,
+  scopesSatisfy,
+  formatScopeRequirement
+} from './scope-validation.js';
 import { validateMemoryInput, validateContent, validateCategory, validateMetadata, validateRelevanceScore } from './validation/memory-input.js';
 import { renderContradictionDashboard } from './ui-resources/contradiction-dashboard.js';
 import { renderSnapshotTimeline } from './ui-resources/snapshot-timeline.js';
@@ -640,6 +647,61 @@ class RembrServer {
           ipAddress,
           userAgent
         });
+
+        // Attach auth scope context for scope validation middleware
+        req.authScopeCtx = {
+          tenantId: authResult.tenantId!,
+          projectId: authResult.projectId,
+          userId: authResult.userId,
+          authMethod: authResult.authMethod || 'oauth',
+          scopes: authResult.scopes
+        };
+
+        // ── REM-254: Inline scope validation ──────────────────────
+        // Scope validation runs AFTER auth so we have the principal's
+        // scopes.  We invoke the middleware inline (rather than as
+        // global middleware) because Express middleware runs before
+        // the async handler — at that point req.authScopeCtx is still
+        // undefined.  By calling it here we guarantee the scope check
+        // fires with real data.
+        {
+          const ctx = req.authScopeCtx;
+          // API keys and sessions skip scope enforcement (legacy)
+          if (ctx.authMethod !== 'api_key' && ctx.authMethod !== 'session') {
+            const body = req.body as Record<string, unknown> | undefined;
+            if (body) {
+              const method = body.method as string | undefined;
+              if (method === 'tools/call') {
+                const params = body.params as Record<string, unknown> | undefined;
+                if (params) {
+                  const toolName = params.tool as string | undefined;
+                  const operation = params.operation as string | undefined;
+                  const scopeKey = operation
+                    ? `${toolName}:${operation}`
+                    : `${toolName}:*`;
+                  const requiredScopes = TOOL_SCOPE_REQUIREMENTS[scopeKey]
+                    || TOOL_SCOPE_REQUIREMENTS['*']
+                    || [SCOPE_MEMORY_READ];
+                  const allowed = scopesSatisfy(
+                    ctx.scopes,
+                    requiredScopes,
+                    ctx.authMethod
+                  );
+                  if (!allowed) {
+                    return res.status(403).json({
+                      jsonrpc: '2.0',
+                      error: {
+                        code: -32603,
+                        message: `Insufficient scopes for '${toolName}'${operation ? ` (${operation})` : ''}. Requires: ${formatScopeRequirement(requiredScopes)}. Your scopes: ${ctx.scopes?.join(', ') || '(none)'}`,
+                      },
+                      id: body.id || null,
+                    });
+                  }
+                }
+              }
+            }
+          }
+        }
 
         let transport: StreamableHTTPServerTransport;
 
@@ -1307,7 +1369,11 @@ class RembrServer {
       success: true,
       tenantId: outcome.tenantId,
       projectId: outcome.projectId,
-      userId: outcome.userId
+      userId: outcome.userId,
+      apiKeyId: outcome.apiKeyId,
+      sessionId: outcome.sessionId,
+      scopes: outcome.scopes,
+      authMethod: outcome.authMethod
     };
   }
 
