@@ -1,0 +1,40 @@
+{
+  "serverInfo": {
+    "name": "Rembr MCP Server",
+    "version": "1.12.0"
+  },
+  "transport": {
+    "endpoint": "https://rembr.ai/mcp"
+  },
+  "capabilities": {
+    "tools": {
+      "count": 98,
+      "categories": [
+        "memory",
+        "search",
+        "stats",
+        "context",
+        "snapshot",
+        "graph",
+        "contradictions",
+        "causality",
+        "temporal",
+        "audit",
+        "classify",
+        "compression",
+        "pii",
+        "task"
+      ]
+    },
+    "resources": {
+      "count": 12,
+      "categories": ["memory", "context", "snapshot", "graph"]
+    }
+  },
+  "logo": {
+    "url": "https://rembr.ai/brand-assets/logo-new.png",
+    "mediaType": "image/png"
+  },
+  "specification": "SEP-1649",
+  "description": "Recursive Language Models context infrastructure — memory, search, context, snapshots, graph analysis, and more."
+}

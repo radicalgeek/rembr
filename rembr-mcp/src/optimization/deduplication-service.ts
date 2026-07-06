@@ -123,7 +123,7 @@ export class DeduplicationService {
           memories[j].embedding
         );
 
-        if (similarity >= similarityThreshold) {
+        if (similarity >= similarityThreshold && !this.hasContradictionRisk(memories[i].content, memories[j].content)) {
           cluster.memories.push({
             id: memories[j].id,
             content: memories[j].content,
@@ -169,7 +169,23 @@ export class DeduplicationService {
     );
 
     const canonical = sorted[0];
-    const duplicates = sorted.slice(1);
+    const duplicates = sorted.slice(1).filter((candidate) => {
+      const risky = this.hasContradictionRisk(canonical.content, candidate.content);
+      if (risky) {
+        console.warn(
+          `[DeduplicationService] Skipping merge for potentially contradictory memories ${canonical.id} and ${candidate.id}`
+        );
+      }
+      return !risky;
+    });
+
+    if (duplicates.length === 0) {
+      return {
+        keptMemoryId: canonical.id,
+        mergedMemoryIds: [],
+        archivedCount: 0
+      };
+    }
 
     // Archive duplicates
     for (const dup of duplicates) {
@@ -253,6 +269,52 @@ export class DeduplicationService {
     if (denominator === 0) return 0;
 
     return dotProduct / denominator;
+  }
+
+  private hasContradictionRisk(contentA: string, contentB: string): boolean {
+    const negatedA = this.hasNegation(contentA);
+    const negatedB = this.hasNegation(contentB);
+
+    if (negatedA === negatedB) {
+      return false;
+    }
+
+    const tokensA = this.topicTokens(contentA);
+    const tokensB = this.topicTokens(contentB);
+    if (tokensA.size === 0 || tokensB.size === 0) {
+      return false;
+    }
+
+    let overlap = 0;
+    for (const token of tokensA) {
+      if (tokensB.has(token)) overlap++;
+    }
+
+    const overlapRatio = overlap / Math.min(tokensA.size, tokensB.size);
+    return overlapRatio >= 0.45;
+  }
+
+  private hasNegation(content: string): boolean {
+    return /\b(?:not|never|no|cannot|can't|cant|won't|wont|isn't|isnt|aren't|arent|wasn't|wasnt|weren't|werent|don't|dont|doesn't|doesnt|didn't|didnt|without)\b/i.test(content);
+  }
+
+  private topicTokens(content: string): Set<string> {
+    const stopWords = new Set([
+      'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by', 'can', 'cannot',
+      'cant', 'could', 'did', 'didnt', 'do', 'does', 'doesnt', 'dont', 'for',
+      'from', 'has', 'have', 'in', 'is', 'isnt', 'it', 'not', 'of', 'on', 'or',
+      'that', 'the', 'this', 'to', 'use', 'uses', 'using', 'was', 'were', 'with',
+      'without'
+    ]);
+
+    return new Set(
+      content
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, ' ')
+        .split(/\s+/)
+        .map((token) => token.replace(/s$/, ''))
+        .filter((token) => token.length > 2 && !stopWords.has(token))
+    );
   }
 
   /**

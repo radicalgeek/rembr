@@ -10,6 +10,7 @@ describe('RelationshipMaintainerService', () => {
     mockDb = { query: vi.fn() };
     mockOllama = { generateEmbedding: vi.fn() };
     service = new RelationshipMaintainerService(mockDb, mockOllama);
+    delete process.env.RELATIONSHIP_LLM_INFERENCE_ENABLED;
   });
 
   it('should infer relationships', async () => {
@@ -27,6 +28,74 @@ describe('RelationshipMaintainerService', () => {
 
     const result = await service.inferRelationships('tenant-1', 0.7, 50);
     expect(Array.isArray(result)).toBe(true);
+  });
+
+  it('uses LLM assessment to classify temporal updates', async () => {
+    const embedding = new Array(768).fill(0.5);
+    mockOllama.generateText = vi.fn().mockResolvedValue(JSON.stringify({
+      relationshipType: 'supersedes',
+      confidence: 0.88,
+      evidence: 'Memory B is newer and replaces the old production endpoint.'
+    }));
+
+    mockDb.query
+      .mockResolvedValueOnce({ rows: [] }) // SET tenant
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: 'm1',
+            content: 'Production Rembr uses the old MCP endpoint.',
+            category: 'facts',
+            embedding,
+            relationship_count: '0',
+            created_at: new Date('2026-01-01T00:00:00Z')
+          },
+          {
+            id: 'm2',
+            content: 'Production Rembr now uses the new OpenAI-compatible MCP endpoint.',
+            category: 'facts',
+            embedding,
+            relationship_count: '0',
+            created_at: new Date('2026-07-01T00:00:00Z')
+          }
+        ]
+      })
+      .mockResolvedValue({ rows: [{ count: '0' }] });
+
+    const result = await service.inferRelationships('tenant-1', 0.7, 50);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      sourceMemoryId: 'm1',
+      targetMemoryId: 'm2',
+      relationshipType: 'supersedes',
+      confidence: 0.88,
+      evidence: 'Memory B is newer and replaces the old production endpoint.'
+    });
+    expect(mockOllama.generateText).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to vector classification when LLM response is invalid', async () => {
+    const embedding = new Array(768).fill(0.5);
+    mockOllama.generateText = vi.fn().mockResolvedValue('not json');
+
+    mockDb.query
+      .mockResolvedValueOnce({ rows: [] }) // SET tenant
+      .mockResolvedValueOnce({
+        rows: [
+          { id: 'm1', content: 'A', category: 'facts', embedding, relationship_count: '0' },
+          { id: 'm2', content: 'B', category: 'facts', embedding, relationship_count: '0' }
+        ]
+      })
+      .mockResolvedValue({ rows: [{ count: '0' }] });
+
+    const result = await service.inferRelationships('tenant-1', 0.7, 50);
+
+    expect(result[0]).toMatchObject({
+      relationshipType: 'similar',
+      confidence: 1,
+      evidence: 'Vector similarity: 1.000'
+    });
   });
 
   it('should create relationships', async () => {

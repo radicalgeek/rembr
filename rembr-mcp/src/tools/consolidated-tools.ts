@@ -504,6 +504,11 @@ export function getConsolidatedTools(): Tool[] {
             description: '[detect] Confidence threshold (0.0-1.0)',
             minimum: 0,
             maximum: 1
+          },
+          live_analysis: {
+            type: 'string',
+            enum: ['auto', 'always', 'never'],
+            description: '[detect] Run live analysis when stored contradiction relationships are missing (default: auto)'
           }
         },
         required: ['operation']

@@ -33,12 +33,12 @@ import { EmbeddingCache } from './embedding-cache.js';
  *    called before batch operations to gate work that requires embeddings.
  *
  * ## Environment Variables
- * - `OLLAMA_HOST`              — Ollama base URL for embeddings (default: cluster-local service)
+ * - `OLLAMA_HOST`              — Ollama base URL for embeddings (default: http://localhost:11434)
  * - `OLLAMA_TEXT_HOST`         — Optional Ollama base URL for text generation
  * - `TEXT_GENERATION_PROVIDER` — "ollama" or "openai-compatible" (also accepts "lmstudio")
- * - `LM_STUDIO_BASE_URL`       — LM Studio/OpenAI-compatible base URL, e.g. http://host:1234/v1
- * - `LM_STUDIO_MODEL`          — LM Studio model id for text generation
- * - `LM_STUDIO_API_KEY`        — Optional LM Studio bearer token (defaults to a non-empty local token)
+ * - `LM_STUDIO_BASE_URL`       — OpenAI-compatible base URL, e.g. http://localhost:4000/v1
+ * - `LM_STUDIO_MODEL`          — OpenAI-compatible model id for text generation
+ * - `LM_STUDIO_API_KEY`        — Optional bearer token (defaults to a non-empty local token)
  * - `OLLAMA_EMBEDDING_MODEL`   — embedding model name (default: nomic-embed-text)
  * - `OLLAMA_TEXT_MODEL`        — text-gen model name (default: llama3.1:8b)
  * - `TEXT_GENERATION_TIMEOUT_MS` — text generation timeout override in milliseconds
@@ -74,7 +74,7 @@ export class OllamaClient {
   private circuitOpenedAt: number | null = null;
 
   private constructor() {
-    this.host = process.env.OLLAMA_HOST || 'http://ollama.ai.svc.cluster.local:11434';
+    this.host = process.env.OLLAMA_HOST || 'http://localhost:11434';
     this.textHost = process.env.LM_STUDIO_BASE_URL
       || process.env.OPENAI_COMPATIBLE_TEXT_BASE_URL
       || process.env.OLLAMA_TEXT_HOST

@@ -263,15 +263,15 @@ export class AnalyticsReportingService {
 
   async getMemoryGrowthStats(from: Date, to: Date): Promise<MemoryGrowthStats> {
     const [startResult, endResult, dailyResult] = await Promise.all([
-      this.pool.query<{ count: string }>(
+      this.queryWithTenant<{ count: string }>(
         `SELECT COUNT(*) AS count FROM memories WHERE tenant_id=$1 AND created_at < $2`,
         [this.tenantId, from],
       ),
-      this.pool.query<{ count: string }>(
+      this.queryWithTenant<{ count: string }>(
         `SELECT COUNT(*) AS count FROM memories WHERE tenant_id=$1 AND created_at <= $2`,
         [this.tenantId, to],
       ),
-      this.pool.query<{ day: Date; count: string }>(
+      this.queryWithTenant<{ day: Date; count: string }>(
         `SELECT DATE(created_at AT TIME ZONE 'UTC') AS day, COUNT(*) AS count
          FROM memories
          WHERE tenant_id=$1 AND created_at >= $2 AND created_at <= $3

@@ -20,4 +20,73 @@ describe('Optimization Services - Basic Validation', () => {
     expect(MemoryDatabase).toBeDefined();
     expect(OllamaClient).toBeDefined();
   });
+
+  it('should not treat high-similarity negated facts as duplicates', async () => {
+    const { DeduplicationService } = await import('../../src/optimization/deduplication-service.js');
+    const db = {
+      query: async (sql: string) => {
+        if (sql.includes('SELECT m.id')) {
+          return {
+            rows: [
+              {
+                id: 'memory-a',
+                content: 'The Rembr synthetic datastore uses PostgreSQL for durable memory storage.',
+                created_at: new Date('2026-07-05T07:00:00Z'),
+                category: 'facts',
+                embedding: '[1,0,0]'
+              },
+              {
+                id: 'memory-b',
+                content: 'The Rembr synthetic datastore does not use PostgreSQL for durable memory storage.',
+                created_at: new Date('2026-07-05T07:01:00Z'),
+                category: 'facts',
+                embedding: '[0.99,0.01,0]'
+              }
+            ]
+          };
+        }
+        return { rows: [] };
+      }
+    };
+
+    const service = new DeduplicationService(db as any, {} as any);
+    const clusters = await service.findDuplicateClusters('tenant-1', 0.85);
+
+    expect(clusters).toEqual([]);
+  });
+
+  it('should still cluster high-similarity repeated facts', async () => {
+    const { DeduplicationService } = await import('../../src/optimization/deduplication-service.js');
+    const db = {
+      query: async (sql: string) => {
+        if (sql.includes('SELECT m.id')) {
+          return {
+            rows: [
+              {
+                id: 'memory-a',
+                content: 'The Rembr synthetic datastore uses PostgreSQL for durable memory storage.',
+                created_at: new Date('2026-07-05T07:00:00Z'),
+                category: 'facts',
+                embedding: '[1,0,0]'
+              },
+              {
+                id: 'memory-b',
+                content: 'Rembr datastore uses PostgreSQL for durable memory storage.',
+                created_at: new Date('2026-07-05T07:01:00Z'),
+                category: 'facts',
+                embedding: '[0.99,0.01,0]'
+              }
+            ]
+          };
+        }
+        return { rows: [] };
+      }
+    };
+
+    const service = new DeduplicationService(db as any, {} as any);
+    const clusters = await service.findDuplicateClusters('tenant-1', 0.85);
+
+    expect(clusters).toHaveLength(1);
+    expect(clusters[0].memories.map((memory) => memory.id)).toEqual(['memory-a', 'memory-b']);
+  });
 });

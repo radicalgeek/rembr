@@ -82,7 +82,11 @@ export class MemoryDatabase {
     const dbPassword = process.env.DB_PASSWORD;
     const dbReadHost = process.env.DB_READ_HOST;
     
-    if (dbHost && dbName && dbUser && dbPassword) {
+    if (connectionString) {
+      primaryConnectionString = connectionString;
+      readConnectionString = process.env.DATABASE_READ_URL;
+      console.log('ℹ️ Using explicit database connection string');
+    } else if (dbHost && dbName && dbUser && dbPassword) {
       // Build from components - this is the reliable way
       const encodedPassword = encodeURIComponent(dbPassword);
       primaryConnectionString = `postgresql://${dbUser}:${encodedPassword}@${dbHost}:${dbPort}/${dbName}`;
@@ -92,9 +96,9 @@ export class MemoryDatabase {
         readConnectionString = `postgresql://${dbUser}:${encodedPassword}@${dbReadHost}:${dbPort}/${dbName}`;
         console.log(`✅ Read replica connection: ${dbUser}@${dbReadHost}:${dbPort}/${dbName}`);
       }
-    } else if (connectionString || process.env.DATABASE_URL) {
+    } else if (process.env.DATABASE_URL) {
       // Fall back to connection string
-      primaryConnectionString = connectionString || process.env.DATABASE_URL!;
+      primaryConnectionString = process.env.DATABASE_URL!;
       readConnectionString = process.env.DATABASE_READ_URL;
       console.log('ℹ️ Using DATABASE_URL environment variable');
     } else {

@@ -10,6 +10,25 @@ function makePool(rows: Record<string, unknown>[] = []) {
   return { query: vi.fn().mockResolvedValue({ rows }) } as any;
 }
 
+function makeConnectedPool(results: Array<{ rows: Record<string, unknown>[] }>) {
+  const clients = results.map((result) => ({
+    query: vi.fn()
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce(result)
+      .mockResolvedValueOnce({ rows: [] }),
+    release: vi.fn()
+  }));
+
+  return {
+    pool: { connect: vi.fn()
+      .mockResolvedValueOnce(clients[0])
+      .mockResolvedValueOnce(clients[1])
+      .mockResolvedValueOnce(clients[2]) } as any,
+    clients
+  };
+}
+
 const TENANT = 'aaaaaaaa-0000-0000-0000-000000000042';
 const FROM   = new Date('2026-02-01T00:00:00Z');
 const TO     = new Date('2026-02-28T23:59:59Z');
@@ -147,12 +166,11 @@ describe('AnalyticsReportingService — getCategoryBreakdown', () => {
 // ─── Memory Growth Stats ──────────────────────────────────
 describe('AnalyticsReportingService — getMemoryGrowthStats', () => {
   it('calculates growth rate correctly', async () => {
-    const pool = {
-      query: vi.fn()
-        .mockResolvedValueOnce({ rows: [{ count: '100' }] })   // start
-        .mockResolvedValueOnce({ rows: [{ count: '150' }] })   // end
-        .mockResolvedValueOnce({ rows: [{ day: new Date('2026-02-15'), count: '10' }] }), // peak
-    } as any;
+    const { pool, clients } = makeConnectedPool([
+      { rows: [{ count: '100' }] },
+      { rows: [{ count: '150' }] },
+      { rows: [{ day: new Date('2026-02-15'), count: '10' }] },
+    ]);
 
     const svc = new AnalyticsReportingService(pool, TENANT);
     const result = await svc.getMemoryGrowthStats(FROM, TO);
@@ -162,15 +180,18 @@ describe('AnalyticsReportingService — getMemoryGrowthStats', () => {
     expect(result.net_change).toBe(50);
     expect(result.growth_rate_pct).toBe(50);
     expect(result.peak_day).toBe('2026-02-15');
+    expect(clients[0].query).toHaveBeenCalledWith(
+      'SELECT set_config($1, $2, true)',
+      ['app.current_tenant', TENANT]
+    );
   });
 
   it('handles zero start_count without division error', async () => {
-    const pool = {
-      query: vi.fn()
-        .mockResolvedValueOnce({ rows: [{ count: '0' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
-        .mockResolvedValueOnce({ rows: [] }),
-    } as any;
+    const { pool } = makeConnectedPool([
+      { rows: [{ count: '0' }] },
+      { rows: [{ count: '20' }] },
+      { rows: [] },
+    ]);
     const svc = new AnalyticsReportingService(pool, TENANT);
     const result = await svc.getMemoryGrowthStats(FROM, TO);
     expect(result.growth_rate_pct).toBe(0);
@@ -201,25 +222,20 @@ describe('AnalyticsReportingService — getPIISummary', () => {
 // ─── buildReport ─────────────────────────────────────────
 describe('AnalyticsReportingService — buildReport', () => {
   it('assembles sections for requested metrics', async () => {
+    const { pool } = makeConnectedPool([
+      { rows: [{ count: '0' }] },
+      { rows: [{ count: '10' }] },
+      { rows: [] },
+    ]);
     // Use a spy that returns sensible rows for every query type
-    const pool = {
-      query: vi.fn().mockImplementation((sql: string) => {
-        // Growth stats: 3 parallel queries — all need count or day rows
-        if (sql.includes('created_at <') || sql.includes('created_at <=')) {
-          return Promise.resolve({ rows: [{ count: '10' }] });
-        }
-        // Growth peak day query
-        if (sql.includes('DATE(created_at')) {
-          return Promise.resolve({ rows: [] }); // no peak
-        }
+    pool.query = vi.fn().mockImplementation((sql: string) => {
         // Category breakdown
         if (sql.includes('COALESCE(category')) {
           return Promise.resolve({ rows: [{ category: 'notes', count: '10', pii_count: '1', avg_len: '120', last_used: null }] });
         }
         // Default: empty
         return Promise.resolve({ rows: [] });
-      }),
-    } as any;
+      });
 
     const svc = new AnalyticsReportingService(pool, TENANT);
     const config: CustomReportConfig = {

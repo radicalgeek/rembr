@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index-http.js",
+    "start:maintenance": "node dist/maintenance-worker.js",
     "dev": "tsc && node dist/index-http.js",
     "test": "vitest run",
     "test:unit": "TEST_SUITE=unit vitest run",

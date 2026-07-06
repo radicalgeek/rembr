@@ -1,10 +1,9 @@
 /**
  * Minimal stateless MCP client for the Rembr server.
  *
- * Rembr (post MCP-2026-07-28 migration) is a stateless streamable-HTTP MCP
- * server: every `tools/call` is an independent POST to /mcp authenticated by
- * x-api-key or a Bearer token. There is no session handshake and no SSE
- * notification stream, so a full MCP SDK client is unnecessary.
+ * Rembr's hosted MCP endpoint uses stateless Streamable HTTP: send tools/call
+ * directly and authenticate each request independently. The server still
+ * answers initialize for older clients, but no session header is required.
  */
 
 export interface RembrClientOptions {
@@ -78,50 +77,53 @@ export class RembrClient {
    * Retries once on network failure or 5xx.
    */
   async callTool(name: string, args: Record<string, unknown>): Promise<string> {
-    const id = this.nextId++
-    const payload = JSON.stringify({
-      jsonrpc: "2.0",
-      id,
-      method: "tools/call",
-      params: { name, arguments: args },
-    })
-
     let lastError: unknown
     for (let attempt = 0; attempt < 2; attempt++) {
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs)
-      // resolved per call so late global fetch instrumentation/stubs are honored
-      const fetchImpl = this.fetchOverride ?? fetch
-      let response: Response
       try {
-        response = await fetchImpl(this.url, {
-          method: "POST",
-          headers: this.headers,
-          body: payload,
-          signal: controller.signal,
+        const id = this.nextId++
+        const response = await this.postJson({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name, arguments: args },
         })
+
+        if (response.status >= 500) {
+          lastError = new RembrError(`Rembr server error (HTTP ${response.status})`, response.status)
+          continue
+        }
+        if (!response.ok) {
+          const text = await response.text().catch(() => "")
+          throw new RembrError(
+            `Rembr request failed (HTTP ${response.status})${text ? `: ${text.slice(0, 300)}` : ""}`,
+            response.status,
+          )
+        }
+        // protocol and tool-level errors are not retryable
+        return this.extractText(await this.parseResponse(response, id))
       } catch (error) {
-        // network failure or timeout: retry once
+        if (error instanceof RembrError) {
+          throw error
+        }
         lastError = error
-        continue
-      } finally {
-        clearTimeout(timer)
       }
-      if (response.status >= 500) {
-        lastError = new RembrError(`Rembr server error (HTTP ${response.status})`, response.status)
-        continue
-      }
-      if (!response.ok) {
-        const text = await response.text().catch(() => "")
-        throw new RembrError(
-          `Rembr request failed (HTTP ${response.status})${text ? `: ${text.slice(0, 300)}` : ""}`,
-          response.status,
-        )
-      }
-      // protocol and tool-level errors are not retryable
-      return this.extractText(await this.parseResponse(response, id))
     }
     throw lastError instanceof Error ? lastError : new RembrError(String(lastError))
+  }
+
+  private async postJson(payload: unknown, extraHeaders: Record<string, string> = {}): Promise<Response> {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs)
+    try {
+      return await (this.fetchOverride ?? fetch)(this.url, {
+        method: "POST",
+        headers: { ...this.headers, ...extraHeaders },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      })
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   private async parseResponse(response: Response, id: number): Promise<JsonRpcResponse> {

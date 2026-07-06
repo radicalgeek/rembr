@@ -12,6 +12,9 @@ default tenant — no login system, no billing, no feature flags.
 - **rembr-console** — a lightweight web UI (browse/search/create/delete memories,
   contexts, snapshots, stats). A pure MCP client with zero runtime dependencies.
 - **PostgreSQL 16 + pgvector**, and optionally a local **Ollama** for embeddings.
+- **rembr-maintenance-worker** — background jobs for missing embeddings,
+  relationship upkeep, and LLM-assisted memory evolution: keep, rewrite,
+  supersede, archive, and prune as your memory base grows.
 
 ## Quick start (Docker Compose)
 
@@ -45,6 +48,22 @@ Search quality depends on an embedding provider. Two options:
   `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS` in `.env`.
 
 Embeddings are generated server-side — agents and the console only ever send text.
+
+### Background memory evolution
+
+The maintenance worker can use an OpenAI-compatible chat endpoint to keep memory
+clean over time. It reviews older memories in the background and records an audit
+decision to keep, rewrite, archive, supersede, or prune. Set these in `.env`:
+
+```bash
+TEXT_GENERATION_PROVIDER=openai-compatible
+LM_STUDIO_BASE_URL=http://your-openai-compatible-host:4000/v1
+LM_STUDIO_MODEL=qwen3
+MEMORY_EVOLUTION_APPLY_ENABLED=true
+```
+
+The `LM_STUDIO_*` names are kept for backwards compatibility; the endpoint can be
+OpenAI or any local/provider gateway that implements the OpenAI chat completions API.
 
 ## Connecting agents
 

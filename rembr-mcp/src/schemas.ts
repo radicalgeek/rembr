@@ -300,7 +300,8 @@ const getMemoryInsightsSchema = z.object({
 const detectMemoryContradictionsSchema = z.object({
   context_id: uuid.optional(),
   min_confidence: scoreRange(0.5, 1.0).optional().default(0.7),
-  contradiction_types: z.array(quoteTolerantEnum(CONTRADICTION_TYPES)).optional()
+  contradiction_types: z.array(quoteTolerantEnum(CONTRADICTION_TYPES)).optional(),
+  live_analysis: z.enum(['auto', 'always', 'never']).optional().default('auto')
 });
 
 // 25. generate_context_graph

@@ -64,6 +64,20 @@ export interface ExpandedSearchResult extends HybridSearchResult {
   graph_boost?: number;
 }
 
+export interface SearchDiagnostics {
+  semantic_status: 'succeeded' | 'failed' | 'unavailable' | 'skipped';
+  semantic_error?: string;
+  fallback_used: boolean;
+  min_similarity: number;
+  embedding_coverage: number | null;
+  embedding_pending: number | null;
+  embedding_total: number | null;
+}
+
+export type SearchMemoryResults = ExpandedSearchResult[] & {
+  search_metadata?: SearchDiagnostics;
+};
+
 export interface MemoryStats {
   total_memories: number;
   by_category: Record<string, number>;
@@ -220,9 +234,15 @@ export class MemoryService {
       piiData
     );
 
-    // Schedule background processing (embedding, relationships, contradictions)
-    // This runs asynchronously and does NOT block the API response
-    this.scheduleBackgroundProcessing(id, projectId, input.content);
+    // Keep store_memory on the durable write path only. Continuous indexing,
+    // relationships, contradictions, and cleanup are handled by the maintenance
+    // worker; inline processing can be enabled for local debugging.
+    if (process.env.ENABLE_INLINE_MEMORY_BACKGROUND_PROCESSING === 'true') {
+      const backgroundJob = setImmediate(() => {
+        this.scheduleBackgroundProcessing(id, projectId, input.content);
+      });
+      backgroundJob.unref?.();
+    }
 
     return memory;
   }
@@ -391,13 +411,12 @@ export class MemoryService {
   }
 
   // Hybrid search: combine semantic and text search with graph-aware ranking
-  async searchMemory(input: SearchMemoryInput): Promise<ExpandedSearchResult[]> {
+  async searchMemory(input: SearchMemoryInput): Promise<SearchMemoryResults> {
     await this.checkRateLimits('search');
 
     const limit = input.limit || 10;
-    // Default 0.5 for nomic-embed-text (768-dim); OpenAI text-embedding-3
-    // models can use 0.7. Agents can override via min_similarity param.
-    const minSimilarity = input.min_similarity || 0.5;
+    const defaultMinSimilarity = this.getDefaultSearchMinSimilarity();
+    const minSimilarity = input.min_similarity ?? defaultMinSimilarity;
     const searchMode = input.search_mode || 'hybrid';
 
     // Weights for hybrid search
@@ -405,8 +424,25 @@ export class MemoryService {
     const TEXT_WEIGHT = 0.3;
 
     const results: HybridSearchResult[] = [];
+    const diagnostics: SearchDiagnostics = {
+      semantic_status: searchMode === 'text' || searchMode === 'phrase' ? 'skipped' : 'unavailable',
+      fallback_used: false,
+      min_similarity: minSimilarity,
+      embedding_coverage: null,
+      embedding_pending: null,
+      embedding_total: null
+    };
 
     // Semantic search if embedding provider is available
+    if ((searchMode === 'semantic' || searchMode === 'hybrid') && !this.embeddingProvider) {
+      diagnostics.semantic_status = 'unavailable';
+      diagnostics.semantic_error = 'No embedding provider configured';
+      diagnostics.fallback_used = searchMode === 'hybrid';
+      if (searchMode === 'semantic') {
+        throw new Error('Semantic search unavailable: no embedding provider configured');
+      }
+    }
+
     if ((searchMode === 'semantic' || searchMode === 'hybrid') && this.embeddingProvider) {
       try {
         console.log(`🔍 Generating embedding for query: "${input.query}"`);
@@ -435,11 +471,15 @@ export class MemoryService {
           }
         }
         console.log(`✅ ${results.length} results passed similarity threshold`);
+        diagnostics.semantic_status = 'succeeded';
       } catch (error) {
         console.error('❌ Semantic search failed:', error);
+        diagnostics.semantic_status = 'failed';
+        diagnostics.semantic_error = (error as Error).message;
         if (searchMode === 'semantic') {
-          throw new Error('Semantic search unavailable');
+          throw new Error(`Semantic search unavailable: ${(error as Error).message}`);
         }
+        diagnostics.fallback_used = true;
       }
     }
 
@@ -485,6 +525,17 @@ export class MemoryService {
     const filteredResults = input.exclude_pii
       ? sortedResults.filter(r => !r.pii_detected)
       : sortedResults;
+
+    try {
+      const embeddingStatus = await this.getPendingEmbeddingCount();
+      diagnostics.embedding_pending = embeddingStatus.pending;
+      diagnostics.embedding_total = embeddingStatus.total;
+      diagnostics.embedding_coverage = embeddingStatus.total > 0
+        ? (embeddingStatus.total - embeddingStatus.pending) / embeddingStatus.total
+        : 1;
+    } catch (error) {
+      console.warn('Failed to calculate search embedding coverage:', (error as Error).message);
+    }
     
     // Apply token budget truncation if requested (REM-103)
     let maxTokens = input.max_tokens;
@@ -517,11 +568,34 @@ export class MemoryService {
         console.warn(`⚠️  ${budgetResult.warning}`);
       }
       
-      return budgetResult.results;
+      return this.withSearchMetadata(budgetResult.results, diagnostics);
     }
     
     // Return top N without budget truncation
-    return filteredResults.slice(0, limit);
+    return this.withSearchMetadata(filteredResults.slice(0, limit), diagnostics);
+  }
+
+  private withSearchMetadata(
+    results: ExpandedSearchResult[],
+    diagnostics: SearchDiagnostics
+  ): SearchMemoryResults {
+    const enriched = results as SearchMemoryResults;
+    enriched.search_metadata = diagnostics;
+    return enriched;
+  }
+
+  private getDefaultSearchMinSimilarity(): number {
+    const configured = Number(process.env.SEARCH_DEFAULT_MIN_SIMILARITY);
+    if (Number.isFinite(configured) && configured >= 0 && configured <= 1) {
+      return configured;
+    }
+
+    const provider = this.embeddingProvider?.name.toLowerCase() || '';
+    if (provider.includes('openai-compatible')) {
+      return 0.35;
+    }
+
+    return 0.5;
   }
 
   // List recent memories

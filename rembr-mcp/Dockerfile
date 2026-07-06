@@ -11,6 +11,7 @@ RUN npm ci
 
 # Copy source code
 COPY src ./src
+COPY src/migrations ./src/migrations
 
 # Build TypeScript
 RUN npm run build

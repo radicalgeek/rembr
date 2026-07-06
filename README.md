@@ -55,6 +55,7 @@ Rembr turns agent memory into durable infrastructure:
 - **Graph tools** for exploring relationships between memories, tasks, decisions, and incidents.
 - **Contradiction detection** for finding stale or conflicting context.
 - **Causal reasoning** for tracing why state changed and what followed.
+- **Self-evolving maintenance** for background keep/rewrite/supersede/archive/prune decisions as memories age.
 - **RLM/task tooling** for resumable agentic work with acceptance criteria, iterations, task state, dependencies, and handoffs.
 - **Audit and PII tooling** for safer production use.
 
@@ -181,6 +182,17 @@ Ask what was known at a specific time, inspect memory history, and compare snaps
 
 Explore related memories, infer relationships, detect contradictions, and trace cause-effect chains.
 
+### Self-Evolving Memory
+
+Run the maintenance worker with any OpenAI-compatible chat endpoint, including local Qwen-compatible gateways, to review older memories in the background. The worker can keep, rewrite, supersede, archive, or prune memories based on confidence-gated LLM decisions and records those actions for auditability.
+
+```sh
+TEXT_GENERATION_PROVIDER=openai-compatible
+LM_STUDIO_BASE_URL=http://your-openai-compatible-host:4000/v1
+LM_STUDIO_MODEL=qwen3
+MEMORY_EVOLUTION_APPLY_ENABLED=true
+```
+
 ### RLM And Task Workflows
 
 Use sessions, iterations, acceptance criteria, task state, dependencies, handoff payloads, and work queues for resumable agentic work.
@@ -204,6 +216,7 @@ PostgreSQL + pgvector
         |
         +-- optional Redis for rate limiting/session cache
         +-- optional Ollama/OpenAI-compatible embeddings
+        +-- optional OpenAI-compatible LLM for memory evolution
 ```
 
 Rembr is intentionally exposed through MCP so it can be used by multiple agent runtimes instead of being locked to one framework.
@@ -212,11 +225,15 @@ Rembr is intentionally exposed through MCP so it can be used by multiple agent r
 
 ```sh
 git clone https://github.com/radicalgeek/rembr.git
-cd rembr/rembr-mcp
-npm install
+cd rembr
 cp .env.example .env
-npm run build
-npm start
+docker compose --profile ollama up -d --build
+docker compose exec ollama ollama pull nomic-embed-text
+
+# Create a tenant + API key, then add the printed key to .env as REMBR_API_KEY.
+node rembr-mcp/scripts/bootstrap-tenant.mjs \
+  | docker compose exec -T postgres psql -U rembr -d rembr
+docker compose up -d rembr-console
 ```
 
 Configure your MCP client with your Rembr endpoint and API key:

@@ -1,6 +1,7 @@
 import { MemoryDatabase } from './database.js';
 import { EmbeddingProvider } from './ollama-provider.js';
 import { OllamaClient } from './ollama-client.js';
+import { randomUUID } from 'crypto';
 
 /**
  * Advanced Analytics Service
@@ -251,41 +252,53 @@ export class AdvancedAnalyticsService {
       }
     }
 
-    // Phase 2: Use LLM to analyze each candidate pair
+    // Phase 2: Use deterministic patterns first, then LLM for ambiguous pairs
     for (const pair of candidatePairs) {
       try {
-        const llmResult = await this.analyzeContradictionWithLLM(pair.memoryA, pair.memoryB);
-        
-        if (llmResult && llmResult.isContradiction && llmResult.confidence >= minConfidence) {
-          const contradiction: ContradictionResult = {
-            memory_a: {
-              id: pair.memoryA.id,
-              content: pair.memoryA.content,
-              category: pair.memoryA.category,
-              created_at: pair.memoryA.created_at
-            },
-            memory_b: {
-              id: pair.memoryB.id,
-              content: pair.memoryB.content,
-              category: pair.memoryB.category,
-              created_at: pair.memoryB.created_at
-            },
-            contradiction_type: llmResult.type,
-            confidence: llmResult.confidence,
-            explanation: llmResult.explanation,
-            severity: this.calculateSeverity(llmResult.confidence, llmResult.type),
-            resolution_suggestions: llmResult.suggestions
-          };
-          
+        let contradiction: ContradictionResult | null = null;
+        const patternResult = await this.analyzeContradiction(pair.memoryA, pair.memoryB);
+
+        if (patternResult && patternResult.confidence >= minConfidence) {
+          contradiction = patternResult;
+        }
+
+        if (!contradiction) {
+          const llmResult = await this.analyzeContradictionWithLLM(pair.memoryA, pair.memoryB);
+
+          if (llmResult && llmResult.isContradiction && llmResult.confidence >= minConfidence) {
+            contradiction = {
+              memory_a: {
+                id: pair.memoryA.id,
+                content: pair.memoryA.content,
+                category: pair.memoryA.category,
+                created_at: pair.memoryA.created_at
+              },
+              memory_b: {
+                id: pair.memoryB.id,
+                content: pair.memoryB.content,
+                category: pair.memoryB.category,
+                created_at: pair.memoryB.created_at
+              },
+              contradiction_type: llmResult.type,
+              confidence: llmResult.confidence,
+              explanation: llmResult.explanation,
+              severity: this.calculateSeverity(llmResult.confidence, llmResult.type),
+              resolution_suggestions: llmResult.suggestions
+            };
+          }
+        }
+
+        if (contradiction) {
           contradictions.push(contradiction);
-          
+
           // Store the contradiction as a relationship so UI can access it
           try {
             await this.database.query(
-              `INSERT INTO memory_relationships (source_memory_id, target_memory_id, relationship_type, confidence, evidence)
-               VALUES ($1, $2, 'contradicts', $3, $4)
+              `INSERT INTO memory_relationships (id, source_memory_id, target_memory_id, relationship_type, confidence, evidence)
+               VALUES ($1, $2, $3, 'contradicts', $4, $5)
                ON CONFLICT DO NOTHING`,
               [
+                randomUUID(),
                 contradiction.memory_a.id,
                 contradiction.memory_b.id,
                 contradiction.confidence,
@@ -295,7 +308,8 @@ export class AdvancedAnalyticsService {
                   explanation: contradiction.explanation,
                   suggestions: contradiction.resolution_suggestions
                 })
-              ]
+              ],
+              tenantId
             );
             console.log(`💾 Stored contradiction: ${pair.memoryA.id} <-> ${pair.memoryB.id}`);
           } catch (err) {
@@ -308,6 +322,28 @@ export class AdvancedAnalyticsService {
         const patternResult = await this.analyzeContradiction(pair.memoryA, pair.memoryB);
         if (patternResult && patternResult.confidence >= minConfidence) {
           contradictions.push(patternResult);
+          try {
+            await this.database.query(
+              `INSERT INTO memory_relationships (id, source_memory_id, target_memory_id, relationship_type, confidence, evidence)
+               VALUES ($1, $2, $3, 'contradicts', $4, $5)
+               ON CONFLICT DO NOTHING`,
+              [
+                randomUUID(),
+                patternResult.memory_a.id,
+                patternResult.memory_b.id,
+                patternResult.confidence,
+                JSON.stringify({
+                  type: patternResult.contradiction_type,
+                  severity: patternResult.severity,
+                  explanation: patternResult.explanation,
+                  suggestions: patternResult.resolution_suggestions
+                })
+              ],
+              tenantId
+            );
+          } catch (storeErr) {
+            console.error('Failed to store pattern contradiction relationship:', storeErr);
+          }
         }
       }
     }
@@ -492,48 +528,61 @@ Do these statements contradict each other? Analyze carefully.`;
         return contradictions;
       }
       
-      // Analyze each candidate with LLM
+      // Analyze each candidate with deterministic patterns first, then LLM.
       for (const candidate of candidateMemories) {
         try {
-          const llmResult = await this.analyzeContradictionWithLLM(newMemory, candidate);
-          
-          if (llmResult && llmResult.isContradiction && llmResult.confidence >= minConfidence) {
-            const contradiction: ContradictionResult = {
-              memory_a: {
-                id: newMemory.id,
-                content: newMemory.content,
-                category: newMemory.category,
-                created_at: newMemory.created_at
-              },
-              memory_b: {
-                id: candidate.id,
-                content: candidate.content,
-                category: candidate.category,
-                created_at: candidate.created_at
-              },
-              contradiction_type: llmResult.type,
-              confidence: llmResult.confidence,
-              explanation: llmResult.explanation,
-              severity: this.calculateSeverity(llmResult.confidence, llmResult.type),
-              resolution_suggestions: llmResult.suggestions
-            };
-            
+          let contradiction: ContradictionResult | null = null;
+          const patternResult = await this.analyzeContradiction(newMemory, candidate);
+
+          if (patternResult && patternResult.confidence >= minConfidence) {
+            contradiction = patternResult;
+          }
+
+          if (!contradiction) {
+            const llmResult = await this.analyzeContradictionWithLLM(newMemory, candidate);
+
+            if (llmResult && llmResult.isContradiction && llmResult.confidence >= minConfidence) {
+              contradiction = {
+                memory_a: {
+                  id: newMemory.id,
+                  content: newMemory.content,
+                  category: newMemory.category,
+                  created_at: newMemory.created_at
+                },
+                memory_b: {
+                  id: candidate.id,
+                  content: candidate.content,
+                  category: candidate.category,
+                  created_at: candidate.created_at
+                },
+                contradiction_type: llmResult.type,
+                confidence: llmResult.confidence,
+                explanation: llmResult.explanation,
+                severity: this.calculateSeverity(llmResult.confidence, llmResult.type),
+                resolution_suggestions: llmResult.suggestions
+              };
+            }
+          }
+
+          if (contradiction) {
             contradictions.push(contradiction);
-            
+
             // Check if contradiction relationship already exists in either direction
             const existingCheck = await this.database.query(
               `SELECT id FROM memory_relationships 
                WHERE ((source_memory_id = $1 AND target_memory_id = $2) OR (source_memory_id = $2 AND target_memory_id = $1))
                  AND relationship_type = 'contradicts'`,
-              [newMemory.id, candidate.id]
+              [newMemory.id, candidate.id],
+              tenantId
             );
             
             if (existingCheck.rows.length === 0) {
               // Store the contradiction as a relationship
               await this.database.query(
-                `INSERT INTO memory_relationships (source_memory_id, target_memory_id, relationship_type, confidence, evidence)
-                 VALUES ($1, $2, 'contradicts', $3, $4)`,
+                `INSERT INTO memory_relationships (id, source_memory_id, target_memory_id, relationship_type, confidence, evidence)
+                 VALUES ($1, $2, $3, 'contradicts', $4, $5)`,
                 [
+                  randomUUID(),
                   newMemory.id,
                   candidate.id,
                   contradiction.confidence,
@@ -544,7 +593,8 @@ Do these statements contradict each other? Analyze carefully.`;
                     suggestions: contradiction.resolution_suggestions,
                     detected_at: new Date().toISOString()
                   })
-                ]
+                ],
+                tenantId
               );
               console.log(`💾 Stored contradiction: ${newMemory.id} <-> ${candidate.id}`);
             } else {
@@ -561,15 +611,17 @@ Do these statements contradict each other? Analyze carefully.`;
               contradictions.push(patternResult);
               // Store pattern-detected contradiction
               await this.database.query(
-                `INSERT INTO memory_relationships (source_memory_id, target_memory_id, relationship_type, confidence, evidence)
-                 VALUES ($1, $2, 'contradicts', $3, $4)
+                `INSERT INTO memory_relationships (id, source_memory_id, target_memory_id, relationship_type, confidence, evidence)
+                 VALUES ($1, $2, $3, 'contradicts', $4, $5)
                  ON CONFLICT DO NOTHING`,
                 [
+                  randomUUID(),
                   newMemory.id,
                   candidate.id,
                   patternResult.confidence,
                   JSON.stringify({ detected_by: 'pattern', severity: patternResult.severity })
-                ]
+                ],
+                tenantId
               );
             }
           } catch (patternErr) {
@@ -725,13 +777,40 @@ Do these statements contradict each other? Analyze carefully.`;
       params = [tenantId];
     }
 
-    const result = await this.database.query(query, params);
+    const result = await this.database.query(query, params, tenantId);
     return result.rows;
   }
 
   private async analyzeContradiction(memoryA: any, memoryB: any): Promise<ContradictionResult | null> {
     const contentA = memoryA.content.toLowerCase();
     const contentB = memoryB.content.toLowerCase();
+
+    const negationConflict = this.detectNegationConflict(contentA, contentB);
+    if (negationConflict) {
+      return {
+        memory_a: {
+          id: memoryA.id,
+          content: memoryA.content,
+          category: memoryA.category,
+          created_at: memoryA.created_at
+        },
+        memory_b: {
+          id: memoryB.id,
+          content: memoryB.content,
+          category: memoryB.category,
+          created_at: memoryB.created_at
+        },
+        contradiction_type: 'factual',
+        confidence: negationConflict.confidence,
+        explanation: negationConflict.explanation,
+        severity: negationConflict.confidence > 0.85 ? 'high' : 'medium',
+        resolution_suggestions: [
+          'Review both memories and determine which statement is current',
+          'Check timestamps and source metadata before archiving either memory',
+          'Write a superseding memory if both were true at different times'
+        ]
+      };
+    }
 
     // ENHANCED: Check for factual numeric conflicts (e.g., "15-minute" vs "60-minute")
     const numericConflict = this.detectNumericConflict(contentA, contentB);
@@ -834,6 +913,62 @@ Do these statements contradict each other? Analyze carefully.`;
    * Detect numeric conflicts where the same metric has different values
    * E.g., "15-minute expiry" vs "60-minute expiry"
    */
+  private detectNegationConflict(contentA: string, contentB: string): {
+    confidence: number;
+    explanation: string;
+  } | null {
+    const negatedA = this.hasNegation(contentA);
+    const negatedB = this.hasNegation(contentB);
+
+    if (negatedA === negatedB) {
+      return null;
+    }
+
+    const tokensA = this.topicTokens(contentA);
+    const tokensB = this.topicTokens(contentB);
+    if (tokensA.size === 0 || tokensB.size === 0) {
+      return null;
+    }
+
+    let overlap = 0;
+    for (const token of tokensA) {
+      if (tokensB.has(token)) overlap++;
+    }
+
+    const overlapRatio = overlap / Math.min(tokensA.size, tokensB.size);
+    if (overlapRatio < 0.45) {
+      return null;
+    }
+
+    return {
+      confidence: overlapRatio >= 0.7 ? 0.9 : 0.78,
+      explanation: 'One memory negates a statement made by the other while referring to the same subject.'
+    };
+  }
+
+  private hasNegation(content: string): boolean {
+    return /\b(?:not|never|no|cannot|can't|cant|won't|wont|isn't|isnt|aren't|arent|wasn't|wasnt|weren't|werent|don't|dont|doesn't|doesnt|didn't|didnt|without)\b/i.test(content);
+  }
+
+  private topicTokens(content: string): Set<string> {
+    const stopWords = new Set([
+      'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by', 'can', 'cannot',
+      'cant', 'could', 'did', 'didnt', 'do', 'does', 'doesnt', 'dont', 'for',
+      'from', 'has', 'have', 'in', 'is', 'isnt', 'it', 'not', 'of', 'on', 'or',
+      'that', 'the', 'this', 'to', 'use', 'uses', 'using', 'was', 'were', 'with',
+      'without'
+    ]);
+
+    return new Set(
+      content
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, ' ')
+        .split(/\s+/)
+        .map((token) => token.replace(/s$/, ''))
+        .filter((token) => token.length > 2 && !stopWords.has(token))
+    );
+  }
+
   private detectNumericConflict(contentA: string, contentB: string): {
     confidence: number;
     explanation: string;

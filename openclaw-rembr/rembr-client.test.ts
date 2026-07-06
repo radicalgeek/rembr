@@ -1,10 +1,13 @@
 import { describe, it, expect, vi } from "vitest"
 import { RembrClient, RembrError } from "./rembr-client.js"
 
-function jsonResponse(body: unknown, init: { status?: number; contentType?: string } = {}) {
+function jsonResponse(
+  body: unknown,
+  init: { status?: number; contentType?: string; headers?: Record<string, string> } = {},
+) {
   return new Response(typeof body === "string" ? body : JSON.stringify(body), {
     status: init.status ?? 200,
-    headers: { "content-type": init.contentType ?? "application/json" },
+    headers: { "content-type": init.contentType ?? "application/json", ...init.headers },
   })
 }
 
@@ -17,8 +20,8 @@ function toolResult(id: number, text: string, isError = false) {
 }
 
 describe("RembrClient.callTool", () => {
-  it("sends a JSON-RPC tools/call with auth header and returns text content", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(toolResult(1, "stored: mem_123")))
+  it("sends stateless tools/call with auth headers and returns text content", async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(toolResult(1, "stored: mem_123")))
     const client = new RembrClient({ url: "https://rembr.test/mcp", apiKey: "mb_live_abc", fetchImpl })
 
     const result = await client.callTool("memory", { operation: "create", content: "hello" })
@@ -30,6 +33,7 @@ describe("RembrClient.callTool", () => {
     expect(init.method).toBe("POST")
     expect(init.headers["x-api-key"]).toBe("mb_live_abc")
     expect(init.headers["accept"]).toContain("text/event-stream")
+    expect(init.headers["mcp-session-id"]).toBeUndefined()
     const body = JSON.parse(init.body)
     expect(body).toMatchObject({
       jsonrpc: "2.0",
@@ -39,7 +43,7 @@ describe("RembrClient.callTool", () => {
   })
 
   it("uses a Bearer token when no API key is given", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(toolResult(1, "ok")))
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(toolResult(1, "ok")))
     const client = new RembrClient({ url: "https://rembr.test/mcp", bearerToken: "oauth", fetchImpl })
 
     await client.callTool("search", { operation: "query", query: "x" })
@@ -54,14 +58,14 @@ describe("RembrClient.callTool", () => {
       "data: ping",
       "",
     ].join("\n")
-    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(sse, { contentType: "text/event-stream" }))
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(sse, { contentType: "text/event-stream" }))
     const client = new RembrClient({ url: "https://rembr.test/mcp", apiKey: "k", fetchImpl })
 
     expect(await client.callTool("search", { operation: "query", query: "x" })).toBe("from sse")
   })
 
   it("throws RembrError when the tool result isError", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(toolResult(1, "category invalid", true)))
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(toolResult(1, "category invalid", true)))
     const client = new RembrClient({ url: "https://rembr.test/mcp", apiKey: "k", fetchImpl })
 
     await expect(client.callTool("memory", { operation: "create" })).rejects.toThrow("category invalid")
@@ -70,7 +74,7 @@ describe("RembrClient.callTool", () => {
   it("throws RembrError on JSON-RPC protocol errors", async () => {
     const fetchImpl = vi
       .fn()
-      .mockResolvedValue(jsonResponse({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "bad params" } }))
+      .mockResolvedValueOnce(jsonResponse({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "bad params" } }))
     const client = new RembrClient({ url: "https://rembr.test/mcp", apiKey: "k", fetchImpl })
 
     await expect(client.callTool("memory", {})).rejects.toThrow("bad params")
@@ -80,7 +84,7 @@ describe("RembrClient.callTool", () => {
     const fetchImpl = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse("oops", { status: 503 }))
-      .mockResolvedValueOnce(jsonResponse(toolResult(1, "recovered")))
+      .mockResolvedValueOnce(jsonResponse(toolResult(2, "recovered")))
     const client = new RembrClient({ url: "https://rembr.test/mcp", apiKey: "k", fetchImpl })
 
     expect(await client.callTool("memory", { operation: "list" })).toBe("recovered")
@@ -106,7 +110,7 @@ describe("RembrClient.callTool", () => {
 
 describe("convenience wrappers", () => {
   it("remember maps to memory/create with category and metadata", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(toolResult(1, "ok")))
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(toolResult(1, "ok")))
     const client = new RembrClient({ url: "https://rembr.test/mcp", apiKey: "k", fetchImpl })
 
     await client.remember("use vitest", "decisions", { source: "test" })
@@ -124,7 +128,7 @@ describe("convenience wrappers", () => {
   })
 
   it("recall maps to search/query with limit and min_similarity", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(toolResult(1, "results")))
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(toolResult(1, "results")))
     const client = new RembrClient({ url: "https://rembr.test/mcp", apiKey: "k", fetchImpl })
 
     await client.recall("auth flow", { limit: 5, minSimilarity: 0.8 })
@@ -137,7 +141,7 @@ describe("convenience wrappers", () => {
   })
 
   it("forget maps to memory/delete", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(toolResult(1, "deleted")))
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(toolResult(1, "deleted")))
     const client = new RembrClient({ url: "https://rembr.test/mcp", apiKey: "k", fetchImpl })
 
     await client.forget("mem_42")

@@ -3,11 +3,18 @@ import plugin from "./index.js"
 
 const CONFIG = { url: "https://rembr.test/mcp", apiKey: "test-key" }
 
-function toolResult(text: string) {
+function toolResult(text: string, id = 1) {
   return new Response(
-    JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text }] } }),
+    JSON.stringify({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }] } }),
     { status: 200, headers: { "content-type": "application/json" } },
   )
+}
+
+function mockMcpToolText(text: string) {
+  return vi.fn().mockImplementation((_url, init) => {
+    const body = JSON.parse(init.body)
+    return Promise.resolve(toolResult(text, body.id))
+  })
 }
 
 function makeApi(pluginConfig: unknown) {
@@ -25,12 +32,14 @@ function makeApi(pluginConfig: unknown) {
 }
 
 function mcpCalls(fetchMock: ReturnType<typeof vi.fn>) {
-  return fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/mcp"))
+  return fetchMock.mock.calls.filter(([url, init]) => {
+    if (!String(url).endsWith("/mcp") || !init?.body) return false
+    return JSON.parse(init.body).method === "tools/call"
+  })
 }
 
 beforeEach(() => {
-  // fresh Response per call: bodies are single-read
-  vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(toolResult("ok"))))
+  vi.stubGlobal("fetch", mockMcpToolText("ok"))
 })
 
 afterEach(() => {
@@ -57,6 +66,7 @@ describe("plugin registration", () => {
   })
 
   it("tools report configuration guidance when no API key is available", async () => {
+    vi.stubEnv("REMBR_API_KEY", "")
     const { api, tools } = makeApi({ url: "https://rembr.test/mcp" })
     plugin.register(api)
     const result = await tools.get("memory_recall")!.execute("t1", { query: "x" })
@@ -67,7 +77,7 @@ describe("plugin registration", () => {
 
 describe("memory tools", () => {
   it("memory_recall frames results as untrusted and maps to search/query", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(toolResult("- [mem_1] user prefers tabs (92%)")))
+    vi.stubGlobal("fetch", mockMcpToolText("- [mem_1] user prefers tabs (92%)"))
     const { api, tools } = makeApi(CONFIG)
     plugin.register(api)
 
@@ -90,7 +100,7 @@ describe("memory tools", () => {
     const first = await tools.get("memory_recall")!.execute("t1", { query: "x" })
     expect(first.content[0].text).toContain("Memory recall unavailable")
 
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(toolResult("results")))
+    vi.stubGlobal("fetch", mockMcpToolText("results"))
     const second = await tools.get("memory_recall")!.execute("t2", { query: "x" })
     expect(second.content[0].text).toContain("temporarily unavailable")
     expect(mcpCalls(vi.mocked(fetch))).toHaveLength(0)
@@ -135,7 +145,7 @@ describe("memory tools", () => {
     let body = JSON.parse(mcpCalls(vi.mocked(fetch))[0][1].body)
     expect(body.params).toEqual({ name: "memory", arguments: { operation: "delete", id: "mem_42" } })
 
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(toolResult("- [mem_9] old fact")))
+    vi.stubGlobal("fetch", mockMcpToolText("- [mem_9] old fact"))
     const result = await tools.get("memory_forget")!.execute("t2", { query: "old fact" })
     expect(result.content[0].text).toContain("memoryId")
     body = JSON.parse(mcpCalls(vi.mocked(fetch))[0][1].body)
@@ -145,7 +155,7 @@ describe("memory tools", () => {
 
 describe("auto-recall (before_prompt_build)", () => {
   it("returns prependContext with untrusted framing", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(toolResult("- [mem_1] prefers tabs")))
+    vi.stubGlobal("fetch", mockMcpToolText("- [mem_1] prefers tabs"))
     const { api, hooks } = makeApi(CONFIG)
     plugin.register(api)
 
@@ -161,7 +171,7 @@ describe("auto-recall (before_prompt_build)", () => {
     plugin.register(api)
     expect(await hooks.get("before_prompt_build")!({ prompt: "hello there", messages: [] } as never)).toBeUndefined()
 
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(toolResult("")))
+    vi.stubGlobal("fetch", mockMcpToolText(""))
     const enabled = makeApi(CONFIG)
     plugin.register(enabled.api)
     expect(
@@ -187,7 +197,7 @@ describe("auto-recall (before_prompt_build)", () => {
     plugin.register(api)
     expect(await hooks.get("before_prompt_build")!({ prompt: "hello there", messages: [] } as never)).toBeUndefined()
 
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(toolResult("results")))
+    vi.stubGlobal("fetch", mockMcpToolText("results"))
     expect(await hooks.get("before_prompt_build")!({ prompt: "hello again", messages: [] } as never)).toBeUndefined()
     expect(mcpCalls(vi.mocked(fetch))).toHaveLength(0)
   })

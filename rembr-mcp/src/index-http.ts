@@ -12,6 +12,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { MemoryDatabase } from './database.js';
 import { MemoryService, MEMORY_CATEGORIES } from './memory-service.js';
+import { MemoryMaintenanceService } from './memory-maintenance-service.js';
 import { ContextService } from './context-service.js';
 import { SnapshotService } from './snapshot-service.js';
 import { CompilationService } from './compilation-service.js';
@@ -27,7 +28,7 @@ import {
   applyBudgetTemplate,
   BUDGET_TEMPLATES,
 } from './budget-management.js';
-import { AdvancedAnalyticsService } from './advanced-analytics-service.js';
+import { AdvancedAnalyticsService, type ContradictionResult } from './advanced-analytics-service.js';
 import { RalphRLMService, type RLMSessionStatus, type IterationOutcome, type ACStatus } from './ralph-rlm.js';
 import { AnalyticsReportingService, type CustomReportConfig, type Granularity, type ReportFormat } from './analytics-reporting.js';
 import { EnhancedSearchService, type AdvancedFilter, type ExportFormat as SearchExportFormat } from './enhanced-search.js';
@@ -84,6 +85,23 @@ interface AuthContext {
   tenantId: string;
   projectId?: string;
   userId?: string;
+}
+
+type ContradictionSource = 'precomputed' | 'live' | 'precomputed+live';
+
+interface FormattedContradiction {
+  memory_a: {
+    id: string;
+    content: string;
+    category: string;
+  };
+  memory_b: {
+    id: string;
+    content: string;
+    category: string;
+  };
+  confidence: number;
+  evidence: unknown;
 }
 
 // MCP 2026-07-28 (SEP-2575): protocol revision advertised by server/discover.
@@ -158,6 +176,29 @@ function sanitizeArgs(args: Record<string, unknown> | undefined): Record<string,
   }
   
   return sanitized;
+}
+
+function normalizeJsonRpcBody(body: unknown): Record<string, any> | null {
+  if (!body) return null;
+
+  let parsed = body;
+  if (Buffer.isBuffer(parsed)) {
+    parsed = parsed.toString('utf8');
+  }
+
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return null;
+    }
+  }
+
+  if (Array.isArray(parsed)) {
+    parsed = parsed[0];
+  }
+
+  return parsed && typeof parsed === 'object' ? parsed as Record<string, any> : null;
 }
 
 /**
@@ -406,22 +447,58 @@ class RembrServer {
         health.queue_depth = null;
       }
 
-      // Ollama status — attempt a lightweight tag list
+      // Embedding provider status — attempt a lightweight model list.
       try {
-        const ollamaUrl = process.env.OLLAMA_BASE_URL || 'http://ollama:11434';
-        const ollamaStart = Date.now();
-        const ollamaRes = await fetch(`${ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(3000) });
-        if (ollamaRes.ok) {
-          const tags = await ollamaRes.json() as { models?: Array<{ name: string; size?: number }> };
-          health.ollama = true;
-          health.ollama_latency_ms = Date.now() - ollamaStart;
-          health.ollama_models = (tags.models ?? []).map(m => m.name);
+        const embeddingProvider = process.env.EMBEDDING_PROVIDER || 'ollama';
+        const embeddingStart = Date.now();
+        health.embedding_provider = embeddingProvider;
+
+        if (embeddingProvider === 'openai-compatible') {
+          const embeddingBaseUrl = process.env.EMBEDDING_BASE_URL || process.env.LM_STUDIO_BASE_URL || 'http://localhost:1234/v1';
+          const embeddingRes = await fetch(`${embeddingBaseUrl.replace(/\/$/, '')}/models`, {
+            signal: AbortSignal.timeout(3000)
+          });
+
+          if (embeddingRes.ok) {
+            const models = await embeddingRes.json() as { data?: Array<{ id?: string }> };
+            health.embeddings = true;
+            health.embedding_latency_ms = Date.now() - embeddingStart;
+            health.embedding_models = (models.data ?? []).map(m => m.id).filter(Boolean);
+            health.ollama = null;
+            health.ollama_latency_ms = null;
+            health.ollama_models = [];
+          } else {
+            health.embeddings = false;
+            health.embedding_latency_ms = null;
+            health.embedding_models = [];
+            health.ollama = null;
+            health.ollama_latency_ms = null;
+            health.ollama_models = [];
+          }
         } else {
-          health.ollama = false;
-          health.ollama_latency_ms = null;
-          health.ollama_models = [];
+          const ollamaUrl = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_HOST || 'http://ollama:11434';
+          const ollamaRes = await fetch(`${ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(3000) });
+          if (ollamaRes.ok) {
+            const tags = await ollamaRes.json() as { models?: Array<{ name: string; size?: number }> };
+            health.embeddings = true;
+            health.embedding_latency_ms = Date.now() - embeddingStart;
+            health.embedding_models = (tags.models ?? []).map(m => m.name);
+            health.ollama = true;
+            health.ollama_latency_ms = health.embedding_latency_ms;
+            health.ollama_models = health.embedding_models;
+          } else {
+            health.embeddings = false;
+            health.embedding_latency_ms = null;
+            health.embedding_models = [];
+            health.ollama = false;
+            health.ollama_latency_ms = null;
+            health.ollama_models = [];
+          }
         }
       } catch {
+        health.embeddings = false;
+        health.embedding_latency_ms = null;
+        health.embedding_models = [];
         health.ollama = false;
         health.ollama_latency_ms = null;
         health.ollama_models = [];
@@ -466,6 +543,37 @@ class RembrServer {
       res.status(health.status === 'ok' ? 200 : 503).json(health);
     });
 
+    this.app.get('/health/memory', async (req, res) => {
+      const t0 = Date.now();
+      try {
+        const maintenance = new MemoryMaintenanceService(this.db);
+        const memory = await maintenance.getGlobalHealth();
+        const status = memory.missing_embeddings > 0 ||
+          memory.stale_embeddings > 0 ||
+          memory.failed_jobs > 0
+          ? 'degraded'
+          : 'ok';
+
+        res.status(status === 'ok' ? 200 : 503).json({
+          status,
+          service: 'rembr-mcp',
+          component: 'memory-maintenance',
+          timestamp: new Date().toISOString(),
+          memory,
+          check_duration_ms: Date.now() - t0
+        });
+      } catch (error) {
+        res.status(503).json({
+          status: 'degraded',
+          service: 'rembr-mcp',
+          component: 'memory-maintenance',
+          timestamp: new Date().toISOString(),
+          error: error instanceof Error ? error.message : String(error),
+          check_duration_ms: Date.now() - t0
+        });
+      }
+    });
+
     // Keep-alive ping endpoint for long-lived connections
     this.app.get('/ping', (req, res) => {
       res.setHeader('Content-Type', 'application/json');
@@ -503,9 +611,10 @@ class RembrServer {
 
       const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       const startTime = Date.now();
+      const rpcBody = normalizeJsonRpcBody(req.body);
 
       // SEP-2575/SEP-414: client metadata + W3C trace context ride on _meta.
-      const mcpMeta = extractMcpMeta(req.body);
+      const mcpMeta = extractMcpMeta(rpcBody || req.body);
 
       // Production-safe request log: no raw credentials, no body content.
       if (process.env.NODE_ENV === 'development') {
@@ -551,6 +660,317 @@ class RembrServer {
           project: authResult.projectId,
           timestamp: new Date().toISOString()
         });
+
+        if (rpcBody?.method === 'tools/call' && rpcBody?.params?.name === 'store_memory') {
+          const args = sanitizeArgs(rpcBody.params.arguments as Record<string, unknown> | undefined);
+          const jsonRpcId = rpcBody.id ?? null;
+          const toolStart = Date.now();
+          const correlationId = randomUUID();
+
+          try {
+            const storeValidation = validateMemoryInput(args || {});
+            if (!storeValidation.valid) {
+              return res.json({
+                jsonrpc: '2.0',
+                id: jsonRpcId,
+                result: {
+                  content: [{
+                    type: 'text',
+                    text: JSON.stringify({
+                      success: false,
+                      error: 'Invalid input',
+                      details: storeValidation.errors,
+                      correlation_id: correlationId
+                    })
+                  }],
+                  isError: true
+                }
+              });
+            }
+
+            const memoryService = new MemoryService(
+              authResult.tenantId!,
+              authResult.projectId,
+              this.db,
+              this.embeddingProvider,
+              authResult.userId
+            );
+            const memory = await memoryService.storeMemory({
+              content: (args?.content as string).trim(),
+              category: args?.category as string,
+              metadata: args?.metadata as Record<string, any>,
+              relevance_score: args?.relevance_score as number
+            });
+
+            const duration = (Date.now() - toolStart) / 1000;
+            trackMcpToolCall('store_memory', 'success', authResult.tenantId!, duration);
+            trackMemoryOperation('store', 'success', authResult.tenantId!);
+            logger.mcpTool('store_memory', 'success', {
+              tenantId: authResult.tenantId,
+              projectId: authResult.projectId,
+              correlationId,
+              category: args?.category as string,
+              transport: 'jsonrpc-auth-fast-path'
+            }, duration * 1000);
+
+            return res.json({
+              jsonrpc: '2.0',
+              id: jsonRpcId,
+              result: {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    success: true,
+                    memory: {
+                      id: memory.id,
+                      content: memory.content,
+                      category: memory.category,
+                      metadata: memory.metadata,
+                      created_at: memory.created_at
+                    }
+                  }, null, 2)
+                }]
+              }
+            });
+          } catch (error) {
+            const duration = (Date.now() - toolStart) / 1000;
+            const err = error as Error;
+            trackMcpToolCall('store_memory', 'error', authResult.tenantId!, duration);
+            trackMcpToolError('store_memory', 'unknown', authResult.tenantId!);
+            trackMemoryOperation('store', 'error', authResult.tenantId!);
+            logger.mcpTool('store_memory', 'error', {
+              tenantId: authResult.tenantId,
+              projectId: authResult.projectId,
+              correlationId,
+              transport: 'jsonrpc-auth-fast-path'
+            }, duration * 1000, err);
+
+            return res.json({
+              jsonrpc: '2.0',
+              id: jsonRpcId,
+              result: {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    success: false,
+                    error: err.message,
+                    correlation_id: correlationId
+                  }, null, 2)
+                }],
+                isError: true
+              }
+            });
+          }
+        }
+
+        if (rpcBody?.method === 'tools/call' && rpcBody?.params?.name === 'search_memory') {
+          const args = sanitizeArgs(rpcBody.params.arguments as Record<string, unknown> | undefined);
+          const jsonRpcId = rpcBody.id ?? null;
+          const toolStart = Date.now();
+          const correlationId = randomUUID();
+
+          try {
+            const memoryService = new MemoryService(
+              authResult.tenantId!,
+              authResult.projectId,
+              this.db,
+              this.embeddingProvider,
+              authResult.userId
+            );
+            const limit = args?.limit as number;
+            const searchMode = (args?.search_mode as 'hybrid' | 'semantic' | 'text' | 'phrase') || 'hybrid';
+            const results = await memoryService.searchMemory({
+              query: args?.query as string,
+              category: args?.category as string,
+              limit,
+              min_similarity: args?.min_similarity as number,
+              search_mode: searchMode,
+              metadata_filter: args?.metadata_filter as Record<string, any>,
+              exclude_pii: args?.exclude_pii as boolean
+            });
+
+            const duration = (Date.now() - toolStart) / 1000;
+            trackMcpToolCall('search_memory', 'success', authResult.tenantId!, duration);
+            trackMemoryOperation('search', 'success', authResult.tenantId!);
+            trackSearchOperation(searchMode, authResult.tenantId!, duration);
+            logger.mcpTool('search_memory', 'success', {
+              tenantId: authResult.tenantId,
+              projectId: authResult.projectId,
+              correlationId,
+              searchMode,
+              resultCount: results.length,
+              transport: 'jsonrpc-auth-fast-path'
+            }, duration * 1000);
+
+            const resultsFormatted = results.map((r) => ({
+              id: r.id,
+              content: r.content,
+              category: r.category,
+              metadata: r.metadata,
+              score: r.score,
+              semantic_similarity: r.semantic_similarity,
+              text_match: r.text_match,
+              created_at: r.created_at,
+              token_estimate: Math.ceil(r.content.length / 4),
+            }));
+
+            const finalResponse: Record<string, unknown> = {
+              ...addPaginationToResponse({
+                items: resultsFormatted,
+                limit,
+                startTime: toolStart,
+                suggestedFilters: results.length === limit ? [
+                  'Add category filter',
+                  'Increase min_similarity',
+                  'Add metadata_filter'
+                ] : undefined
+              }),
+              search_mode: searchMode,
+            };
+
+            const searchMetadata = results.search_metadata;
+            if (searchMetadata) {
+              finalResponse.semantic_status = searchMetadata.semantic_status;
+              finalResponse.fallback_used = searchMetadata.fallback_used;
+              finalResponse.min_similarity = searchMetadata.min_similarity;
+              if (searchMetadata.semantic_error) {
+                finalResponse.semantic_error = searchMetadata.semantic_error;
+              }
+              if (searchMetadata.embedding_coverage !== null) {
+                finalResponse.embedding_coverage = `${Math.round(searchMetadata.embedding_coverage * 100)}%`;
+              }
+              if (searchMetadata.embedding_pending !== null) {
+                finalResponse.embedding_pending = searchMetadata.embedding_pending;
+              }
+              if (searchMetadata.embedding_total !== null) {
+                finalResponse.embedding_total = searchMetadata.embedding_total;
+              }
+              if (searchMetadata.embedding_pending !== null) {
+                finalResponse.embedding_status = searchMetadata.embedding_pending > 0 ? 'partial' : 'ready';
+              }
+              if (searchMetadata.embedding_pending && results.length === 0) {
+                finalResponse.search_note = `${searchMetadata.embedding_pending} memories are still being indexed. Results may be incomplete — retry in a few seconds.`;
+              }
+            } else try {
+              const embeddingStatus = await memoryService.getPendingEmbeddingCount();
+              finalResponse.embedding_status = embeddingStatus.pending > 0 ? 'partial' : 'ready';
+              if (embeddingStatus.pending > 0) {
+                finalResponse.embedding_pending = embeddingStatus.pending;
+              }
+            } catch {
+              // Non-fatal: omit embedding status.
+            }
+
+            return res.json({
+              jsonrpc: '2.0',
+              id: jsonRpcId,
+              result: {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify(finalResponse, null, 2)
+                }]
+              }
+            });
+          } catch (error) {
+            const duration = (Date.now() - toolStart) / 1000;
+            const err = error as Error;
+            trackMcpToolCall('search_memory', 'error', authResult.tenantId!, duration);
+            trackMcpToolError('search_memory', 'unknown', authResult.tenantId!);
+            trackMemoryOperation('search', 'error', authResult.tenantId!);
+            logger.mcpTool('search_memory', 'error', {
+              tenantId: authResult.tenantId,
+              projectId: authResult.projectId,
+              correlationId,
+              transport: 'jsonrpc-auth-fast-path'
+            }, duration * 1000, err);
+
+            return res.json({
+              jsonrpc: '2.0',
+              id: jsonRpcId,
+              result: {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    success: false,
+                    error: err.message,
+                    correlation_id: correlationId
+                  }, null, 2)
+                }],
+                isError: true
+              }
+            });
+          }
+        }
+
+        if (rpcBody?.method === 'tools/call' && rpcBody?.params?.name === 'detect_memory_contradictions') {
+          const args = sanitizeArgs(rpcBody.params.arguments as Record<string, unknown> | undefined);
+          const jsonRpcId = rpcBody.id ?? null;
+          const toolStart = Date.now();
+          const correlationId = randomUUID();
+          const minConfidence = args?.min_confidence as number || 0.7;
+          const contextId = args?.context_id as string;
+          const liveAnalysis = this.normalizeLiveAnalysis(args?.live_analysis);
+
+          try {
+            const {
+              contradictions,
+              source,
+              live_analysis
+            } = await this.getContradictionsWithLiveFallback(
+              authResult.tenantId!,
+              minConfidence,
+              contextId,
+              liveAnalysis
+            );
+
+            const duration = (Date.now() - toolStart) / 1000;
+            trackMcpToolCall('detect_memory_contradictions', 'success', authResult.tenantId!, duration);
+
+            return res.json({
+              jsonrpc: '2.0',
+              id: jsonRpcId,
+              result: {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    success: true,
+                    context_id: contextId || null,
+                    min_confidence: minConfidence,
+                    contradictions_found: contradictions.length,
+                    contradictions,
+                    source,
+                    live_analysis,
+                    note: source === 'precomputed'
+                      ? 'Returned stored contradiction relationships.'
+                      : 'Returned live contradiction analysis; detected relationships are stored for future calls when possible.',
+                    correlation_id: correlationId
+                  }, null, 2)
+                }]
+              }
+            });
+          } catch (error) {
+            const duration = (Date.now() - toolStart) / 1000;
+            const err = error as Error;
+            trackMcpToolCall('detect_memory_contradictions', 'error', authResult.tenantId!, duration);
+            trackMcpToolError('detect_memory_contradictions', 'unknown', authResult.tenantId!);
+
+            return res.json({
+              jsonrpc: '2.0',
+              id: jsonRpcId,
+              result: {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    success: false,
+                    error: err.message,
+                    correlation_id: correlationId
+                  }, null, 2)
+                }],
+                isError: true
+              }
+            });
+          }
+        }
 
         // Per-tenant daily quota check (REM-48)
         // Runs after auth so we have tenantId + plan available.
@@ -600,6 +1020,112 @@ class RembrServer {
           ipAddress,
           userAgent
         });
+
+        // Fast path for stateless JSON-RPC store_memory calls. Some
+        // Streamable HTTP clients wait indefinitely for the SDK transport to
+        // close even after the write succeeds; memory writes should return a
+        // plain JSON-RPC response as soon as the durable insert is complete.
+        if (rpcBody?.method === 'tools/call' && rpcBody?.params?.name === 'store_memory') {
+          const args = sanitizeArgs(rpcBody.params.arguments as Record<string, unknown> | undefined);
+          const requestId = rpcBody.id ?? null;
+          const toolStart = Date.now();
+          const correlationId = randomUUID();
+
+          try {
+            const storeValidation = validateMemoryInput(args || {});
+            if (!storeValidation.valid) {
+              return res.json({
+                jsonrpc: '2.0',
+                id: requestId,
+                result: {
+                  content: [{
+                    type: 'text',
+                    text: JSON.stringify({
+                      success: false,
+                      error: 'Invalid input',
+                      details: storeValidation.errors,
+                      correlation_id: correlationId
+                    })
+                  }],
+                  isError: true
+                }
+              });
+            }
+
+            const memoryService = new MemoryService(
+              authResult.tenantId!,
+              authResult.projectId,
+              this.db,
+              this.embeddingProvider,
+              authResult.userId
+            );
+            const memory = await memoryService.storeMemory({
+              content: (args?.content as string).trim(),
+              category: args?.category as string,
+              metadata: args?.metadata as Record<string, any>,
+              relevance_score: args?.relevance_score as number
+            });
+
+            const duration = (Date.now() - toolStart) / 1000;
+            trackMcpToolCall('store_memory', 'success', authResult.tenantId!, duration);
+            trackMemoryOperation('store', 'success', authResult.tenantId!);
+            logger.mcpTool('store_memory', 'success', {
+              tenantId: authResult.tenantId,
+              projectId: authResult.projectId,
+              correlationId,
+              category: args?.category as string,
+              transport: 'jsonrpc-fast-path'
+            }, duration * 1000);
+
+            return res.json({
+              jsonrpc: '2.0',
+              id: requestId,
+              result: {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    success: true,
+                    memory: {
+                      id: memory.id,
+                      content: memory.content,
+                      category: memory.category,
+                      metadata: memory.metadata,
+                      created_at: memory.created_at
+                    }
+                  }, null, 2)
+                }]
+              }
+            });
+          } catch (error) {
+            const duration = (Date.now() - toolStart) / 1000;
+            const err = error as Error;
+            trackMcpToolCall('store_memory', 'error', authResult.tenantId!, duration);
+            trackMcpToolError('store_memory', 'unknown', authResult.tenantId!);
+            trackMemoryOperation('store', 'error', authResult.tenantId!);
+            logger.mcpTool('store_memory', 'error', {
+              tenantId: authResult.tenantId,
+              projectId: authResult.projectId,
+              correlationId,
+              transport: 'jsonrpc-fast-path'
+            }, duration * 1000, err);
+
+            return res.json({
+              jsonrpc: '2.0',
+              id: requestId,
+              result: {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    success: false,
+                    error: err.message,
+                    correlation_id: correlationId
+                  }, null, 2)
+                }],
+                isError: true
+              }
+            });
+          }
+        }
 
         // ── Stateless transport (MCP 2026-07-28, SEP-2575/SEP-2567) ──────
         // A fresh Server + StreamableHTTPServerTransport pair is created per
@@ -686,6 +1212,189 @@ class RembrServer {
     } catch (error) {
       console.error('Failed to initialize database:', error);
     }
+  }
+
+  private parseContradictionEvidence(evidence: unknown): unknown {
+    if (!evidence) return null;
+    if (typeof evidence === 'object') return evidence;
+    if (typeof evidence !== 'string') return evidence;
+    try {
+      return JSON.parse(evidence);
+    } catch {
+      return evidence;
+    }
+  }
+
+  private normalizeLiveAnalysis(value: unknown): 'auto' | 'always' | 'never' {
+    return value === 'always' || value === 'never' || value === 'auto' ? value : 'auto';
+  }
+
+  private formatPrecomputedContradictions(rows: any[]): FormattedContradiction[] {
+    return rows.map((row: any) => ({
+      memory_a: {
+        id: row.source_memory_id,
+        content: row.source_content,
+        category: row.source_category
+      },
+      memory_b: {
+        id: row.target_memory_id,
+        content: row.target_content,
+        category: row.target_category
+      },
+      confidence: Number(row.confidence),
+      evidence: this.parseContradictionEvidence(row.evidence)
+    }));
+  }
+
+  private formatLiveContradictions(results: ContradictionResult[]): FormattedContradiction[] {
+    return results.map((result) => ({
+      memory_a: {
+        id: result.memory_a.id,
+        content: result.memory_a.content,
+        category: result.memory_a.category
+      },
+      memory_b: {
+        id: result.memory_b.id,
+        content: result.memory_b.content,
+        category: result.memory_b.category
+      },
+      confidence: result.confidence,
+      evidence: {
+        type: result.contradiction_type,
+        severity: result.severity,
+        explanation: result.explanation,
+        suggestions: result.resolution_suggestions,
+        detected_by: 'live_analysis'
+      }
+    }));
+  }
+
+  private mergeContradictions(
+    precomputed: FormattedContradiction[],
+    live: FormattedContradiction[]
+  ): FormattedContradiction[] {
+    const byPair = new Map<string, FormattedContradiction>();
+
+    for (const contradiction of [...precomputed, ...live]) {
+      const pairKey = [contradiction.memory_a.id, contradiction.memory_b.id].sort().join(':');
+      const existing = byPair.get(pairKey);
+      if (!existing || contradiction.confidence > existing.confidence) {
+        byPair.set(pairKey, contradiction);
+      }
+    }
+
+    return [...byPair.values()].sort((a, b) => b.confidence - a.confidence);
+  }
+
+  private async getPrecomputedContradictions(
+    tenantId: string,
+    minConfidence: number,
+    contextId?: string
+  ): Promise<FormattedContradiction[]> {
+    const client = await this.pool.connect();
+    let contradictionResult: any;
+
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant', tenantId]);
+
+      if (contextId) {
+        contradictionResult = await client.query(`
+          SELECT mr.source_memory_id, mr.target_memory_id, mr.confidence, mr.evidence,
+                 ms.content as source_content, mt.content as target_content,
+                 ms.category as source_category, mt.category as target_category
+          FROM memory_relationships mr
+          JOIN memories ms ON mr.source_memory_id = ms.id
+          JOIN memories mt ON mr.target_memory_id = mt.id
+          JOIN memory_contexts cm ON (cm.memory_id = mr.source_memory_id OR cm.memory_id = mr.target_memory_id)
+          WHERE mr.relationship_type = 'contradicts'
+            AND mr.confidence >= $1
+            AND cm.context_id = $2
+            AND ms.tenant_id = $3
+            AND mt.tenant_id = $3
+            AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains opposing terms:%')
+            AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains contradictory information or opposing statements. Semantic similarity:%')
+          ORDER BY mr.confidence DESC
+        `, [minConfidence, contextId, tenantId]);
+      } else {
+        contradictionResult = await client.query(`
+          SELECT mr.source_memory_id, mr.target_memory_id, mr.confidence, mr.evidence,
+                 ms.content as source_content, mt.content as target_content,
+                 ms.category as source_category, mt.category as target_category
+          FROM memory_relationships mr
+          JOIN memories ms ON mr.source_memory_id = ms.id
+          JOIN memories mt ON mr.target_memory_id = mt.id
+          WHERE mr.relationship_type = 'contradicts'
+            AND mr.confidence >= $1
+            AND ms.tenant_id = $2
+            AND mt.tenant_id = $2
+            AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains opposing terms:%')
+            AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains contradictory information or opposing statements. Semantic similarity:%')
+          ORDER BY mr.confidence DESC
+          LIMIT 50
+        `, [minConfidence, tenantId]);
+      }
+
+      await client.query('COMMIT');
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    return this.formatPrecomputedContradictions(contradictionResult.rows);
+  }
+
+  private async getContradictionsWithLiveFallback(
+    tenantId: string,
+    minConfidence: number,
+    contextId?: string,
+    liveAnalysis: 'auto' | 'always' | 'never' = 'auto'
+  ): Promise<{
+    contradictions: FormattedContradiction[];
+    source: ContradictionSource;
+    live_analysis: {
+      requested: boolean;
+      attempted: boolean;
+      reason: string;
+      error: string | null;
+    };
+  }> {
+    const precomputed = await this.getPrecomputedContradictions(tenantId, minConfidence, contextId);
+    const shouldRunLive = liveAnalysis === 'always' || (liveAnalysis === 'auto' && precomputed.length === 0);
+    let live: FormattedContradiction[] = [];
+    let liveError: string | null = null;
+
+    if (shouldRunLive) {
+      try {
+        const analyticsService = new AdvancedAnalyticsService(this.db, this.embeddingProvider);
+        const liveResults = await analyticsService.detectContradictions(tenantId, contextId, minConfidence);
+        live = this.formatLiveContradictions(liveResults);
+      } catch (error) {
+        liveError = (error as Error).message;
+      }
+    }
+
+    const contradictions = this.mergeContradictions(precomputed, live);
+    const source: ContradictionSource = precomputed.length > 0 && live.length > 0
+      ? 'precomputed+live'
+      : live.length > 0
+        ? 'live'
+        : 'precomputed';
+
+    return {
+      contradictions,
+      source,
+      live_analysis: {
+        requested: liveAnalysis !== 'never',
+        attempted: shouldRunLive,
+        reason: shouldRunLive
+          ? (liveAnalysis === 'always' ? 'requested' : 'no_precomputed_results')
+          : (liveAnalysis === 'never' ? 'disabled' : 'precomputed_results_available'),
+        error: liveError
+      }
+    };
   }
 
   private async initializeEmbeddings() {
@@ -1438,6 +2147,11 @@ class RembrServer {
                 enum: ['factual', 'temporal', 'logical', 'preference']
               },
               description: 'Types of contradictions to detect (default: all)'
+            },
+            live_analysis: {
+              type: 'string',
+              enum: ['auto', 'always', 'never'],
+              description: 'Run live contradiction analysis when precomputed relationships are missing (default: auto). Use always to refresh on demand, never for stored results only.'
             }
           }
         }
@@ -2656,6 +3370,14 @@ class RembrServer {
           if (legacyName) {
             effectiveName = legacyName;
             isConsolidatedCall = true;
+            if (name === 'contradictions' && legacyName === 'detect_memory_contradictions') {
+              args = {
+                ...args,
+                min_confidence: typeof args?.min_confidence === 'number'
+                  ? args.min_confidence
+                  : args?.threshold
+              };
+            }
             logger.info(`Routing consolidated tool '${name}.${operation}' to legacy '${legacyName}'`);
 
             // Re-validate with the legacy tool schema now that we know the effective name
@@ -2956,7 +3678,28 @@ class RembrServer {
 
             // RAD-67: Include embedding_status when memories may not yet be indexed
             // This prevents agents from concluding "no results exist" when results are pending
-            try {
+            const searchMetadata = results.search_metadata;
+            if (searchMetadata) {
+              finalResponse.semantic_status = searchMetadata.semantic_status;
+              finalResponse.fallback_used = searchMetadata.fallback_used;
+              finalResponse.min_similarity = searchMetadata.min_similarity;
+              if (searchMetadata.semantic_error) {
+                finalResponse.semantic_error = searchMetadata.semantic_error;
+              }
+              if (searchMetadata.embedding_coverage !== null) {
+                finalResponse.embedding_coverage = `${Math.round(searchMetadata.embedding_coverage * 100)}%`;
+              }
+              if (searchMetadata.embedding_pending !== null) {
+                finalResponse.embedding_pending = searchMetadata.embedding_pending;
+                finalResponse.embedding_status = searchMetadata.embedding_pending > 0 ? 'partial' : 'ready';
+              }
+              if (searchMetadata.embedding_total !== null) {
+                finalResponse.embedding_total = searchMetadata.embedding_total;
+              }
+              if (searchMetadata.embedding_pending && results.length === 0) {
+                finalResponse.search_note = `${searchMetadata.embedding_pending} memories are still being indexed. Results may be incomplete — retry in a few seconds.`;
+              }
+            } else try {
               const embeddingStatus = await memoryService.getPendingEmbeddingCount();
               if (embeddingStatus.pending > 0) {
                 const coverage = embeddingStatus.total > 0
@@ -4448,86 +5191,19 @@ case 'context_analytics': {
 
           // Week 14: Advanced Analytics Tool Handlers
           case 'detect_memory_contradictions': {
-            // Read pre-detected contradictions from DB (stored during memory ingestion)
-            // instead of triggering expensive live LLM analysis
             const minConfidence = args?.min_confidence as number || 0.7;
             const contextId = args?.context_id as string;
-
-            let contradictionQuery: string;
-            let contradictionParams: any[];
-            const client = await this.pool.connect();
-
-            if (contextId) {
-              // Scoped to a context: get contradictions for memories in that context
-              contradictionQuery = `
-                SELECT mr.source_memory_id, mr.target_memory_id, mr.confidence, mr.evidence,
-                       ms.content as source_content, mt.content as target_content,
-                       ms.category as source_category, mt.category as target_category
-                FROM memory_relationships mr
-                JOIN memories ms ON mr.source_memory_id = ms.id
-                JOIN memories mt ON mr.target_memory_id = mt.id
-                JOIN memory_contexts cm ON (cm.memory_id = mr.source_memory_id OR cm.memory_id = mr.target_memory_id)
-                WHERE mr.relationship_type = 'contradicts'
-                  AND mr.confidence >= $1
-                  AND cm.context_id = $2
-                  AND ms.tenant_id = $3
-                  AND mt.tenant_id = $3
-                  AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains opposing terms:%')
-                  AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains contradictory information or opposing statements. Semantic similarity:%')
-                ORDER BY mr.confidence DESC
-              `;
-              contradictionParams = [minConfidence, contextId, tenantId];
-            } else {
-              // All contradictions for this tenant
-              contradictionQuery = `
-                SELECT mr.source_memory_id, mr.target_memory_id, mr.confidence, mr.evidence,
-                       ms.content as source_content, mt.content as target_content,
-                       ms.category as source_category, mt.category as target_category
-                FROM memory_relationships mr
-                JOIN memories ms ON mr.source_memory_id = ms.id
-                JOIN memories mt ON mr.target_memory_id = mt.id
-                WHERE mr.relationship_type = 'contradicts'
-                  AND mr.confidence >= $1
-                  AND ms.tenant_id = $2
-                  AND mt.tenant_id = $2
-                  AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains opposing terms:%')
-                  AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains contradictory information or opposing statements. Semantic similarity:%')
-                ORDER BY mr.confidence DESC
-                LIMIT 50
-              `;
-              contradictionParams = [minConfidence, tenantId];
-            }
-
-            let contradictionResult: any;
-            try {
-              await client.query('BEGIN');
-              await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant', tenantId]);
-              contradictionResult = await client.query(contradictionQuery, contradictionParams);
-              await client.query('COMMIT');
-            } catch (error) {
-              try { await client.query('ROLLBACK'); } catch {}
-              throw error;
-            } finally {
-              client.release();
-            }
-            const contradictions: any[] = contradictionResult.rows.map((row: any) => ({
-              memory_a: {
-                id: row.source_memory_id,
-                content: row.source_content,
-                category: row.source_category
-              },
-              memory_b: {
-                id: row.target_memory_id,
-                content: row.target_content,
-                category: row.target_category
-              },
-              confidence: row.confidence,
-              evidence: (() => {
-                if (!row.evidence) return null;
-                if (typeof row.evidence === 'object') return row.evidence;
-                try { return JSON.parse(row.evidence); } catch { return row.evidence; }
-              })()
-            }));
+            const liveAnalysis = this.normalizeLiveAnalysis(args?.live_analysis);
+            const {
+              contradictions,
+              source,
+              live_analysis
+            } = await this.getContradictionsWithLiveFallback(
+              tenantId,
+              minConfidence,
+              contextId,
+              liveAnalysis
+            );
 
             const duration = (Date.now() - startTime) / 1000;
             trackMcpToolCall('detect_memory_contradictions', 'success', tenantId, duration);
@@ -4571,7 +5247,11 @@ case 'context_analytics': {
                     min_confidence: minConfidence,
                     contradictions_found: contradictions.length,
                     contradictions,
-                    note: 'Contradictions are detected automatically during memory ingestion. This tool returns pre-computed results.'
+                    source,
+                    live_analysis,
+                    note: source === 'precomputed'
+                      ? 'Returned stored contradiction relationships.'
+                      : 'Returned live contradiction analysis; detected relationships are stored for future calls when possible.'
                   }, null, 2)
                 },
                 {

@@ -12,6 +12,20 @@ export interface InferredRelationship {
   evidence?: string;
 }
 
+interface CandidateMemory {
+  id: string;
+  content: string;
+  category: string;
+  embedding: number[];
+  created_at?: Date | string;
+}
+
+interface LLMRelationshipAssessment {
+  relationshipType: string;
+  confidence: number;
+  evidence: string;
+}
+
 /**
  * Relationship update result
  */
@@ -83,6 +97,7 @@ export class RelationshipMaintainerService {
         m.id,
         m.content,
         m.category,
+        m.created_at,
         me.embedding,
         COUNT(mr.id) as relationship_count
       FROM memories m
@@ -121,14 +136,19 @@ export class RelationshipMaintainerService {
         const similarity = this.cosineSimilarity(source.embedding, target.embedding);
 
         if (similarity >= minScore) {
-          const relType = this.determineRelationshipType(similarity, source.category, target.category);
+          const llmAssessment = await this.assessRelationshipWithLLM(source, target, similarity);
+          const relType = llmAssessment?.relationshipType
+            ?? this.determineRelationshipType(similarity, source.category, target.category);
+          const confidence = llmAssessment?.confidence ?? similarity;
+          const evidence = llmAssessment?.evidence
+            ?? `Vector similarity: ${similarity.toFixed(3)}`;
           
           relationships.push({
             sourceMemoryId: source.id,
             targetMemoryId: target.id,
             relationshipType: relType,
-            confidence: similarity,
-            evidence: `Vector similarity: ${similarity.toFixed(3)}`
+            confidence,
+            evidence
           });
         }
       }
@@ -316,6 +336,132 @@ export class RelationshipMaintainerService {
   }
 
   /**
+   * Optionally ask the configured text-generation backend for higher-order
+   * relationship classification. OllamaClient can route this through any
+   * OpenAI-compatible service via OPENAI_COMPATIBLE_TEXT_BASE_URL.
+   */
+  private async assessRelationshipWithLLM(
+    source: CandidateMemory,
+    target: CandidateMemory,
+    similarity: number
+  ): Promise<LLMRelationshipAssessment | null> {
+    if (process.env.RELATIONSHIP_LLM_INFERENCE_ENABLED === 'false') {
+      return null;
+    }
+
+    if (typeof this.ollamaClient.generateText !== 'function') {
+      return null;
+    }
+
+    const systemPrompt = `You classify relationships between persisted memories.
+Return only compact JSON. Do not resolve, merge, delete, or rewrite either memory.
+
+Allowed relationship types:
+- similar: near-duplicate or strongly same meaning
+- related: useful contextual connection
+- associated: weak but real topical connection
+- prerequisite: one memory must be known before the other
+- updates: newer information changes or refines older information
+- supersedes: newer information replaces older information
+- contradicts: same subject cannot both be true
+
+Prefer updates or supersedes when dates, versions, status changes, or explicit "now/no longer/replaced" language show temporal change.
+Use contradicts only for same-subject incompatibility, not normal evolution over time.`;
+
+    const prompt = `Similarity: ${similarity.toFixed(3)}
+
+Memory A:
+id: ${source.id}
+category: ${source.category}
+created_at: ${this.formatDate(source.created_at)}
+content: ${source.content}
+
+Memory B:
+id: ${target.id}
+category: ${target.category}
+created_at: ${this.formatDate(target.created_at)}
+content: ${target.content}
+
+Respond as JSON:
+{"relationshipType":"related","confidence":0.72,"evidence":"short reason"}`;
+
+    try {
+      const response = await this.ollamaClient.generateText(prompt, systemPrompt, {
+        temperature: 0,
+        maxTokens: 220
+      });
+      return this.parseLLMAssessment(response, similarity);
+    } catch (error) {
+      console.warn(`[RelationshipMaintainerService] LLM relationship assessment failed: ${error}`);
+      return null;
+    }
+  }
+
+  private parseLLMAssessment(response: string, fallbackConfidence: number): LLMRelationshipAssessment | null {
+    const jsonText = this.extractJsonObject(response);
+    if (!jsonText) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(jsonText) as {
+        relationshipType?: unknown;
+        relationship_type?: unknown;
+        confidence?: unknown;
+        evidence?: unknown;
+      };
+
+      const relationshipType = String(parsed.relationshipType ?? parsed.relationship_type ?? '').trim();
+      const allowedTypes = new Set([
+        'similar',
+        'related',
+        'associated',
+        'prerequisite',
+        'updates',
+        'supersedes',
+        'contradicts'
+      ]);
+      if (!allowedTypes.has(relationshipType)) {
+        return null;
+      }
+
+      const rawConfidence = typeof parsed.confidence === 'number'
+        ? parsed.confidence
+        : Number(parsed.confidence);
+      const confidence = Number.isFinite(rawConfidence)
+        ? Math.max(0, Math.min(1, rawConfidence))
+        : fallbackConfidence;
+
+      if (confidence < this.WEAK_RELATIONSHIP_THRESHOLD) {
+        return null;
+      }
+
+      const evidence = typeof parsed.evidence === 'string' && parsed.evidence.trim()
+        ? parsed.evidence.trim().slice(0, 500)
+        : `LLM relationship assessment; vector similarity: ${fallbackConfidence.toFixed(3)}`;
+
+      return { relationshipType, confidence, evidence };
+    } catch {
+      return null;
+    }
+  }
+
+  private extractJsonObject(response: string): string | null {
+    const start = response.indexOf('{');
+    const end = response.lastIndexOf('}');
+    if (start === -1 || end === -1 || end <= start) {
+      return null;
+    }
+    return response.slice(start, end + 1);
+  }
+
+  private formatDate(value: Date | string | undefined): string {
+    if (!value) return 'unknown';
+    const date = value instanceof Date ? value : new Date(value);
+    return Number.isNaN(date.getTime()) ? 'unknown' : date.toISOString();
+  }
+
+  /**
    * Calculate cosine similarity
    */
   private cosineSimilarity(vecA: number[], vecB: number[]): number {
@@ -336,6 +482,6 @@ export class RelationshipMaintainerService {
     const denominator = Math.sqrt(normA) * Math.sqrt(normB);
     if (denominator === 0) return 0;
 
-    return dotProduct / denominator;
+    return Math.max(-1, Math.min(1, dotProduct / denominator));
   }
 }

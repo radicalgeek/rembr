@@ -36,7 +36,7 @@ describe("createRembrConfigSchema", () => {
 
   it("treats an unresolved ${VAR} apiKey as unset and falls back to REMBR_API_KEY", () => {
     const cfg = createRembrConfigSchema({ REMBR_API_KEY: "mb_live_env" }).parse({
-      apiKey: "$KEY",
+      apiKey: "${KEY}",
     })
     expect(cfg.apiKey).toBe("mb_live_env")
   })

@@ -69,7 +69,7 @@ describe('OllamaClient', () => {
     });
 
     it('should initialize with default configuration', () => {
-      expect(client.getHost()).toBe('http://ollama.ai.svc.cluster.local:11434');
+      expect(client.getHost()).toBe('http://localhost:11434');
       expect(client.getEmbeddingModel()).toBe('nomic-embed-text');
       expect(client.getTextModel()).toBe('llama3.1:8b');
     });
@@ -453,7 +453,7 @@ describe('OllamaClient', () => {
 
   describe('Configuration', () => {
     it('should return correct host', () => {
-      expect(client.getHost()).toBe('http://ollama.ai.svc.cluster.local:11434');
+      expect(client.getHost()).toBe('http://localhost:11434');
     });
 
     it('should return correct embedding model', () => {
