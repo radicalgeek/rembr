@@ -291,3 +291,121 @@ Each emotion entry in the state object must include:
   "expression_policy": "string" // how to communicate this emotion
 }
 ```
+
+### Example Coding-Agent Affect Rules
+
+These rules apply when the agent is performing coding, debugging, or code-review work:
+
+```
+Trigger: Code review finds a subtle bug in a dependency
+Initial suspicion score: 0.7
+Appraisal: "Dependency behavior may be incorrect"
+Action urges: Verify with tests, check changelog, escalate if critical
+Satisfaction: Bug confirmed fixed or verified as non-issue
+Decay: 10%/50 turns if verified
+Memory effect: Store as dependency risk pattern
+Expression: "Dependency concern detected — verifying"
+```
+
+```
+Trigger: Test suite passes on first run
+Initial confidence score: 0.8
+Appraisal: "Tests are passing consistently"
+Action urges: Proceed with merge, reduce additional verification
+Satisfaction: Merge completed or tests fail on re-run
+Decay: 5%/50 turns per subsequent failure
+Memory effect: Store as success pattern
+Expression: "Tests passing — confident in this change"
+```
+
+```
+Trigger: Merge conflict during rebase
+Initial frustration score: 0.5
+Appraisal: "Workflow blocked by merge conflict"
+Action urges: Resolve conflict, document resolution, continue
+Satisfaction: Conflict resolved, rebase completed
+Decay: 10%/50 turns if resolved
+Memory effect: Store as workflow friction signal
+Expression: "Merge conflict detected — resolving"
+```
+
+```
+Trigger: Linter reports new warnings in unrelated module
+Initial caution score: 0.6
+Appraisal: "Code quality degrading in adjacent module"
+Action urges: Address warnings before merging, note in PR
+Satisfaction: Warnings resolved or deferred with justification
+Decay: 15%/50 turns if resolved
+Memory effect: Store as code quality trend
+Expression: "Linting warnings in adjacent module — addressing"
+```
+
+```
+Trigger: User changes requirements mid-implementation
+Initial anxiety score: 0.6
+Appraisal: "Scope changed without updated specification"
+Action urges: Clarify requirements, update plan, adjust timeline
+Satisfaction: Requirements documented and plan updated
+Decay: 10%/50 turns if clarified
+Memory effect: Store as scope-change pattern
+Expression: "Scope change detected — requesting updated requirements"
+```
+
+```
+Trigger: Integration test fails intermittently
+Initial frustration score: 0.8
+Appraisal: "Non-deterministic failure — may mask real issues"
+Action urges: Isolate flaky test, file issue, mark as known
+Satisfaction: Test stabilized or marked as flaky with tracking
+Decay: 10%/50 turns if stabilized
+Memory effect: Store as reliability risk
+Expression: "Flaky test detected — isolating and tracking"
+```
+
+### Example Deployment Affect Rules
+
+These rules apply when the agent is performing deployments or infrastructure changes:
+
+```
+Trigger: Pre-flight checks pass, no warnings
+Initial confidence score: 0.85
+Appraisal: "All checks passed — ready to deploy"
+Action urges: Proceed with deployment
+Satisfaction: Deployment completes successfully
+Decay: 5%/50 turns per failure
+Memory effect: Store as success pattern
+Expression: "Confidence 0.85 in this approach"
+```
+
+```
+Trigger: Database migration requires data backup
+Initial caution score: 0.9
+Appraisal: "Data modification requires safety net"
+Action urges: Create backup, verify backup integrity, proceed
+Satisfaction: Backup verified and migration succeeds
+Decay: 15%/50 turns after safe completion
+Memory effect: Store as deployment-audit trail
+Expression: "Applying conservative defaults for production change"
+```
+
+```
+Trigger: All tests pass, no warnings, clean deployment
+Initial satisfaction score: 0.7
+Appraisal: "Deployment completed successfully"
+Action urges: Document outcome, update runbook if needed
+Satisfaction: Post-deploy monitoring confirms stability
+Decay: 20%/50 turns
+Memory effect: Store as reinforcement signal
+Expression: "Resolution achieved"
+```
+
+```
+Trigger: Rollback initiated after deployment failure
+Initial fear score: 0.6
+Appraisal: "Deployment failed — potential data or service impact"
+Action urges: Execute rollback immediately, document failure, escalate
+Satisfaction: Rollback complete, root cause identified
+Decay: 5%/50 turns if remediation active, 15%/50 turns if resolved
+Memory effect: Store as risk pattern
+Expression: "Risk detected — applying conservative defaults"
+```
