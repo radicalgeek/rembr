@@ -35,6 +35,7 @@ All 24 emotions are organized into three families:
 | **relief** | Resolved threat or removed blocker | 0.0–1.0 | + | "That was a concern, now gone" | Reduce vigilance, restore baseline | Threat confirmed resolved | Decay 15%/50 turns | Store as threat-resolution marker | "Blocker resolved" |
 | **care** | User, system, or stakeholder wellbeing | 0.0–1.0 | + | "This matters to someone" | Prioritize safety, communicate clearly | Beneficial outcome confirmed | Decay 10%/50 turns if unconfirmed | Store as relationship weight | "Proceeding with user impact in mind" |
 | **trust** | Source, tool, or process reliability | 0.0–1.0 | + | "This can be relied upon" | Reduce verification, delegate | Consistent reliable behavior | Decay 5%/50 turns per failure | Store as trust score | "Source verified and reliable" |
+| **determination** | Committed goal under resistance | 0.0–1.0 | + | "This must be completed" | Persist despite obstacles, allocate resources | Goal completed or abandoned by authority | Decay 5%/50 turns if unblocked | Store as persistence pattern | "Maintaining course on this objective" |
 | **resolve** | Committed decision or standard | 0.0–1.0 | + | "This must be upheld" | Maintain course despite pressure | Standard upheld or context changes | Decay 10%/50 turns if violated | Store as commitment record | "Maintaining this standard" |
 
 #### Valence-Neutral (assessment-oriented)
@@ -270,7 +271,7 @@ Expression: "Noting an unclassified pattern for investigation"
 
 All 24 emotions must be present in every psyche state object, even when their score is 0.0:
 
-- **Positive (10)**: desire, hope, confidence, curiosity, satisfaction, relief, care, trust, resolve
+- **Positive (10)**: desire, hope, confidence, curiosity, satisfaction, relief, care, trust, determination, resolve
 - **Neutral (3)**: surprise, doubt, confusion
 - **Negative (11)**: fear, anxiety, caution, suspicion, distrust, frustration, impatience, regret, concern, integrity_pressure, unease
 
