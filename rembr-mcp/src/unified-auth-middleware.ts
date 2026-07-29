@@ -45,6 +45,8 @@ export type AuthMethod = 'oauth' | 'api_key' | 'session' | 'jwt';
 /** What authenticateRequest() returns on success */
 export interface AuthSuccess extends AuthorizationContext {
   success: true;
+  /** OAuth/JWT scope claim, normalized to an array. Undefined for api_key/session. */
+  scopes?: string[];
 }
 
 /** What authenticateRequest() returns on failure */
@@ -71,6 +73,7 @@ export interface AuthAuditEvent {
   userId?: string;
   apiKeyId?: string;
   sessionId?: string;
+  scopes?: string[];
   error?: string;
   timestamp: Date;
 }
@@ -148,6 +151,7 @@ export async function authenticateRequest(
       projectId: result.projectId,
       apiKeyId: result.apiKeyId,
       authMethod: 'api_key',
+      scopes: [], // API keys have no scope claim
       authenticatedAt: new Date(),
     };
   }
@@ -179,6 +183,7 @@ export async function authenticateRequest(
         success: result.success,
         tenantId: result.tenantId,
         userId: result.userId,
+        scopes: result.scopes,
         error: result.error,
         timestamp: new Date(),
       });
@@ -198,6 +203,7 @@ export async function authenticateRequest(
         projectId: result.projectId,
         userId: result.userId,
         authMethod: 'oauth',
+        scopes: result.scopes,
         authenticatedAt: new Date(),
       };
     }
@@ -209,6 +215,7 @@ export async function authenticateRequest(
       success: result.success,
       tenantId: result.tenantId,
       userId: result.userId,
+      scopes: result.scopes,
       error: result.error,
       timestamp: new Date(),
     });
@@ -228,6 +235,7 @@ export async function authenticateRequest(
       projectId: result.projectId,
       userId: result.userId,
       authMethod: 'jwt',
+      scopes: result.scopes,
       authenticatedAt: new Date(),
     };
   }
