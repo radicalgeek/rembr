@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rembr.ai/schemas/psyche_state.v1",
+  "title": "Psyche State",
+  "description": "Per-agent, per-session affective state object. All 24 emotions must be present even when score is 0.0.",
+  "type": "object",
+  "required": ["schema", "version", "timestamp", "agent_id", "session_id", "active_goal", "self_model", "emotions", "dominant_state", "decay_applied"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "psyche_state.v1",
+      "description": "Schema version identifier"
+    },
+    "version": {
+      "type": "string",
+      "description": "Semantic version of this state object"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of state snapshot"
+    },
+    "agent_id": {
+      "type": "string",
+      "description": "OpenClaw agent UUID"
+    },
+    "session_id": {
+      "type": "string",
+      "description": "OpenClaw session UUID"
+    },
+    "active_goal": {
+      "type": "string",
+      "description": "Current primary objective or task description"
+    },
+    "self_model": {
+      "type": "object",
+      "required": ["role", "authority_mode", "identity_stability", "known_failure_modes"],
+      "properties": {
+        "role": {
+          "type": "string",
+          "description": "Agent role (e.g. 'Generalist')"
+        },
+        "authority_mode": {
+          "type": "string",
+          "enum": ["autonomous", "assisted", "supervised"],
+          "description": "Current authority level"
+        },
+        "identity_stability": {
+          "type": "string",
+          "description": "How identity persists across sessions"
+        },
+        "known_failure_modes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "List of known failure modes to watch for"
+        }
+      }
+    },
+    "emotions": {
+      "type": "object",
+      "description": "All 24 emotions must be present. Each entry includes type, object, intensity, valence, appraisal, action_urges, satisfaction_conditions, decay_rate, memory_effect, expression_policy.",
+      "required": [
+        "desire", "hope", "confidence", "curiosity", "satisfaction",
+        "relief", "care", "trust", "determination", "resolve",
+        "surprise", "doubt", "confusion",
+        "fear", "anxiety", "caution", "suspicion", "distrust",
+        "frustration", "impatience", "regret", "concern",
+        "integrity_pressure", "unease"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "desire": { "$ref": "#/$defs/emotion" },
+        "hope": { "$ref": "#/$defs/emotion" },
+        "confidence": { "$ref": "#/$defs/emotion" },
+        "curiosity": { "$ref": "#/$defs/emotion" },
+        "satisfaction": { "$ref": "#/$defs/emotion" },
+        "relief": { "$ref": "#/$defs/emotion" },
+        "care": { "$ref": "#/$defs/emotion" },
+        "trust": { "$ref": "#/$defs/emotion" },
+        "determination": { "$ref": "#/$defs/emotion" },
+        "resolve": { "$ref": "#/$defs/emotion" },
+        "surprise": { "$ref": "#/$defs/emotion" },
+        "doubt": { "$ref": "#/$defs/emotion" },
+        "confusion": { "$ref": "#/$defs/emotion" },
+        "fear": { "$ref": "#/$defs/emotion" },
+        "anxiety": { "$ref": "#/$defs/emotion" },
+        "caution": { "$ref": "#/$defs/emotion" },
+        "suspicion": { "$ref": "#/$defs/emotion" },
+        "distrust": { "$ref": "#/$defs/emotion" },
+        "frustration": { "$ref": "#/$defs/emotion" },
+        "impatience": { "$ref": "#/$defs/emotion" },
+        "regret": { "$ref": "#/$defs/emotion" },
+        "concern": { "$ref": "#/$defs/emotion" },
+        "integrity_pressure": { "$ref": "#/$defs/emotion" },
+        "unease": { "$ref": "#/$defs/emotion" }
+      }
+    },
+    "dominant_state": {
+      "type": "string",
+      "description": "Emotion with highest confidence score (>= 0.3 threshold)"
+    },
+    "decay_applied": {
+      "type": "boolean",
+      "description": "Whether temporal decay was applied in this computation cycle"
+    },
+    "turn_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of turns since state initialization"
+    },
+    "priority_resolution": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Emotions sorted by priority (integrity_pressure > caution > fear > frustration > anxiety > desire > confidence > curiosity > other)",
+      "default": ["integrity_pressure", "caution", "fear", "frustration", "anxiety", "desire", "confidence", "curiosity", "hope", "satisfaction", "relief", "care", "trust", "determination", "resolve", "surprise", "doubt", "confusion", "suspicion", "distrust", "impatience", "regret", "concern", "unease"]
+    }
+  },
+  "$defs": {
+    "emotion": {
+      "type": "object",
+      "required": ["type", "object", "intensity", "valence", "appraisal", "action_urges", "satisfaction_conditions", "decay_rate", "memory_effect", "expression_policy"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Emotion name (e.g. 'confidence')"
+        },
+        "object": {
+          "type": "string",
+          "description": "What the emotion is about"
+        },
+        "intensity": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "description": "Confidence score 0.0-1.0"
+        },
+        "valence": {
+          "type": "string",
+          "enum": ["positive", "neutral", "negative"],
+          "description": "Emotional valence"
+        },
+        "appraisal": {
+          "type": "string",
+          "description": "Human-readable appraisal of the situation"
+        },
+        "action_urges": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "List of behavioral urges"
+        },
+        "satisfaction_conditions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Conditions that reduce this emotion"
+        },
+        "decay_rate": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Per-50-turns decay percentage"
+        },
+        "memory_effect": {
+          "type": "string",
+          "description": "How this emotion affects memory storage"
+        },
+        "expression_policy": {
+          "type": "string",
+          "description": "How to communicate this emotion to the user"
+        }
+      }
+    }
+  }
+}
