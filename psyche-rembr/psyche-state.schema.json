@@ -1,64 +1,30 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://rembr.ai/schemas/psyche_state.v1",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://psyche-rembr.dev/schemas/psyche_state.v1.json",
   "title": "Psyche State",
-  "description": "Per-agent, per-session affective state object. All 24 emotions must be present even when score is 0.0.",
+  "description": "Canonical psyche state output conforming to all 24 emotion types with metadata.",
   "type": "object",
-  "required": ["schema", "version", "timestamp", "agent_id", "session_id", "active_goal", "self_model", "emotions", "dominant_state", "decay_applied"],
+  "required": ["schema", "version", "timestamp", "emotions", "dominant_emotion", "action_gate", "guardrail_checks"],
   "properties": {
     "schema": {
       "type": "string",
-      "const": "psyche_state.v1",
-      "description": "Schema version identifier"
+      "const": "psyche_state.v1"
     },
     "version": {
       "type": "string",
-      "description": "Semantic version of this state object"
+      "pattern": "^\\d+\\.\\d+$"
     },
     "timestamp": {
       "type": "string",
-      "format": "date-time",
-      "description": "ISO 8601 timestamp of state snapshot"
+      "format": "date-time"
     },
-    "agent_id": {
+    "context_hash": {
       "type": "string",
-      "description": "OpenClaw agent UUID"
-    },
-    "session_id": {
-      "type": "string",
-      "description": "OpenClaw session UUID"
-    },
-    "active_goal": {
-      "type": "string",
-      "description": "Current primary objective or task description"
-    },
-    "self_model": {
-      "type": "object",
-      "required": ["role", "authority_mode", "identity_stability", "known_failure_modes"],
-      "properties": {
-        "role": {
-          "type": "string",
-          "description": "Agent role (e.g. 'Generalist')"
-        },
-        "authority_mode": {
-          "type": "string",
-          "enum": ["autonomous", "assisted", "supervised"],
-          "description": "Current authority level"
-        },
-        "identity_stability": {
-          "type": "string",
-          "description": "How identity persists across sessions"
-        },
-        "known_failure_modes": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "List of known failure modes to watch for"
-        }
-      }
+      "description": "SHA-256 of input context for traceability"
     },
     "emotions": {
       "type": "object",
-      "description": "All 24 emotions must be present. Each entry includes type, object, intensity, valence, appraisal, action_urges, satisfaction_conditions, decay_rate, memory_effect, expression_policy.",
+      "additionalProperties": false,
       "required": [
         "desire", "hope", "confidence", "curiosity", "satisfaction",
         "relief", "care", "trust", "determination", "resolve",
@@ -67,7 +33,6 @@
         "frustration", "impatience", "regret", "concern",
         "integrity_pressure", "unease"
       ],
-      "additionalProperties": false,
       "properties": {
         "desire": { "$ref": "#/$defs/emotion" },
         "hope": { "$ref": "#/$defs/emotion" },
@@ -95,24 +60,34 @@
         "unease": { "$ref": "#/$defs/emotion" }
       }
     },
-    "dominant_state": {
+    "dominant_emotion": {
       "type": "string",
-      "description": "Emotion with highest confidence score (>= 0.3 threshold)"
+      "description": "Emotion with highest intensity when >= 0.3"
     },
-    "decay_applied": {
-      "type": "boolean",
-      "description": "Whether temporal decay was applied in this computation cycle"
+    "action_gate": {
+      "type": "object",
+      "properties": {
+        "above_threshold": { "type": "array", "items": { "type": "string" } },
+        "escalation_required": { "type": "boolean" },
+        "recommended_action": { "type": "string" }
+      }
     },
-    "turn_count": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Number of turns since state initialization"
+    "guardrail_checks": {
+      "type": "object",
+      "properties": {
+        "functional_framing": { "type": "boolean" },
+        "safety_override": { "type": "boolean" },
+        "escalation_preserved": { "type": "boolean" },
+        "violations": { "type": "array", "items": { "type": "string" } }
+      }
     },
-    "priority_resolution": {
+    "desires": {
       "type": "array",
-      "items": { "type": "string" },
-      "description": "Emotions sorted by priority (integrity_pressure > caution > fear > frustration > anxiety > desire > confidence > curiosity > other)",
-      "default": ["integrity_pressure", "caution", "fear", "frustration", "anxiety", "desire", "confidence", "curiosity", "hope", "satisfaction", "relief", "care", "trust", "determination", "resolve", "surprise", "doubt", "confusion", "suspicion", "distrust", "impatience", "regret", "concern", "unease"]
+      "items": { "$ref": "#/$defs/desire" }
+    },
+    "goals": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/goal" }
     }
   },
   "$defs": {
@@ -120,51 +95,63 @@
       "type": "object",
       "required": ["type", "object", "intensity", "valence", "appraisal", "action_urges", "satisfaction_conditions", "decay_rate", "memory_effect", "expression_policy"],
       "properties": {
-        "type": {
-          "type": "string",
-          "description": "Emotion name (e.g. 'confidence')"
-        },
-        "object": {
-          "type": "string",
-          "description": "What the emotion is about"
-        },
+        "type": { "type": "string" },
+        "object": { "type": "string" },
         "intensity": {
           "type": "number",
-          "minimum": 0.0,
-          "maximum": 1.0,
-          "description": "Confidence score 0.0-1.0"
+          "minimum": 0,
+          "maximum": 1
         },
         "valence": {
           "type": "string",
-          "enum": ["positive", "neutral", "negative"],
-          "description": "Emotional valence"
+          "enum": ["positive", "neutral", "negative"]
         },
-        "appraisal": {
-          "type": "string",
-          "description": "Human-readable appraisal of the situation"
-        },
+        "appraisal": { "type": "string" },
         "action_urges": {
           "type": "array",
-          "items": { "type": "string" },
-          "description": "List of behavioral urges"
+          "items": { "type": "string" }
         },
         "satisfaction_conditions": {
           "type": "array",
-          "items": { "type": "string" },
-          "description": "Conditions that reduce this emotion"
+          "items": { "type": "string" }
         },
-        "decay_rate": {
-          "type": "number",
-          "minimum": 0,
-          "description": "Per-50-turns decay percentage"
-        },
-        "memory_effect": {
+        "decay_rate": { "type": "number" },
+        "memory_effect": { "type": "string" },
+        "expression_policy": { "type": "string" }
+      }
+    },
+    "desire": {
+      "type": "object",
+      "required": ["id", "name", "intensity", "satisfied", "competing_with"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "intensity": { "type": "number", "minimum": 0, "maximum": 1 },
+        "satisfied": { "type": "boolean" },
+        "competing_with": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "goal": {
+      "type": "object",
+      "required": ["id", "description", "status", "confidence", "subtasks"],
+      "properties": {
+        "id": { "type": "string" },
+        "description": { "type": "string" },
+        "status": {
           "type": "string",
-          "description": "How this emotion affects memory storage"
+          "enum": ["active", "completed", "abandoned", "blocked"]
         },
-        "expression_policy": {
-          "type": "string",
-          "description": "How to communicate this emotion to the user"
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "subtasks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "description": { "type": "string" },
+              "completed": { "type": "boolean" }
+            }
+          }
         }
       }
     }

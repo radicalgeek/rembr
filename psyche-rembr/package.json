@@ -1,0 +1,50 @@
+{
+  "name": "psyche-rembr",
+  "version": "0.1.0",
+  "description": "OpenClaw psyche plugin: functional emotion computation, self-model injection, and affective state persistence via Rembr.",
+  "type": "module",
+  "files": [
+    "index.ts",
+    "psyche-state.ts",
+    "appraisal.ts",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "psyche",
+    "emotion",
+    "self-model",
+    "rembr"
+  ],
+  "author": "Mark @ radicalgeek",
+  "license": "MIT",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "install": {
+      "npmSpec": "psyche-rembr",
+      "defaultChoice": "npm"
+    },
+    "compat": {
+      "pluginApi": ">=2026.6.2"
+    }
+  },
+  "dependencies": {
+    "ajv": "^8.20.0",
+    "typebox": "1.1.39"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "openclaw": "^2026.6.5",
+    "typescript": "^5.9.3",
+    "vitest": "^1.6.1"
+  }
+}

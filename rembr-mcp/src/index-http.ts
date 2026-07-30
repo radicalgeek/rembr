@@ -61,6 +61,7 @@ import { adminAuthMiddleware } from './middleware/admin-auth.js';
 import {
   scopeValidationMiddleware,
   type AuthScopeContext,
+  SCOPE_MEMORY_READ,
   TOOL_SCOPE_REQUIREMENTS,
   scopesSatisfy,
   formatScopeRequirement
@@ -674,7 +675,6 @@ class RembrServer {
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined,
           enableJsonResponse: true
-        });
         });
 
         // Tear down the per-request pair when the client connection closes.

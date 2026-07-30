@@ -1,0 +1,16 @@
+{
+  "name": "psyche-rembr",
+  "version": "0.1.0",
+  "description": "Functional emotion computation engine for OpenClaw agents",
+  "author": "Mark @ radicalgeek",
+  "license": "MIT",
+  "openclaw": {
+    "compat": {
+      "pluginApi": ">=2026.6.2"
+    },
+    "install": {
+      "npmSpec": "psyche-rembr",
+      "defaultChoice": "npm"
+    }
+  }
+}
