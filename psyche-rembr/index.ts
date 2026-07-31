@@ -95,3 +95,28 @@ export default {
   PsycheEngine,
   computePsycheState,
 };
+
+// ─── Hook Exports ─────────────────────────────────────────────────────────────
+// These are the OpenClaw plugin hook adapters that connect the psyche engine
+// to the OpenClaw plugin lifecycle.
+
+export {
+  beforePromptBuild,
+  beforePromptBuildHook,
+  toCompactSnapshot,
+  type CompactPsycheSnapshot,
+  type BeforePromptBuildConfig,
+} from './hook-before-prompt-build.js';
+
+export {
+  agentEndHook,
+  type AgentEndConfig,
+} from './hook-agent-end.js';
+
+export {
+  sessionEndHook,
+  type SessionEndConfig,
+} from './hook-session-end.js';
+
+// Re-export appraisal for hook composition
+export { appraisePrompt } from './hook-before-prompt-build.js';

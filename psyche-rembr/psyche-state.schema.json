@@ -66,10 +66,13 @@
     },
     "action_gate": {
       "type": "object",
+      "required": ["above_threshold", "escalation_required", "recommended_action", "dominant_emotion", "dominant_intensity"],
       "properties": {
         "above_threshold": { "type": "array", "items": { "type": "string" } },
         "escalation_required": { "type": "boolean" },
-        "recommended_action": { "type": "string" }
+        "recommended_action": { "type": "string" },
+        "dominant_emotion": { "type": ["string", "null"] },
+        "dominant_intensity": { "type": "number", "minimum": 0, "maximum": 1 }
       }
     },
     "guardrail_checks": {
