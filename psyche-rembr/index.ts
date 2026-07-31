@@ -96,6 +96,30 @@ export default {
   computePsycheState,
 };
 
+// ─── API Endpoint Exports ─────────────────────────────────────────────────────
+// 6 named endpoints for direct agent invocation.
+
+export {
+  psyche_state,
+  psyche_appraise,
+  psyche_feel,
+  psyche_confidence,
+  psyche_reflect,
+  psyche_snapshot,
+  reset_store,
+  configure,
+  type AppraiseRequest,
+  type AppraiseResponse,
+  type FeelRequest,
+  type FeelResponse,
+  type ConfidenceRequest,
+  type ConfidenceResponse,
+  type ReflectionRequest,
+  type ReflectionResponse,
+  type SnapshotRequest,
+  type SnapshotResponse,
+} from './api-endpoints.js';
+
 // ─── Hook Exports ─────────────────────────────────────────────────────────────
 // These are the OpenClaw plugin hook adapters that connect the psyche engine
 // to the OpenClaw plugin lifecycle.

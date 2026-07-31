@@ -49,12 +49,12 @@
   },
   "dependencies": {
     "ajv": "^8.20.0",
-    "typebox": "1.1.39"
+    "typebox": "^1.1.39"
   },
   "devDependencies": {
-    "@types/node": "^24.13.3",
+    "@types/node": "^26.1.2",
     "openclaw": "^2026.7.1",
     "typescript": "^5.9.3",
-    "vitest": "^1.6.1"
+    "vitest": "^4.1.10"
   }
 }
