@@ -1,10 +1,36 @@
 {
-  "name": "psyche-rembr",
+  "id": "psyche-rembr",
+  "name": "Psyche Rembr",
+  "description": "Functional emotion computation engine: prompt injection, outcome appraisal, and session persistence.",
   "version": "0.1.0",
-  "description": "Functional emotion computation engine for OpenClaw agents",
-  "author": "Mark @ radicalgeek",
-  "license": "MIT",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "psycheFilePaths": {
+        "type": "array",
+        "items": { "type": "string" }
+      },
+      "enableMemoryRecall": { "type": "boolean" },
+      "rembrUrl": { "type": "string" },
+      "apiKey": { "type": "string", "sensitive": true },
+      "boardId": { "type": "string" },
+      "agentToken": { "type": "string", "sensitive": true },
+      "recallLimit": { "type": "integer" },
+      "enableInsightStorage": { "type": "boolean" },
+      "enableCausalTrace": { "type": "boolean" },
+      "enableSnapshotStorage": { "type": "boolean" },
+      "clearEphemeralState": { "type": "boolean" },
+      "actionThreshold": { "type": "number", "minimum": 0, "maximum": 1 },
+      "decayMultiplier": { "type": "number" }
+    }
+  },
+  "activation": {
+    "onStartup": false,
+    "onCapabilities": ["hook"]
+  },
   "openclaw": {
+    "extensions": ["./plugin-entry.ts"],
     "compat": {
       "pluginApi": ">=2026.6.2"
     },

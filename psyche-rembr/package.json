@@ -5,8 +5,18 @@
   "type": "module",
   "files": [
     "index.ts",
+    "plugin-entry.ts",
     "psyche-state.ts",
+    "psyche-state.schema.json",
     "appraisal.ts",
+    "engine.ts",
+    "emotion-registry.ts",
+    "action-gate.ts",
+    "desire-goal.ts",
+    "parse.ts",
+    "hook-before-prompt-build.ts",
+    "hook-agent-end.ts",
+    "hook-session-end.ts",
     "openclaw.plugin.json",
     "README.md"
   ],
