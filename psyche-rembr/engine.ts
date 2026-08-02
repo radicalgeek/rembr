@@ -31,6 +31,10 @@ import {
   type Desire,
   type Goal,
 } from './desire-goal.js';
+import {
+  mediate,
+  type MediationDecision,
+} from './mediation.js';
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -45,6 +49,8 @@ export interface PsycheState {
   guardrail_checks: GuardrailChecks;
   desires: Desire[];
   goals: Goal[];
+  /** Self/ego mediation decision — conflict resolution and action gating */
+  mediation: MediationDecision;
 }
 
 export interface PsycheEngineOptions {
