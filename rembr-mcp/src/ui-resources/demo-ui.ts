@@ -64,10 +64,10 @@ export function renderDemoUI(data: DemoData = {}): string {
           ${items.map(item => `
             <tr style="border-bottom: 1px solid var(--rembr-border);">
               <td style="padding: 0.75rem;">${escapeHtml(item.label)}</td>
-              <td style="text-align: right; padding: 0.75rem; font-weight: 600; color: var(--rembr-primary);">${item.value}</td>
+              <td style="text-align: right; padding: 0.75rem; font-weight: 600; color: var(--rembr-primary);">${escapeHtml(String(item.value))}</td>
               <td style="text-align: center; padding: 0.75rem;">
                 <span class="rembr-badge rembr-badge-${getBadgeType(item.status)}">
-                  ${item.status}
+                  ${escapeHtml(item.status)}
                 </span>
               </td>
             </tr>

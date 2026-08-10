@@ -98,7 +98,7 @@ describe('evaluateThresholds', () => {
     // Low failure rate, low denials
     const pool = {
       query: vi.fn().mockImplementation((sql: string) => {
-        if (sql.includes('CREATE TABLE')) return Promise.resolve({ rows: [] });
+        if (sql.includes('to_regclass')) return Promise.resolve({ rows: [{ table_name: 'audit_alerts' }] });
         if (sql.includes('COUNT(*)') || sql.includes('count')) {
           return Promise.resolve({ rows: [makeCountsRow({ failure_count: '2', denied_count: '0', total: '100' })] });
         }
@@ -115,7 +115,7 @@ describe('evaluateThresholds', () => {
     // 30% failure rate → triggers both warning (10%) and critical (25%) thresholds
     const pool = {
       query: vi.fn().mockImplementation((sql: string) => {
-        if (sql.includes('CREATE TABLE')) return Promise.resolve({ rows: [] });
+        if (sql.includes('to_regclass')) return Promise.resolve({ rows: [{ table_name: 'audit_alerts' }] });
         if (sql.includes('INSERT INTO audit_alerts')) return Promise.resolve({ rows: [{ id: 'alert-001' }] });
         if (sql.includes('unique')) return Promise.resolve({ rows: [{ unique_users: '1', unique_resource_types: '1' }] });
         return Promise.resolve({ rows: [makeCountsRow({ failure_count: '30', denied_count: '0', total: '100' })] });
@@ -132,7 +132,7 @@ describe('evaluateThresholds', () => {
   it('fires critical when failure_rate exceeds critical threshold', async () => {
     const pool = {
       query: vi.fn().mockImplementation((sql: string) => {
-        if (sql.includes('CREATE TABLE')) return Promise.resolve({ rows: [] });
+        if (sql.includes('to_regclass')) return Promise.resolve({ rows: [{ table_name: 'audit_alerts' }] });
         if (sql.includes('INSERT INTO audit_alerts')) return Promise.resolve({ rows: [{ id: 'alert-002' }] });
         if (sql.includes('unique')) return Promise.resolve({ rows: [{ unique_users: '1', unique_resource_types: '1' }] });
         return Promise.resolve({ rows: [makeCountsRow({ failure_count: '50', denied_count: '0', total: '100' })] });
@@ -148,7 +148,7 @@ describe('evaluateThresholds', () => {
   it('alert message includes observed and threshold values', async () => {
     const pool = {
       query: vi.fn().mockImplementation((sql: string) => {
-        if (sql.includes('CREATE TABLE')) return Promise.resolve({ rows: [] });
+        if (sql.includes('to_regclass')) return Promise.resolve({ rows: [{ table_name: 'audit_alerts' }] });
         if (sql.includes('INSERT INTO audit_alerts')) return Promise.resolve({ rows: [{ id: 'x' }] });
         if (sql.includes('unique')) return Promise.resolve({ rows: [{ unique_users: '1', unique_resource_types: '1' }] });
         return Promise.resolve({ rows: [makeCountsRow({ denied_count: '20', total: '100' })] });
@@ -230,7 +230,7 @@ describe('getHealthStatus', () => {
   it('returns healthy status for good metrics', async () => {
     const pool = {
       query: vi.fn().mockImplementation((sql: string) => {
-        if (sql.includes('CREATE TABLE')) return Promise.resolve({ rows: [] });
+        if (sql.includes('to_regclass')) return Promise.resolve({ rows: [{ table_name: 'audit_alerts' }] });
         if (sql.includes('unique')) return Promise.resolve({ rows: [{ unique_users: '2', unique_resource_types: '2' }] });
         if (sql.includes('audit_alerts')) return Promise.resolve({ rows: [] });
         if (sql.includes('action_result') && sql.includes('failure')) return Promise.resolve({ rows: [] });
@@ -248,7 +248,7 @@ describe('getHealthStatus', () => {
   it('includes evaluated_at timestamp', async () => {
     const pool = {
       query: vi.fn().mockImplementation((sql: string) => {
-        if (sql.includes('CREATE TABLE')) return Promise.resolve({ rows: [] });
+        if (sql.includes('to_regclass')) return Promise.resolve({ rows: [{ table_name: 'audit_alerts' }] });
         if (sql.includes('unique')) return Promise.resolve({ rows: [{ unique_users: '1', unique_resource_types: '1' }] });
         if (sql.includes('audit_alerts')) return Promise.resolve({ rows: [] });
         if (sql.includes('action_result')) return Promise.resolve({ rows: [] });

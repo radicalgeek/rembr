@@ -1,0 +1,11 @@
+SELECT format(
+  'CREATE ROLE rembr_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS PASSWORD %L',
+  :'app_password'
+)
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rembr_app')
+\gexec
+
+ALTER ROLE rembr_app
+  LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS
+  PASSWORD :'app_password';
+ALTER ROLE rembr_app SET search_path = public, pg_catalog;

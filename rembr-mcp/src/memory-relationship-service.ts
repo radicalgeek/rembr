@@ -33,6 +33,9 @@ export class MemoryRelationshipService {
 
   // Thresholds for relationship detection
   private readonly SIMILARITY_THRESHOLD = 0.65; // Semantic similarity threshold (balanced)
+  private readonly MAX_CANDIDATES = 100;
+  private readonly MAX_ANALYSIS_CONTENT_CHARS = 16_000;
+  private readonly MAX_EMBEDDING_TEXT_BYTES = 64 * 1024;
   private readonly CONTRADICTION_KEYWORDS = [
     'contradicts', 'conflicts with', 'mutually exclusive', 'opposite of',
     'is wrong', 'is incorrect', 'no longer true'
@@ -54,15 +57,20 @@ export class MemoryRelationshipService {
   /**
    * Analyze and infer relationships for a specific memory
    */
-  async inferRelationshipsForMemory(memoryId: string, tenantId: string, projectId?: string): Promise<RelationshipCandidate[]> {
+  async inferRelationshipsForMemory(
+    memoryId: string,
+    tenantId: string,
+    projectId?: string,
+    userId?: string,
+  ): Promise<RelationshipCandidate[]> {
     // Get the target memory
-    const targetMemory = await this.getMemory(memoryId, tenantId);
+    const targetMemory = await this.getMemory(memoryId, tenantId, projectId, userId);
     if (!targetMemory) {
       throw new Error('Memory not found');
     }
 
     // Get candidate memories for comparison
-    const candidates = await this.getCandidateMemories(memoryId, tenantId, projectId);
+    const candidates = await this.getCandidateMemories(memoryId, tenantId, projectId, userId);
     
     const relationships: RelationshipCandidate[] = [];
 
@@ -71,7 +79,7 @@ export class MemoryRelationshipService {
     relationships.push(...tagRelationships);
 
     // 2. Semantic similarity (strict threshold 0.65, top 100 candidates)
-    const semanticCandidates = candidates.slice(0, 100);
+    const semanticCandidates = candidates.slice(0, this.MAX_CANDIDATES);
     for (const candidate of semanticCandidates) {
       const relationship = await this.analyzeRelationship(targetMemory, candidate);
       if (relationship) {
@@ -88,27 +96,73 @@ export class MemoryRelationshipService {
 
   /**
    * Get candidate memories for relationship analysis
-   * Returns ALL memories in the tenant (no limits)
+   * Returns a bounded, deterministic candidate set. The SQL projection also
+   * caps content and embedding bytes before they cross the DB boundary.
    */
-  private async getCandidateMemories(excludeId: string, tenantId: string, projectId?: string): Promise<any[]> {
+  private async getCandidateMemories(
+    excludeId: string,
+    tenantId: string,
+    projectId?: string,
+    userId?: string,
+  ): Promise<any[]> {
     const query = `
-      SELECT m.*, me.embedding::text as embedding_text
+      SELECT m.id,
+             LEFT(m.content, $5::integer) AS content,
+             m.category, m.metadata, m.created_at, m.updated_at,
+             m.relevance_score, m.project_id, m.user_id, m.visibility,
+             CASE
+               WHEN octet_length(me.embedding::text) <= $6::integer
+               THEN me.embedding::text
+               ELSE NULL
+             END AS embedding_text
       FROM memories m
       LEFT JOIN memory_embeddings me ON m.id = me.memory_id
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
       WHERE m.tenant_id = $1
-      ${projectId ? 'AND m.project_id = $2' : ''}
-      AND m.id != $${projectId ? '3' : '2'}
-      ORDER BY m.created_at DESC
+        AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+        AND m.id != $4::uuid
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+          OR (
+            COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+            AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $3::uuid
+                 OR EXISTS (SELECT 1 FROM project_members pm
+                            WHERE pm.project_id = p.id AND pm.user_id = $3::uuid))
+          )
+        )
+      ORDER BY m.created_at DESC, m.id DESC
+      LIMIT $7::integer
     `;
 
-    const params = projectId ? [tenantId, projectId, excludeId] : [tenantId, excludeId];
+    const params = [
+      tenantId,
+      projectId || null,
+      userId || null,
+      excludeId,
+      this.MAX_ANALYSIS_CONTENT_CHARS,
+      this.MAX_EMBEDDING_TEXT_BYTES,
+      this.MAX_CANDIDATES,
+    ];
     const result = await this.database.query(query, params, tenantId);
-    
+
     // Parse embeddings from PostgreSQL vector format "[1,2,3]" to JavaScript arrays
-    return result.rows.map((row: any) => ({
+    return result.rows.slice(0, this.MAX_CANDIDATES).map((row: any) => ({
       ...row,
-      embedding: row.embedding_text ? JSON.parse(row.embedding_text) : null
+      embedding: this.parseBoundedEmbedding(row.embedding_text),
     }));
+  }
+
+  private parseBoundedEmbedding(value: unknown): number[] | null {
+    if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > this.MAX_EMBEDDING_TEXT_BYTES) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(value);
+      if (!Array.isArray(parsed) || parsed.length > 16_384) return null;
+      return parsed.every(item => typeof item === 'number' && Number.isFinite(item)) ? parsed : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -395,12 +449,12 @@ export class MemoryRelationshipService {
             rel.confidence,
             rel.evidence
           ], tenantId);
-          console.log(`💾 Stored new ${rel.relationship_type} relationship: ${rel.source_memory_id} -> ${rel.target_memory_id}`);
+          if (process.env.NODE_ENV !== 'production') console.log(`Stored ${rel.relationship_type} relationship`);
         } catch (error) {
           console.error('Error storing relationship:', error);
         }
       } else {
-        console.log(`⏭️  Skipping duplicate ${rel.relationship_type}: ${rel.source_memory_id} <-> ${rel.target_memory_id}`);
+        if (process.env.NODE_ENV !== 'production') console.log(`Skipped duplicate ${rel.relationship_type} relationship`);
       }
     }
   }
@@ -493,7 +547,7 @@ export class MemoryRelationshipService {
         if ((error as Error).message?.includes('embedding')) {
           skipped_no_embedding++;
         } else {
-          console.error(`[Backfill] Error processing memory ${orphan.id}:`, error);
+          console.error('[Backfill] Relationship inference failed for one memory');
         }
         processed++;
       }
@@ -510,14 +564,34 @@ export class MemoryRelationshipService {
   /**
    * Helper methods
    */
-  private async getMemory(id: string, tenantId: string): Promise<any> {
+  private async getMemory(
+    id: string,
+    tenantId: string,
+    projectId?: string,
+    userId?: string,
+  ): Promise<any> {
     const query = `
       SELECT m.*, me.embedding::text as embedding_text
       FROM memories m
       LEFT JOIN memory_embeddings me ON m.id = me.memory_id
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
       WHERE m.id = $1 AND m.tenant_id = $2
+        AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+          OR (
+            COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+            AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $4::uuid
+                 OR EXISTS (SELECT 1 FROM project_members pm
+                            WHERE pm.project_id = p.id AND pm.user_id = $4::uuid))
+          )
+        )
     `;
-    const result = await this.database.query(query, [id, tenantId], tenantId);
+    const result = await this.database.query(
+      query,
+      [id, tenantId, projectId || null, userId || null],
+      tenantId,
+    );
     const row = result.rows[0];
     
     // Parse embedding from PostgreSQL vector format to JavaScript array

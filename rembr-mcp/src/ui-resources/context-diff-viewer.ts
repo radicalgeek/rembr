@@ -11,7 +11,7 @@
  * - Search within diff results
  */
 
-import { renderTemplate } from './index.js';
+import { renderTemplate, safeJsonForHtml } from './index.js';
 
 export interface Memory {
   id: string;
@@ -38,7 +38,7 @@ export interface SnapshotDiffData {
  * Render the context diff viewer
  */
 export function renderContextDiffViewer(data: SnapshotDiffData): string {
-  const dataJson = JSON.stringify(data, null, 2);
+  const dataJson = safeJsonForHtml(data);
   
   // Summary stats
   const totalChanges = data.added + data.removed + data.modified;
@@ -49,7 +49,7 @@ export function renderContextDiffViewer(data: SnapshotDiffData): string {
       <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem;">
         <span class="rembr-badge rembr-badge-success">ADDED</span>
         <span style="font-size: 0.75rem; color: var(--rembr-text-secondary);">
-          ${memory.category} · ${formatDate(memory.created_at)}
+          ${escapeHtml(String(memory.category ?? ''))} · ${formatDate(memory.created_at)}
         </span>
       </div>
       <div style="padding: 0.75rem; background: rgba(34, 197, 94, 0.1); border-left: 3px solid #22c55e; border-radius: 4px;">
@@ -62,7 +62,7 @@ export function renderContextDiffViewer(data: SnapshotDiffData): string {
           <summary style="cursor: pointer; font-size: 0.75rem; color: var(--rembr-text-secondary);">
             Show metadata
           </summary>
-          <pre style="font-size: 0.75rem; margin-top: 0.5rem; padding: 0.5rem; background: var(--rembr-bg); border-radius: 4px; overflow-x: auto;">${JSON.stringify(memory.metadata, null, 2)}</pre>
+          <pre style="font-size: 0.75rem; margin-top: 0.5rem; padding: 0.5rem; background: var(--rembr-bg); border-radius: 4px; overflow-x: auto;">${escapeHtml(JSON.stringify(memory.metadata, null, 2))}</pre>
         </details>
       ` : ''}
     </div>
@@ -73,7 +73,7 @@ export function renderContextDiffViewer(data: SnapshotDiffData): string {
       <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem;">
         <span class="rembr-badge rembr-badge-danger">REMOVED</span>
         <span style="font-size: 0.75rem; color: var(--rembr-text-secondary);">
-          ${memory.category} · ${formatDate(memory.created_at)}
+          ${escapeHtml(String(memory.category ?? ''))} · ${formatDate(memory.created_at)}
         </span>
       </div>
       <div style="padding: 0.75rem; background: rgba(239, 68, 68, 0.1); border-left: 3px solid #ef4444; border-radius: 4px;">
@@ -86,7 +86,7 @@ export function renderContextDiffViewer(data: SnapshotDiffData): string {
           <summary style="cursor: pointer; font-size: 0.75rem; color: var(--rembr-text-secondary);">
             Show metadata
           </summary>
-          <pre style="font-size: 0.75rem; margin-top: 0.5rem; padding: 0.5rem; background: var(--rembr-bg); border-radius: 4px; overflow-x: auto;">${JSON.stringify(memory.metadata, null, 2)}</pre>
+          <pre style="font-size: 0.75rem; margin-top: 0.5rem; padding: 0.5rem; background: var(--rembr-bg); border-radius: 4px; overflow-x: auto;">${escapeHtml(JSON.stringify(memory.metadata, null, 2))}</pre>
         </details>
       ` : ''}
     </div>
@@ -97,7 +97,7 @@ export function renderContextDiffViewer(data: SnapshotDiffData): string {
       <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem;">
         <span class="rembr-badge rembr-badge-warning">MODIFIED</span>
         <span style="font-size: 0.75rem; color: var(--rembr-text-secondary);">
-          ${change.before.category} · ${formatDate(change.before.created_at)}
+          ${escapeHtml(String(change.before.category ?? ''))} · ${formatDate(change.before.created_at)}
         </span>
       </div>
       

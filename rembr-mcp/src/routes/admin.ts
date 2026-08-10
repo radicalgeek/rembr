@@ -14,6 +14,15 @@ import { OptimizationScheduler } from '../optimization/scheduler.js';
 import { MemoryRelationshipService } from '../memory-relationship-service.js';
 import { EmbeddingProvider } from '../ollama-provider.js';
 import { VectorSearchService } from '../vector-search-service.js';
+import { randomUUID } from 'node:crypto';
+
+function respondAdminFailure(res: Response, operation: string, error: unknown): void {
+  const correlationId = randomUUID();
+  const rawCode = error && typeof error === 'object' ? (error as any).code : undefined;
+  const code = typeof rawCode === 'string' && /^[A-Z0-9_]{1,32}$/.test(rawCode) ? rawCode : undefined;
+  console.error(`[Admin] ${operation} failed`, { correlationId, code });
+  res.status(500).json({ error: 'Admin operation failed', correlation_id: correlationId });
+}
 
 export interface AdminRouterDeps {
   db: MemoryDatabase;
@@ -56,11 +65,7 @@ export function createAdminRouter(deps: AdminRouterDeps): Router {
         });
       }
     } catch (error) {
-      console.error('[Admin] Optimization trigger failed:', error);
-      res.status(500).json({
-        error: 'Optimization failed',
-        message: error instanceof Error ? error.message : String(error)
-      });
+      respondAdminFailure(res, 'optimization', error);
     }
   });
 
@@ -96,7 +101,7 @@ export function createAdminRouter(deps: AdminRouterDeps): Router {
 
       for (const row of result.rows) {
         try {
-          const embedding = await embeddingProvider.generateEmbedding(row.content);
+          const embedding = await embeddingProvider.generateEmbedding(row.content, { tenantId });
           await db.storeEmbedding(
             row.id,
             tenantId,
@@ -106,8 +111,8 @@ export function createAdminRouter(deps: AdminRouterDeps): Router {
             embeddingProvider.getModelFingerprint()
           );
           generated++;
-        } catch (err) {
-          console.error(`[Admin] Embedding failed for memory ${row.id}:`, err);
+        } catch {
+          console.error('[Admin] One embedding generation item failed');
           failed++;
         }
       }
@@ -121,11 +126,7 @@ export function createAdminRouter(deps: AdminRouterDeps): Router {
         timestamp: new Date().toISOString()
       });
     } catch (error) {
-      console.error('[Admin] Embedding generation failed:', error);
-      res.status(500).json({
-        error: 'Embedding generation failed',
-        message: error instanceof Error ? error.message : String(error)
-      });
+      respondAdminFailure(res, 'embedding generation', error);
     }
   });
 
@@ -161,8 +162,7 @@ export function createAdminRouter(deps: AdminRouterDeps): Router {
       console.log(`[Admin] Backfill complete for tenant ${tenantId}:`, result);
       res.json({ success: true, tenant_id: tenantId, ...result });
     } catch (error) {
-      console.error('[Admin] Backfill error:', error);
-      res.status(500).json({ error: 'Backfill failed', detail: (error as Error).message });
+      respondAdminFailure(res, 'relationship backfill', error);
     }
   });
 
@@ -219,8 +219,7 @@ export function createAdminRouter(deps: AdminRouterDeps): Router {
 
       res.json(result);
     } catch (error) {
-      console.error('[Admin] Compaction error:', error);
-      res.status(500).json({ error: 'Compaction failed', detail: (error as Error).message });
+      respondAdminFailure(res, 'compaction', error);
     }
   });
 
@@ -258,8 +257,7 @@ export function createAdminRouter(deps: AdminRouterDeps): Router {
         indexes: reports,
       });
     } catch (error) {
-      console.error('[Admin] vector-index-health error:', error);
-      res.status(500).json({ error: 'Failed to retrieve index health', detail: (error as Error).message });
+      respondAdminFailure(res, 'vector index health', error);
     }
   });
 

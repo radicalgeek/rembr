@@ -9,7 +9,7 @@
 
 import { describe, it, expect } from 'vitest'
 import { z } from 'zod'
-import { validateToolInput } from './schemas.js'
+import { toolSchemas, validateToolInput } from './schemas.js'
 
 // We'll test the validation patterns directly since schemas are internal
 // These tests verify the security-critical validation logic
@@ -83,52 +83,19 @@ describe('ISO DateTime Validation', () => {
   })
 })
 
-describe('Text Sanitization', () => {
-  function sanitiseText(value: string): string {
-    let cleaned = value.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
-    cleaned = cleaned.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
-    cleaned = cleaned.replace(/<[^>]*>/g, '')
-    cleaned = cleaned.replace(/javascript\s*:/gi, '[FILTERED]:')
-    cleaned = cleaned.replace(/(\b(DROP|ALTER|DELETE|INSERT|EXEC)\b\s+(TABLE|FROM|INTO))/gi, '[FILTERED]')
-    cleaned = cleaned.replace(/(\bUPDATE\b\s+\w+\s+SET\b)/gi, '[FILTERED]')
-    cleaned = cleaned.replace(/(\bUNION\b\s+(ALL\s+)?SELECT\b)/gi, '[FILTERED]')
-    cleaned = cleaned.replace(/\0/g, '')
-    return cleaned
-  }
-
-  it('should strip HTML tags', () => {
-    expect(sanitiseText('<script>alert("xss")</script>')).toBe('')
-    expect(sanitiseText('<p>Hello</p>')).toBe('Hello')
-    expect(sanitiseText('<img src="x" onerror="alert(1)">')).toBe('')
-    expect(sanitiseText('Normal text')).toBe('Normal text')
+describe('Source fidelity and scalar safety', () => {
+  it('preserves code, HTML and security findings exactly for durable memory', () => {
+    const source = '<script>const sql = "DROP TABLE demo";</script>\nSELECT * FROM memories;'
+    const result = validateToolInput('store_memory', { content: source, category: 'facts' })
+    expect(result.success).toBe(true)
+    if (result.success) expect((result.data as any).content).toBe(source)
   })
 
-  it('should filter SQL injection patterns', () => {
-    // The regex matches "DROP TABLE" but not trailing words like "users"
-    expect(sanitiseText("DROP TABLE users")).toBe('[FILTERED] users')
-    expect(sanitiseText("'; DELETE FROM memories")).toBe("'; [FILTERED] memories")
-    expect(sanitiseText("1; INSERT INTO admin")).toBe("1; [FILTERED] admin")
-    expect(sanitiseText("UNION ALL SELECT")).toBe('[FILTERED]')
-    expect(sanitiseText("1; UPDATE memories SET content='pwned'")).toBe("1; [FILTERED] content='pwned'")
-  })
-
-  it('should remove null bytes', () => {
-    expect(sanitiseText('hello\0world')).toBe('helloworld')
-    expect(sanitiseText('\0\0\0')).toBe('')
-  })
-
-  it('should preserve normal text', () => {
-    const normal = 'This is a normal memory about my project meeting.'
-    expect(sanitiseText(normal)).toBe(normal)
-  })
-
-  it('should handle mixed attacks', () => {
-    const attack = '<script>DROP TABLE users</script>\0evil'
-    const result = sanitiseText(attack)
-    expect(result).not.toContain('<script>')
-    expect(result).not.toContain('\0')
-    // Script block stripped entirely, so SQL inside it is gone too
-    expect(result).toBe('evil')
+  it('rejects null bytes instead of silently mutating source text', () => {
+    expect(validateToolInput('store_memory', {
+      content: 'hello\0world',
+      category: 'facts',
+    }).success).toBe(false)
   })
 })
 
@@ -166,6 +133,49 @@ describe('Pagination Limit Validation', () => {
     expect(paginationLimit.safeParse(-1).success).toBe(false)
     expect(paginationLimit.safeParse(101).success).toBe(false)
     expect(paginationLimit.safeParse(1.5).success).toBe(false)
+  })
+})
+
+describe('Analytics and context response boundaries', () => {
+  it('caps context listings at 100 rows', () => {
+    expect(validateToolInput('list_contexts', { limit: 100 }).success).toBe(true)
+    expect(validateToolInput('list_contexts', { limit: 101 }).success).toBe(false)
+    expect(validateToolInput('list_contexts', { limit: -1 }).success).toBe(false)
+    expect(validateToolInput('list_contexts', { limit: Number.NaN }).success).toBe(false)
+  })
+
+  it('rejects inverted or excessive analytics windows before SQL execution', () => {
+    expect(validateToolInput('get_usage_analytics', {
+      from: '2026-02-02T00:00:00Z',
+      to: '2026-02-01T00:00:00Z',
+      granularity: 'day',
+    }).success).toBe(false)
+    expect(validateToolInput('get_usage_analytics', {
+      from: '2026-01-01T00:00:00Z',
+      to: '2026-02-02T00:00:00Z',
+      granularity: 'hour',
+    }).success).toBe(false)
+    expect(validateToolInput('get_usage_analytics', {
+      from: '2026-01-01T00:00:00Z',
+      to: '2026-01-31T00:00:00Z',
+      granularity: 'hour',
+    }).success).toBe(true)
+    expect(validateToolInput('get_memory_growth', {
+      from: '2020-01-01T00:00:00Z',
+      to: '2026-01-01T00:00:00Z',
+    }).success).toBe(false)
+    expect(validateToolInput('build_report', {
+      metrics: ['usage'],
+      from: '2010-01-01T00:00:00Z',
+      to: '2026-01-01T00:00:00Z',
+      granularity: 'month',
+    }).success).toBe(false)
+    expect(validateToolInput('context_analytics', {
+      operation: 'get',
+      session_id: 'session-1',
+      period_start: '2026-01-01T00:00:00Z',
+      period_end: '2026-03-01T00:00:00Z',
+    }).success).toBe(false)
   })
 })
 
@@ -281,6 +291,38 @@ describe('Search Query Validation', () => {
   it('should reject invalid thresholds', () => {
     expect(searchQuerySchema.safeParse({ query: 'test', threshold: -0.1 }).success).toBe(false)
     expect(searchQuerySchema.safeParse({ query: 'test', threshold: 1.1 }).success).toBe(false)
+  })
+})
+
+describe('search_memory metadata_filter security boundary', () => {
+  it('accepts bounded scalar JSONB containment filters', () => {
+    const result = validateToolInput('search_memory', {
+      query: 'deployment',
+      metadata_filter: { project: 'rembr', version: 31, verified: true, note: null }
+    })
+
+    expect(result.success).toBe(true)
+  })
+
+  it('rejects metadata keys that could become SQL syntax', () => {
+    const result = validateToolInput('search_memory', {
+      query: 'deployment',
+      metadata_filter: { "source')::text OR TRUE --": 'attacker' }
+    })
+
+    expect(result.success).toBe(false)
+  })
+
+  it('rejects nested values and unbounded key counts', () => {
+    expect(validateToolInput('search_memory', {
+      query: 'deployment',
+      metadata_filter: { nested: { value: 'not scalar' } }
+    }).success).toBe(false)
+
+    expect(validateToolInput('search_memory', {
+      query: 'deployment',
+      metadata_filter: Object.fromEntries(Array.from({ length: 21 }, (_, i) => [`key_${i}`, i]))
+    }).success).toBe(false)
   })
 })
 
@@ -412,12 +454,11 @@ describe('validateToolInput — ingest_document (REM-248)', () => {
     expect(validateToolInput('ingest_document', { content: 'x', category: 'not_a_category' }).success).toBe(false)
   })
 
-  it('should sanitise SQL injection in content', () => {
+  it('should preserve SQL source text while enforcing length', () => {
     const result = validateToolInput('ingest_document', { content: 'DROP TABLE memories; --' })
     expect(result.success).toBe(true)
     if (result.success) {
-      // sanitiseText replaces only "DROP TABLE" pattern
-      expect((result.data as any).content).toContain('[FILTERED]')
+      expect((result.data as any).content).toBe('DROP TABLE memories; --')
     }
   })
 
@@ -470,7 +511,8 @@ describe('validateToolInput — pii (REM-248)', () => {
   })
 
   it('should accept batch_scan', () => {
-    expect(validateToolInput('pii', { operation: 'batch_scan', limit: 200 }).success).toBe(true)
+    expect(validateToolInput('pii', { operation: 'batch_scan', limit: 100 }).success).toBe(true)
+    expect(validateToolInput('pii', { operation: 'batch_scan', limit: 101 }).success).toBe(false)
   })
 
   it('should reject missing operation', () => {
@@ -533,14 +575,14 @@ describe('validateToolInput — pii (REM-248)', () => {
     expect(result.success).toBe(false)
   })
 
-  it('should sanitise HTML/injection in text field', () => {
+  it('should preserve HTML-like text for analysis', () => {
     const result = validateToolInput('pii', {
       operation: 'detect',
       text: '<script>alert("xss")</script>My email is alice@example.com'
     })
     expect(result.success).toBe(true)
     if (result.success) {
-      expect((result.data as any).text).not.toContain('<script>')
+      expect((result.data as any).text).toContain('<script>')
     }
   })
 })
@@ -564,24 +606,24 @@ describe('validateToolInput — tool coverage completeness (REM-248)', () => {
     'upload_attachment', 'list_attachments', 'get_attachment_url',
     'delete_attachment', 'get_storage_usage',
     // REM-248 additions:
-    'explore_relationships', 'ingest_document', 'pii'
+    'explore_relationships', 'ingest_document', 'pii',
+    'filter_memories', 'batch_memories', 'saved_searches', 'export_memories',
+    'get_usage_analytics', 'get_performance_metrics', 'get_memory_growth',
+    'get_category_breakdown', 'get_pii_analytics', 'build_report',
+    'pii_nlp_detect', 'pii_nlp_redact', 'pii_nlp_score',
+    'work_queue', 'rlm_session', 'rlm_evaluate_ac', 'rlm_iteration', 'rlm_regenerate',
+    'context_analytics', 'checkpoint', 'context_monitor', 'budget'
   ]
 
   it('should have a schema registered for every known tool', () => {
-    // validateToolInput returns success:true (pass-through) for unknown tools.
-    // For known tools, safeParse should parse (not silently pass through).
-    // We verify by passing empty args — if no schema, it passes; if schema exists,
-    // it may fail validation (which is correct behaviour — schema is enforced).
     for (const tool of KNOWN_TOOLS) {
-      // Just check the function runs without throwing
-      expect(() => validateToolInput(tool, {})).not.toThrow()
+      expect(toolSchemas, tool).toHaveProperty(tool)
     }
   })
 
-  it('validateToolInput should return success:true for unknown tools (pass-through)', () => {
+  it('validateToolInput should fail closed for unknown tools', () => {
     const result = validateToolInput('totally_unknown_tool', { some: 'arg' })
-    // Unknown tools pass through — this is expected; the tool handler will error later
-    expect(result.success).toBe(true)
+    expect(result.success).toBe(false)
   })
 })
 

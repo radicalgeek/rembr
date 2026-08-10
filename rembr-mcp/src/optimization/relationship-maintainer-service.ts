@@ -89,8 +89,6 @@ export class RelationshipMaintainerService {
     minScore: number = this.SIMILARITY_THRESHOLD,
     batchSize: number = 50
   ): Promise<InferredRelationship[]> {
-    await this.db.query('SELECT set_config($1, $2, FALSE)', ['app.current_tenant', tenantId]);
-
     // Get memories with low relationship counts
     const result = await this.db.query(`
       SELECT 
@@ -108,7 +106,7 @@ export class RelationshipMaintainerService {
       HAVING COUNT(mr.id) < 3
       ORDER BY COUNT(mr.id) ASC, m.created_at DESC
       LIMIT $2
-    `, [tenantId, batchSize]);
+    `, [tenantId, batchSize], tenantId);
 
     const memories = result.rows.map((row: any) => ({
       ...row,
@@ -129,14 +127,14 @@ export class RelationshipMaintainerService {
         const target = memories[j];
 
         // Skip if already related
-        const existing = await this.hasRelationship(source.id, target.id);
+        const existing = await this.hasRelationship(source.id, target.id, tenantId);
         if (existing) continue;
 
         // Calculate similarity
         const similarity = this.cosineSimilarity(source.embedding, target.embedding);
 
         if (similarity >= minScore) {
-          const llmAssessment = await this.assessRelationshipWithLLM(source, target, similarity);
+          const llmAssessment = await this.assessRelationshipWithLLM(source, target, similarity, tenantId);
           const relType = llmAssessment?.relationshipType
             ?? this.determineRelationshipType(similarity, source.category, target.category);
           const confidence = llmAssessment?.confidence ?? similarity;
@@ -169,8 +167,6 @@ export class RelationshipMaintainerService {
   ): Promise<number> {
     if (relationships.length === 0) return 0;
 
-    await this.db.query('SELECT set_config($1, $2, FALSE)', ['app.current_tenant', tenantId]);
-
     let created = 0;
     for (const rel of relationships) {
       try {
@@ -196,7 +192,7 @@ export class RelationshipMaintainerService {
           rel.relationshipType,
           rel.confidence,
           rel.evidence
-        ]);
+        ], tenantId);
         created += result.rowCount ?? result.rows?.length ?? 0;
       } catch (error) {
         console.error(`Failed to create relationship: ${error}`);
@@ -212,8 +208,6 @@ export class RelationshipMaintainerService {
    * @returns Update result
    */
   async updateWeights(tenantId: string): Promise<RelationshipUpdateResult> {
-    await this.db.query('SELECT set_config($1, $2, FALSE)', ['app.current_tenant', tenantId]);
-
     // This would ideally track co-access in a separate table
     // For now, we'll boost confidence for frequently co-occurring relationships
     
@@ -227,7 +221,7 @@ export class RelationshipMaintainerService {
         AND confidence < 0.95
       ) old
       WHERE mr.id = old.id
-    `);
+    `, [], tenantId);
 
     return {
       added: 0,
@@ -246,13 +240,11 @@ export class RelationshipMaintainerService {
     tenantId: string,
     threshold: number = this.WEAK_RELATIONSHIP_THRESHOLD
   ): Promise<number> {
-    await this.db.query('SELECT set_config($1, $2, FALSE)', ['app.current_tenant', tenantId]);
-
     const result = await this.db.query(`
       DELETE FROM memory_relationships
       WHERE confidence < $1
       AND created_at < NOW() - INTERVAL '30 days'
-    `, [threshold]);
+    `, [threshold], tenantId);
 
     return result.rowCount || 0;
   }
@@ -268,8 +260,6 @@ export class RelationshipMaintainerService {
     orphanedMemories: number;
     highlyConnected: number;
   }> {
-    await this.db.query('SELECT set_config($1, $2, FALSE)', ['app.current_tenant', tenantId]);
-
     const result = await this.db.query(`
       WITH memory_stats AS (
         SELECT 
@@ -287,7 +277,7 @@ export class RelationshipMaintainerService {
         SUM(CASE WHEN rel_count = 0 THEN 1 ELSE 0 END)::int as orphaned,
         SUM(CASE WHEN rel_count > 10 THEN 1 ELSE 0 END)::int as highly_connected
       FROM memory_stats
-    `, [tenantId]);
+    `, [tenantId], tenantId);
 
     const stats = result.rows[0];
     const avgRel = stats.total_memories > 0 
@@ -305,13 +295,13 @@ export class RelationshipMaintainerService {
   /**
    * Check if relationship exists between two memories
    */
-  private async hasRelationship(memoryId1: string, memoryId2: string): Promise<boolean> {
+  private async hasRelationship(memoryId1: string, memoryId2: string, tenantId: string): Promise<boolean> {
     const result = await this.db.query(`
       SELECT COUNT(*) as count
       FROM memory_relationships
       WHERE (source_memory_id = $1 AND target_memory_id = $2)
          OR (source_memory_id = $2 AND target_memory_id = $1)
-    `, [memoryId1, memoryId2]);
+    `, [memoryId1, memoryId2], tenantId);
 
     return parseInt(result.rows[0].count) > 0;
   }
@@ -337,13 +327,14 @@ export class RelationshipMaintainerService {
 
   /**
    * Optionally ask the configured text-generation backend for higher-order
-   * relationship classification. OllamaClient can route this through any
-   * OpenAI-compatible service via OPENAI_COMPATIBLE_TEXT_BASE_URL.
+   * relationship classification. OllamaClient can route this through LiteLLM or
+   * another OpenAI-compatible service via OPENAI_COMPATIBLE_TEXT_BASE_URL.
    */
   private async assessRelationshipWithLLM(
     source: CandidateMemory,
     target: CandidateMemory,
-    similarity: number
+    similarity: number,
+    tenantId: string,
   ): Promise<LLMRelationshipAssessment | null> {
     if (process.env.RELATIONSHIP_LLM_INFERENCE_ENABLED === 'false') {
       return null;
@@ -388,7 +379,8 @@ Respond as JSON:
     try {
       const response = await this.ollamaClient.generateText(prompt, systemPrompt, {
         temperature: 0,
-        maxTokens: 220
+        maxTokens: 220,
+        tenantId,
       });
       return this.parseLLMAssessment(response, similarity);
     } catch (error) {

@@ -5,7 +5,7 @@
  * Tracks memory version history and creates snapshots.
  */
 
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 
 export interface Memory {
   id: string;
@@ -44,14 +44,34 @@ export interface SnapshotDiff {
 }
 
 export interface SearchOptions {
-  embedding: number[];
+  embedding?: number[];
   projectId?: string;
+  userId?: string;
   category?: string;
   limit?: number;
 }
 
 export class TemporalQueryService {
   constructor(private db: Pool) {}
+
+  private async withTenantContext<T>(
+    tenantId: string,
+    fn: (client: PoolClient) => Promise<T>,
+  ): Promise<T> {
+    const client = await this.db.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`SELECT set_config('app.current_tenant', $1, true)`, [tenantId]);
+      const result = await fn(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
 
   /**
    * Search memories as they existed at a specific point in time
@@ -63,22 +83,23 @@ export class TemporalQueryService {
     options: SearchOptions
   ): Promise<Memory[]> {
     const asOfTimeISO = asOfTime.toISOString();
-    const params: any[] = [tenantId];
-    let paramIndex = 2;
+    const params: any[] = [tenantId, asOfTimeISO, options.projectId || null, options.userId || null];
+    let paramIndex = 5;
 
     let whereClause = `
       WHERE m.tenant_id = $1
-        AND m.valid_from <= $${paramIndex}
-        AND (m.valid_until IS NULL OR m.valid_until > $${paramIndex})
+        AND m.valid_from <= $2
+        AND (m.valid_until IS NULL OR m.valid_until > $2)
+        AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+          OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND (
+            p.id IS NULL OR p.is_personal = false OR p.owner_id = $4::uuid
+            OR EXISTS (SELECT 1 FROM project_members pm
+                       WHERE pm.project_id = p.id AND pm.user_id = $4::uuid)
+          ))
+        )
     `;
-    params.push(asOfTimeISO);
-    paramIndex++;
-
-    if (options.projectId) {
-      whereClause += ` AND m.project_id = $${paramIndex}`;
-      params.push(options.projectId);
-      paramIndex++;
-    }
 
     if (options.category) {
       whereClause += ` AND m.category = $${paramIndex}`;
@@ -86,42 +107,27 @@ export class TemporalQueryService {
       paramIndex++;
     }
 
-    // Use search_memories_at_time function if we have embedding
-    if (options.embedding) {
-      const querySQL = `
-        SELECT * FROM search_memories_at_time(
-          $1::uuid, 
-          $2::vector(768), 
-          $3::timestamptz,
-          $4::uuid,
-          $5::varchar(50),
-          $6::integer
-        )
-      `;
-
-      const result = await this.db.query(querySQL, [
-        tenantId,
-        `[${options.embedding.join(',')}]`,
-        asOfTimeISO,
-        options.projectId || null,
-        options.category || null,
-        options.limit || 10
-      ]);
-
-      return result.rows;
+    const hasEmbedding = Array.isArray(options.embedding) && options.embedding.length > 0;
+    const embeddingParam = hasEmbedding ? paramIndex++ : null;
+    if (hasEmbedding) {
+      params.push(`[${options.embedding!.join(',')}]`);
+      whereClause += ` AND m.embedding IS NOT NULL`;
     }
-
-    // Fall back to simple query without embedding
-    const querySQL = `
-      SELECT m.*
-      FROM memories m
-      ${whereClause}
-      ORDER BY m.created_at DESC
-      LIMIT $${paramIndex}
-    `;
+    const limitParam = paramIndex;
     params.push(options.limit || 10);
 
-    const result = await this.db.query(querySQL, params);
+    // Direct querying keeps the user/project audience in the same statement
+    // as the point-in-time and vector predicates.
+    const querySQL = `
+      SELECT m.*${hasEmbedding ? `, (m.embedding <=> $${embeddingParam}::vector) AS distance` : ''}
+      FROM memories m
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+      ${whereClause}
+      ORDER BY ${hasEmbedding ? `m.embedding <=> $${embeddingParam}::vector` : 'm.created_at DESC'}
+      LIMIT $${limitParam}
+    `;
+
+    const result = await this.withTenantContext(tenantId, client => client.query(querySQL, params));
     return result.rows;
   }
 
@@ -132,20 +138,33 @@ export class TemporalQueryService {
     tenantId: string,
     memoryId: string,
     asOfTime: Date,
-    projectId?: string
+    projectId?: string,
+    userId?: string,
   ): Promise<Memory | null> {
     const asOfTimeISO = asOfTime.toISOString();
     const query = `
-      SELECT * FROM memories
-      WHERE id = $1
-        AND tenant_id = $2
-        AND ($3::uuid IS NULL OR project_id = $3)
-        AND valid_from <= $4
-        AND (valid_until IS NULL OR valid_until > $4)
+      SELECT m.* FROM memories m
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+      WHERE m.id = $1
+        AND m.tenant_id = $2
+        AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+        AND m.valid_from <= $4
+        AND (m.valid_until IS NULL OR m.valid_until > $4)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $5::uuid)
+          OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND (
+            p.id IS NULL OR p.is_personal = false OR p.owner_id = $5::uuid
+            OR EXISTS (SELECT 1 FROM project_members pm
+                       WHERE pm.project_id = p.id AND pm.user_id = $5::uuid)
+          ))
+        )
       LIMIT 1
     `;
 
-    const result = await this.db.query(query, [memoryId, tenantId, projectId, asOfTimeISO]);
+    const result = await this.withTenantContext(tenantId, client => client.query(
+      query,
+      [memoryId, tenantId, projectId || null, asOfTimeISO, userId || null],
+    ));
     return result.rows[0] || null;
   }
 
@@ -155,7 +174,8 @@ export class TemporalQueryService {
   async getMemoryHistory(
     tenantId: string,
     memoryId: string,
-    projectId?: string
+    projectId?: string,
+    userId?: string,
   ): Promise<MemoryVersion[]> {
     const query = `
       SELECT 
@@ -169,14 +189,27 @@ export class TemporalQueryService {
           WHEN valid_until IS NULL THEN 'current'
           ELSE 'historical'
         END as status
-      FROM memories
-      WHERE id = $1
-        AND tenant_id = $2
-        AND ($3::uuid IS NULL OR project_id = $3)
-      ORDER BY valid_from DESC
+      FROM memories m
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+      WHERE m.id = $1
+        AND m.tenant_id = $2
+        AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+          OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND (
+            p.id IS NULL OR p.is_personal = false OR p.owner_id = $4::uuid
+            OR EXISTS (SELECT 1 FROM project_members pm
+                       WHERE pm.project_id = p.id AND pm.user_id = $4::uuid)
+          ))
+        )
+      ORDER BY m.valid_from DESC
+      LIMIT 100
     `;
 
-    const result = await this.db.query(query, [memoryId, tenantId, projectId]);
+    const result = await this.withTenantContext(tenantId, client => client.query(
+      query,
+      [memoryId, tenantId, projectId || null, userId || null],
+    ));
     return result.rows;
   }
 
@@ -199,24 +232,22 @@ export class TemporalQueryService {
         COUNT(*) as total,
         category,
         COUNT(*) FILTER (WHERE category IS NOT NULL) as cat_count
-      FROM memories
-      WHERE tenant_id = $1
-        AND ($2::uuid IS NULL OR project_id = $2)
-        AND valid_from <= $3
-        AND (valid_until IS NULL OR valid_until > $3)
-      GROUP BY category
+      FROM memories m
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+      WHERE m.tenant_id = $1
+        AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+        AND m.valid_from <= $3
+        AND (m.valid_until IS NULL OR m.valid_until > $3)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+          OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND (
+            p.id IS NULL OR p.is_personal = false OR p.owner_id = $4::uuid
+            OR EXISTS (SELECT 1 FROM project_members pm
+                       WHERE pm.project_id = p.id AND pm.user_id = $4::uuid)
+          ))
+        )
+      GROUP BY m.category
     `;
-
-    const statsResult = await this.db.query(statsQuery, [tenantId, projectId, snapTimeISO]);
-
-    const categoriesSnapshot = statsResult.rows.reduce((acc: any, row: any) => {
-      acc[row.category || 'uncategorized'] = parseInt(row.cat_count);
-      return acc;
-    }, {});
-
-    const totalMemories = statsResult.rows.reduce((sum: number, r: any) => 
-      sum + parseInt(r.cat_count), 0
-    );
 
     const insertQuery = `
       INSERT INTO temporal_snapshots 
@@ -225,17 +256,30 @@ export class TemporalQueryService {
       RETURNING id
     `;
 
-    const result = await this.db.query(insertQuery, [
-      tenantId, 
-      projectId, 
-      snapshotName, 
-      snapTimeISO,
-      totalMemories,
-      JSON.stringify(categoriesSnapshot),
-      userId || null
-    ]);
-
-    return result.rows[0].id;
+    return this.withTenantContext(tenantId, async client => {
+      const statsResult = await client.query(
+        statsQuery,
+        [tenantId, projectId || null, snapTimeISO, userId || null],
+      );
+      const categoriesSnapshot = statsResult.rows.reduce((acc: any, row: any) => {
+        acc[row.category || 'uncategorized'] = parseInt(row.cat_count);
+        return acc;
+      }, {});
+      const totalMemories = statsResult.rows.reduce(
+        (sum: number, row: any) => sum + parseInt(row.cat_count),
+        0,
+      );
+      const result = await client.query(insertQuery, [
+        tenantId,
+        projectId || null,
+        snapshotName,
+        snapTimeISO,
+        totalMemories,
+        JSON.stringify(categoriesSnapshot),
+        userId || null,
+      ]);
+      return result.rows[0].id;
+    });
   }
 
   /**
@@ -243,15 +287,26 @@ export class TemporalQueryService {
    */
   async getSnapshot(
     tenantId: string,
-    snapshotName: string
+    snapshotName: string,
+    projectId?: string,
+    userId?: string,
   ): Promise<any> {
     const query = `
-      SELECT * FROM temporal_snapshots
-      WHERE tenant_id = $1 AND snapshot_name = $2
+      SELECT ts.* FROM temporal_snapshots ts
+      LEFT JOIN projects p ON p.id = ts.project_id AND p.tenant_id = ts.tenant_id
+      WHERE ts.tenant_id = $1 AND ts.snapshot_name = $2
+        AND ($3::uuid IS NULL OR ts.project_id = $3::uuid)
+        AND (ts.created_by_user_id IS NULL OR ts.created_by_user_id = $4::uuid)
+        AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $4::uuid
+             OR EXISTS (SELECT 1 FROM project_members pm
+                        WHERE pm.project_id = p.id AND pm.user_id = $4::uuid))
       LIMIT 1
     `;
 
-    const result = await this.db.query(query, [tenantId, snapshotName]);
+    const result = await this.withTenantContext(tenantId, client => client.query(
+      query,
+      [tenantId, snapshotName, projectId || null, userId || null],
+    ));
     return result.rows[0] || null;
   }
 
@@ -261,7 +316,8 @@ export class TemporalQueryService {
   async listSnapshots(
     tenantId: string,
     projectId?: string,
-    limit: number = 50
+    limit: number = 50,
+    userId?: string,
   ): Promise<any[]> {
     const query = `
       SELECT 
@@ -271,14 +327,22 @@ export class TemporalQueryService {
         total_memories,
         categories_snapshot,
         created_at
-      FROM temporal_snapshots
-      WHERE tenant_id = $1
-        AND ($2::uuid IS NULL OR project_id = $2)
-      ORDER BY snapshot_time DESC
+      FROM temporal_snapshots ts
+      LEFT JOIN projects p ON p.id = ts.project_id AND p.tenant_id = ts.tenant_id
+      WHERE ts.tenant_id = $1
+        AND ($2::uuid IS NULL OR ts.project_id = $2::uuid)
+        AND (ts.created_by_user_id IS NULL OR ts.created_by_user_id = $4::uuid)
+        AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $4::uuid
+             OR EXISTS (SELECT 1 FROM project_members pm
+                        WHERE pm.project_id = p.id AND pm.user_id = $4::uuid))
+      ORDER BY ts.snapshot_time DESC
       LIMIT $3
     `;
 
-    const result = await this.db.query(query, [tenantId, projectId, limit]);
+    const result = await this.withTenantContext(tenantId, client => client.query(
+      query,
+      [tenantId, projectId || null, limit, userId || null],
+    ));
     return result.rows;
   }
 
@@ -287,14 +351,29 @@ export class TemporalQueryService {
    */
   async deleteSnapshot(
     tenantId: string,
-    snapshotId: string
+    snapshotId: string,
+    projectId?: string,
+    userId?: string,
   ): Promise<void> {
     const query = `
-      DELETE FROM temporal_snapshots
-      WHERE id = $1 AND tenant_id = $2
+      DELETE FROM temporal_snapshots ts
+      WHERE ts.id = $1 AND ts.tenant_id = $2
+        AND ($3::uuid IS NULL OR ts.project_id = $3::uuid)
+        AND ts.created_by_user_id = $4::uuid
+        AND (
+          ts.project_id IS NULL OR EXISTS (
+            SELECT 1 FROM projects p
+            WHERE p.id = ts.project_id AND p.tenant_id = ts.tenant_id
+              AND (p.is_personal = false OR p.owner_id = $4::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p.id AND pm.user_id = $4::uuid))
+          )
+        )
     `;
 
-    await this.db.query(query, [snapshotId, tenantId]);
+    await this.withTenantContext(tenantId, client =>
+      client.query(query, [snapshotId, tenantId, projectId || null, userId || null])
+    );
   }
 
   /**
@@ -304,11 +383,12 @@ export class TemporalQueryService {
     tenantId: string,
     timeA: Date,
     timeB: Date,
-    projectId?: string
+    projectId?: string,
+    userId?: string,
   ): Promise<SnapshotDiff> {
     const [memoriesA, memoriesB] = await Promise.all([
-      this.getMemoriesAtTime(tenantId, timeA, projectId),
-      this.getMemoriesAtTime(tenantId, timeB, projectId)
+      this.getMemoriesAtTime(tenantId, timeA, projectId, userId),
+      this.getMemoriesAtTime(tenantId, timeB, projectId, userId)
     ]);
 
     // Create maps for efficient lookup
@@ -339,19 +419,32 @@ export class TemporalQueryService {
   private async getMemoriesAtTime(
     tenantId: string,
     asOfTime: Date,
-    projectId?: string
+    projectId?: string,
+    userId?: string,
   ): Promise<Memory[]> {
     const asOfTimeISO = asOfTime.toISOString();
     const query = `
-      SELECT * FROM memories
-      WHERE tenant_id = $1
-        AND ($2::uuid IS NULL OR project_id = $2)
-        AND valid_from <= $3
-        AND (valid_until IS NULL OR valid_until > $3)
-      ORDER BY created_at DESC
+      SELECT m.* FROM memories m
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+      WHERE m.tenant_id = $1
+        AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+        AND m.valid_from <= $3
+        AND (m.valid_until IS NULL OR m.valid_until > $3)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+          OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND (
+            p.id IS NULL OR p.is_personal = false OR p.owner_id = $4::uuid
+            OR EXISTS (SELECT 1 FROM project_members pm
+                       WHERE pm.project_id = p.id AND pm.user_id = $4::uuid)
+          ))
+        )
+      ORDER BY m.created_at DESC
     `;
 
-    const result = await this.db.query(query, [tenantId, projectId, asOfTimeISO]);
+    const result = await this.withTenantContext(tenantId, client => client.query(
+      query,
+      [tenantId, projectId || null, asOfTimeISO, userId || null],
+    ));
     return result.rows;
   }
 
@@ -360,7 +453,8 @@ export class TemporalQueryService {
    */
   async getTemporalStats(
     tenantId: string,
-    projectId?: string
+    projectId?: string,
+    userId?: string,
   ): Promise<any> {
     const query = `
       SELECT 
@@ -369,12 +463,24 @@ export class TemporalQueryService {
         AVG(EXTRACT(EPOCH FROM (COALESCE(valid_until, NOW()) - valid_from))) as avg_version_lifetime_seconds,
         COUNT(*) FILTER (WHERE valid_until IS NULL) as current_versions,
         COUNT(*) FILTER (WHERE valid_until IS NOT NULL) as historical_versions
-      FROM memories
-      WHERE tenant_id = $1
-        AND ($2::uuid IS NULL OR project_id = $2)
+      FROM memories m
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+      WHERE m.tenant_id = $1
+        AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+          OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND (
+            p.id IS NULL OR p.is_personal = false OR p.owner_id = $3::uuid
+            OR EXISTS (SELECT 1 FROM project_members pm
+                       WHERE pm.project_id = p.id AND pm.user_id = $3::uuid)
+          ))
+        )
     `;
 
-    const result = await this.db.query(query, [tenantId, projectId]);
+    const result = await this.withTenantContext(tenantId, client => client.query(
+      query,
+      [tenantId, projectId || null, userId || null],
+    ));
     
     const stats = result.rows[0];
     return {
@@ -393,10 +499,17 @@ export class TemporalQueryService {
     tenantId: string,
     memoryId: string,
     rollbackToTime: Date,
-    projectId?: string
+    projectId?: string,
+    userId?: string,
   ): Promise<Memory | null> {
     // Get the memory version at the rollback time
-    const historicalVersion = await this.getMemoryAtTime(tenantId, memoryId, rollbackToTime, projectId);
+    const historicalVersion = await this.getMemoryAtTime(
+      tenantId,
+      memoryId,
+      rollbackToTime,
+      projectId,
+      userId,
+    );
     
     if (!historicalVersion) {
       return null;
@@ -404,37 +517,69 @@ export class TemporalQueryService {
 
     // Close current version
     const closeQuery = `
-      UPDATE memories
+      UPDATE memories m
       SET valid_until = NOW()
-      WHERE id = $1 
-        AND tenant_id = $2
-        AND valid_until IS NULL
+      WHERE m.id = $1
+        AND m.tenant_id = $2
+        AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+        AND m.valid_until IS NULL
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+          OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND (
+            m.project_id IS NULL OR EXISTS (
+              SELECT 1 FROM projects p
+              WHERE p.id = m.project_id AND p.tenant_id = m.tenant_id
+                AND (p.is_personal = false OR p.owner_id = $4::uuid
+                     OR EXISTS (SELECT 1 FROM project_members pm
+                                WHERE pm.project_id = p.id AND pm.user_id = $4::uuid))
+            )
+          ))
+        )
     `;
-    
-    await this.db.query(closeQuery, [memoryId, tenantId]);
 
     // Insert new version with historical content
     const insertQuery = `
       INSERT INTO memories (
-        id, tenant_id, project_id, user_id, content, category, 
-        embedding, metadata, valid_from, created_at
+        id, tenant_id, project_id, user_id, content, category,
+        embedding, metadata, visibility, valid_from, created_at
       ) 
       SELECT 
-        id, tenant_id, project_id, user_id, content, category,
-        embedding, metadata, NOW(), created_at
-      FROM memories
-      WHERE id = $1 
-        AND tenant_id = $2
-        AND valid_from = $3
+        m.id, m.tenant_id, m.project_id, m.user_id, m.content, m.category,
+        m.embedding, m.metadata, m.visibility, NOW(), m.created_at
+      FROM memories m
+      WHERE m.id = $1
+        AND m.tenant_id = $2
+        AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+        AND m.valid_from = $5
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+          OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND (
+            m.project_id IS NULL OR EXISTS (
+              SELECT 1 FROM projects p
+              WHERE p.id = m.project_id AND p.tenant_id = m.tenant_id
+                AND (p.is_personal = false OR p.owner_id = $4::uuid
+                     OR EXISTS (SELECT 1 FROM project_members pm
+                                WHERE pm.project_id = p.id AND pm.user_id = $4::uuid))
+            )
+          ))
+        )
       RETURNING *
     `;
 
-    const result = await this.db.query(insertQuery, [
-      memoryId, 
-      tenantId, 
-      historicalVersion.valid_from
-    ]);
-
-    return result.rows[0] || null;
+    return this.withTenantContext(tenantId, async client => {
+      const closeResult = await client.query(
+        closeQuery,
+        [memoryId, tenantId, projectId || null, userId || null],
+      );
+      if (closeResult.rowCount === 0) return null;
+      const result = await client.query(insertQuery, [
+        memoryId,
+        tenantId,
+        projectId || null,
+        userId || null,
+        historicalVersion.valid_from,
+      ]);
+      return result.rows[0] || null;
+    });
   }
 }

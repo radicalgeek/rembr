@@ -36,15 +36,16 @@ CREATE TABLE IF NOT EXISTS context_sessions (
 );
 
 -- Indexes for session lookups and analytics
-CREATE INDEX idx_context_sessions_tenant ON context_sessions(tenant_id);
-CREATE INDEX idx_context_sessions_state ON context_sessions(session_state);
-CREATE INDEX idx_context_sessions_created_at ON context_sessions(created_at DESC);
-CREATE INDEX idx_context_sessions_updated_at ON context_sessions(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_context_sessions_tenant ON context_sessions(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_context_sessions_state ON context_sessions(session_state);
+CREATE INDEX IF NOT EXISTS idx_context_sessions_created_at ON context_sessions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_context_sessions_updated_at ON context_sessions(updated_at DESC);
 
 -- Enable RLS
 ALTER TABLE context_sessions ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS context_sessions_tenant_isolation ON context_sessions;
 CREATE POLICY context_sessions_tenant_isolation ON context_sessions
-    USING (tenant_id = current_setting('app.current_tenant_id', TRUE)::uuid);
+    USING (tenant_id::text = current_setting('app.current_tenant', TRUE));
 
 
 -- ============================================================================
@@ -75,18 +76,19 @@ CREATE TABLE IF NOT EXISTS context_checkpoints (
 );
 
 -- Indexes for checkpoint retrieval
-CREATE INDEX idx_context_checkpoints_tenant ON context_checkpoints(tenant_id);
-CREATE INDEX idx_context_checkpoints_session ON context_checkpoints(session_id);
-CREATE INDEX idx_context_checkpoints_created_at ON context_checkpoints(created_at DESC);
-CREATE INDEX idx_context_checkpoints_type ON context_checkpoints(checkpoint_type);
+CREATE INDEX IF NOT EXISTS idx_context_checkpoints_tenant ON context_checkpoints(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_context_checkpoints_session ON context_checkpoints(session_id);
+CREATE INDEX IF NOT EXISTS idx_context_checkpoints_created_at ON context_checkpoints(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_context_checkpoints_type ON context_checkpoints(checkpoint_type);
 
 -- GIN index for JSONB queries
-CREATE INDEX idx_context_checkpoints_decisions ON context_checkpoints USING GIN (decisions_snapshot);
+CREATE INDEX IF NOT EXISTS idx_context_checkpoints_decisions ON context_checkpoints USING GIN (decisions_snapshot);
 
 -- Enable RLS
 ALTER TABLE context_checkpoints ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS context_checkpoints_tenant_isolation ON context_checkpoints;
 CREATE POLICY context_checkpoints_tenant_isolation ON context_checkpoints
-    USING (tenant_id = current_setting('app.current_tenant_id', TRUE)::uuid);
+    USING (tenant_id::text = current_setting('app.current_tenant', TRUE));
 
 
 -- ============================================================================
@@ -112,13 +114,14 @@ CREATE TABLE IF NOT EXISTS context_budgets (
 );
 
 -- Indexes for budget lookups
-CREATE INDEX idx_context_budgets_tenant ON context_budgets(tenant_id);
-CREATE INDEX idx_context_budgets_active ON context_budgets(is_active) WHERE is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_context_budgets_tenant ON context_budgets(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_context_budgets_active ON context_budgets(is_active) WHERE is_active = TRUE;
 
 -- Enable RLS
 ALTER TABLE context_budgets ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS context_budgets_tenant_isolation ON context_budgets;
 CREATE POLICY context_budgets_tenant_isolation ON context_budgets
-    USING (tenant_id = current_setting('app.current_tenant_id', TRUE)::uuid);
+    USING (tenant_id::text = current_setting('app.current_tenant', TRUE));
 
 
 -- ============================================================================
@@ -138,18 +141,19 @@ CREATE TABLE IF NOT EXISTS context_analytics_events (
 );
 
 -- Indexes for event queries
-CREATE INDEX idx_context_analytics_events_tenant ON context_analytics_events(tenant_id);
-CREATE INDEX idx_context_analytics_events_session ON context_analytics_events(session_id);
-CREATE INDEX idx_context_analytics_events_type ON context_analytics_events(event_type);
-CREATE INDEX idx_context_analytics_events_created_at ON context_analytics_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_context_analytics_events_tenant ON context_analytics_events(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_context_analytics_events_session ON context_analytics_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_context_analytics_events_type ON context_analytics_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_context_analytics_events_created_at ON context_analytics_events(created_at DESC);
 
 -- GIN index for event data queries
-CREATE INDEX idx_context_analytics_events_data ON context_analytics_events USING GIN (event_data);
+CREATE INDEX IF NOT EXISTS idx_context_analytics_events_data ON context_analytics_events USING GIN (event_data);
 
 -- Enable RLS
 ALTER TABLE context_analytics_events ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS context_analytics_events_tenant_isolation ON context_analytics_events;
 CREATE POLICY context_analytics_events_tenant_isolation ON context_analytics_events
-    USING (tenant_id = current_setting('app.current_tenant_id', TRUE)::uuid);
+    USING (tenant_id::text = current_setting('app.current_tenant', TRUE));
 
 
 -- ============================================================================
@@ -188,6 +192,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS context_sessions_updated_at_trigger ON context_sessions;
 CREATE TRIGGER context_sessions_updated_at_trigger
     BEFORE UPDATE ON context_sessions
     FOR EACH ROW
@@ -202,6 +207,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS context_budgets_updated_at_trigger ON context_budgets;
 CREATE TRIGGER context_budgets_updated_at_trigger
     BEFORE UPDATE ON context_budgets
     FOR EACH ROW

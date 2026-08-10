@@ -57,6 +57,10 @@ function makeIterRow(overrides: Record<string, unknown> = {}) {
   };
 }
 
+const schemaRows = {
+  rows: [{ sessions_table: 'rlm_sessions', iterations_table: 'rlm_iterations' }],
+};
+
 // ─────────────────────────────────────────────────────────
 // _formatSession / _formatIteration (via getSession)
 // ─────────────────────────────────────────────────────────
@@ -64,7 +68,7 @@ describe('RalphRLMService — session formatting', () => {
   it('formats a session with iterations correctly', async () => {
     const pool = {
       query: vi.fn()
-        .mockResolvedValueOnce({ rows: [] })                      // ensureSchema
+        .mockResolvedValueOnce(schemaRows)                       // ensureSchema
         .mockResolvedValueOnce({ rows: [makeSessionRow()] })      // session query
         .mockResolvedValueOnce({ rows: [makeIterRow()] }),        // iteration query
     } as any;
@@ -85,7 +89,7 @@ describe('RalphRLMService — session formatting', () => {
   it('returns null when session not found', async () => {
     const pool = {
       query: vi.fn()
-        .mockResolvedValueOnce({ rows: [] })   // ensureSchema
+        .mockResolvedValueOnce(schemaRows)    // ensureSchema
         .mockResolvedValueOnce({ rows: [] })   // session query (empty)
         .mockResolvedValueOnce({ rows: [] }),  // iteration query
     } as any;
@@ -103,6 +107,7 @@ describe('RalphRLMService — createSession', () => {
     const capturedArgs: unknown[][] = [];
     const pool = {
       query: vi.fn().mockImplementation((_sql: string, params?: unknown[]) => {
+        if (_sql.includes('to_regclass')) return Promise.resolve(schemaRows);
         if (params) capturedArgs.push(params);
         return Promise.resolve({ rows: [makeSessionRow()] });
       }),
@@ -131,6 +136,7 @@ describe('RalphRLMService — evaluateAC', () => {
     const queries: string[] = [];
     const pool = {
       query: vi.fn().mockImplementation((sql: string) => {
+        if (sql.includes('to_regclass')) return Promise.resolve(schemaRows);
         queries.push(sql.trim()); // store full SQL, not truncated
         if (sql.includes('SELECT') && sql.includes('rlm_sessions')) {
           return Promise.resolve({ rows: [makeSessionRow()] });
@@ -158,6 +164,7 @@ describe('RalphRLMService — evaluateAC', () => {
     const queries: string[] = [];
     const pool = {
       query: vi.fn().mockImplementation((sql: string) => {
+        if (sql.includes('to_regclass')) return Promise.resolve(schemaRows);
         queries.push(sql.trim()); // store full SQL, not truncated
         if (sql.includes('SELECT') && sql.includes('rlm_sessions')) return Promise.resolve({ rows: [rowWithTwoAC] });
         if (sql.includes('rlm_iterations')) return Promise.resolve({ rows: [] });
@@ -184,6 +191,7 @@ describe('RalphRLMService — iteration lifecycle', () => {
     const capturedParams: unknown[][] = [];
     const pool = {
       query: vi.fn().mockImplementation((_sql: string, params?: unknown[]) => {
+        if (_sql.includes('to_regclass')) return Promise.resolve(schemaRows);
         if (params) capturedParams.push(params);
         // Count query returns 2 existing iterations
         if (_sql.includes('COUNT(*)')) return Promise.resolve({ rows: [{ count: '2' }] });
@@ -198,11 +206,14 @@ describe('RalphRLMService — iteration lifecycle', () => {
 
   it('completeIteration records outcome and evidence', async () => {
     const pool = {
-      query: vi.fn().mockResolvedValue({ rows: [makeIterRow({
-        outcome: 'success',
-        evidence: JSON.stringify(['Test passed', 'Coverage 95%']),
-        ac_met: JSON.stringify(['ac-000001']),
-      })] }),
+      query: vi.fn().mockImplementation((sql: string) => {
+        if (sql.includes('to_regclass')) return Promise.resolve(schemaRows);
+        return Promise.resolve({ rows: [makeIterRow({
+          outcome: 'success',
+          evidence: JSON.stringify(['Test passed', 'Coverage 95%']),
+          ac_met: JSON.stringify(['ac-000001']),
+        })] });
+      }),
     } as any;
 
     const svc = new RalphRLMService(pool, TENANT);
@@ -222,7 +233,7 @@ describe('RalphRLMService — requestRegeneration', () => {
   it('generates structured prompt with failed approaches', async () => {
     const pool = {
       query: vi.fn().mockImplementation((sql: string) => {
-        if (sql.includes('ensureSchema') || sql.trim().startsWith('CREATE')) return Promise.resolve({ rows: [] });
+        if (sql.includes('to_regclass')) return Promise.resolve(schemaRows);
         if (sql.includes('SELECT') && sql.includes('rlm_sessions')) return Promise.resolve({ rows: [makeSessionRow()] });
         if (sql.includes('rlm_iterations')) return Promise.resolve({ rows: [] });
         return Promise.resolve({ rows: [] });
@@ -250,6 +261,7 @@ describe('RalphRLMService — requestRegeneration', () => {
   it('throws when session not found', async () => {
     const pool = {
       query: vi.fn().mockImplementation((sql: string) => {
+        if (sql.includes('to_regclass')) return Promise.resolve(schemaRows);
         if (sql.includes('SELECT') && sql.includes('rlm_sessions')) return Promise.resolve({ rows: [] });
         return Promise.resolve({ rows: [] });
       }),
@@ -292,7 +304,10 @@ describe('RalphRLMService — exportState / importState', () => {
     const stateJson = JSON.stringify({ schema_version: '1.0', exported_at: '', session });
 
     const pool = {
-      query: vi.fn().mockResolvedValue({ rows: [makeSessionRow()] }),
+      query: vi.fn().mockImplementation((sql: string) => {
+        if (sql.includes('to_regclass')) return Promise.resolve(schemaRows);
+        return Promise.resolve({ rows: [makeSessionRow()] });
+      }),
     } as any;
 
     const svc = new RalphRLMService(pool, TENANT);

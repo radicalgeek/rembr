@@ -39,8 +39,8 @@ function makePool(sessionRow?: { tenant_id: string; project_id: string | null; u
   };
 }
 
-function makeReq(headers: Record<string, string> = {}): any {
-  return { headers };
+function makeReq(headers: Record<string, string | string[]> = {}, rawHeaders?: string[]): any {
+  return { headers, rawHeaders };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -160,7 +160,7 @@ describe('authenticateRequest — OAuth Bearer', () => {
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.statusCode).toBe(401);
-      expect(result.error).toContain('Malformed Authorization header');
+      expect(result.error).toBe('Authentication failed');
     }
   });
 });
@@ -227,7 +227,7 @@ describe('authenticateRequest — session auth removed', () => {
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.statusCode).toBe(401);
-      expect(result.error).toContain('Session-based authentication was removed');
+      expect(result.error).toBe('Authentication failed');
     }
     // mcp_sessions must never be queried
     expect(pool.query).not.toHaveBeenCalled();
@@ -245,7 +245,7 @@ describe('authenticateRequest — no credentials', () => {
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.statusCode).toBe(401);
-      expect(result.error).toContain('No valid authentication credentials');
+      expect(result.error).toBe('Authentication failed');
     }
   });
 
@@ -260,10 +260,10 @@ describe('authenticateRequest — no credentials', () => {
 // Precedence tests
 // ─────────────────────────────────────────────────────────
 
-describe('authenticateRequest — credential precedence', () => {
+describe('authenticateRequest — credential ambiguity', () => {
   beforeEach(() => { vi.clearAllMocks(); });
 
-  it('prefers API key over Bearer token', async () => {
+  it('rejects simultaneous API key and Bearer mechanisms', async () => {
     vi.mocked(verifyApiKey).mockResolvedValue({ success: true, tenantId: TENANT_ID, apiKeyId: API_KEY_ID });
 
     const result = await authenticateRequest(
@@ -274,8 +274,28 @@ describe('authenticateRequest — credential precedence', () => {
       }),
     );
 
-    expect(result.success).toBe(true);
-    if (result.success) expect(result.authMethod).toBe('api_key');
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toBe('Authentication failed');
+    expect(verifyApiKey).not.toHaveBeenCalled();
+    expect(verifyOAuthToken).not.toHaveBeenCalled();
+  });
+
+  it('rejects array-valued and duplicate credential headers before verification', async () => {
+    const arrayResult = await authenticateRequest(
+      makePool() as any,
+      makeReq({ 'x-api-key': ['mb_live_one', 'mb_live_two'] }),
+    );
+    expect(arrayResult.success).toBe(false);
+
+    const duplicateResult = await authenticateRequest(
+      makePool() as any,
+      makeReq(
+        { authorization: 'Bearer token-one' },
+        ['Authorization', 'Bearer token-one', 'Authorization', 'Bearer token-two'],
+      ),
+    );
+    expect(duplicateResult.success).toBe(false);
+    expect(verifyApiKey).not.toHaveBeenCalled();
     expect(verifyOAuthToken).not.toHaveBeenCalled();
   });
 

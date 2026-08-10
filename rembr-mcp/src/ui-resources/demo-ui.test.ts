@@ -36,12 +36,13 @@ describe('renderDemoUI', () => {
     expect(html).toContain('active');
   });
 
-  it('should include interactive JavaScript', () => {
+  it('should remain static under the release CSP', () => {
     const html = renderDemoUI();
 
-    expect(html).toContain('handleDemoAction');
-    expect(html).toContain('toggleTheme');
-    expect(html).toContain('clickCount');
+    expect(html).not.toContain('handleDemoAction');
+    expect(html).not.toContain('toggleTheme');
+    expect(html).not.toContain('<script');
+    expect(html).toContain("script-src 'none'");
   });
 
   it('should escape HTML in user content', () => {

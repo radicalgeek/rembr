@@ -6,6 +6,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EnhancedSearchService, FilteredMemory, AdvancedFilter } from './enhanced-search.js';
 
 const TENANT = 'aaaaaaaa-0000-0000-0000-000000000039';
+const USER = 'bbbbbbbb-0000-0000-0000-000000000039';
+const PROJECT = 'cccccccc-0000-0000-0000-000000000039';
 
 function makeMemory(overrides: Partial<FilteredMemory> = {}): FilteredMemory {
   return {
@@ -23,9 +25,25 @@ function makeMemory(overrides: Partial<FilteredMemory> = {}): FilteredMemory {
 
 function makePool(rowsOrFn: Record<string, unknown>[] | ((sql: string) => Record<string, unknown>[]) = []) {
   const queryFn = typeof rowsOrFn === 'function' ? rowsOrFn : () => rowsOrFn;
-  return {
+  return transactional({
     query: vi.fn().mockImplementation((sql: string) => Promise.resolve({ rows: queryFn(sql), rowCount: queryFn(sql).length })),
-  } as any;
+  });
+}
+
+function transactional<T extends { query: ReturnType<typeof vi.fn> }>(pool: T): T & { connect: ReturnType<typeof vi.fn> } {
+  const client = {
+    query: vi.fn().mockImplementation((sql: string, params?: unknown[]) => {
+      if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK' || sql.includes("set_config('app.current_tenant'")) {
+        return Promise.resolve({ rows: [], rowCount: 0 });
+      }
+      if (sql.includes("to_regclass('public.saved_searches')")) {
+        return Promise.resolve({ rows: [{ table_name: 'saved_searches' }], rowCount: 1 });
+      }
+      return pool.query(sql, params);
+    }),
+    release: vi.fn(),
+  };
+  return Object.assign(pool, { connect: vi.fn().mockResolvedValue(client), _client: client });
 }
 
 // ─────────────────────────────────────────────────────────
@@ -67,6 +85,12 @@ describe('EnhancedSearchService — exportAsCSV', () => {
     expect(csv).toContain('"a, b, c"');
   });
 
+  it('neutralises spreadsheet formulas after leading whitespace or controls', () => {
+    const svc = new EnhancedSearchService(makePool(), TENANT);
+    const csv = svc.exportAsCSV([makeMemory({ content: ' \t=HYPERLINK("https://invalid.example")' })]);
+    expect(csv).toContain('"\' \t=HYPERLINK(""https://invalid.example"")"');
+  });
+
   it('handles empty items list', () => {
     const svc = new EnhancedSearchService(makePool(), TENANT);
     const csv = svc.exportAsCSV([]);
@@ -95,6 +119,12 @@ describe('EnhancedSearchService — exportAsMarkdown', () => {
     const svc = new EnhancedSearchService(makePool(), TENANT);
     const md = svc.exportAsMarkdown([]);
     expect(md).toContain('# Search Results');
+  });
+
+  it('keeps pipes and newlines inside a Markdown table cell', () => {
+    const svc = new EnhancedSearchService(makePool(), TENANT);
+    const md = svc.exportAsMarkdown([makeMemory({ category: 'first | second\nthird' })]);
+    expect(md).toContain('first \\| second<br>third');
   });
 });
 
@@ -132,7 +162,7 @@ describe('EnhancedSearchService — batchDelete safety', () => {
         .mockResolvedValueOnce({ rows: [{ total: '0' }] })   // count
         .mockResolvedValueOnce({ rows: [] }),                 // data
     } as any;
-    const svc = new EnhancedSearchService(pool, TENANT);
+    const svc = new EnhancedSearchService(transactional(pool), TENANT);
     const result = await svc.batchDelete({ category: 'nonexistent' });
     expect(result.affected).toBe(0);
     expect(result.ids).toHaveLength(0);
@@ -169,7 +199,7 @@ describe('EnhancedSearchService — saveSearch', () => {
       use_count: 0,
     };
     const pool = { query: vi.fn().mockResolvedValue({ rows: [fakeRow] }) } as any;
-    const svc = new EnhancedSearchService(pool, TENANT);
+    const svc = new EnhancedSearchService(transactional(pool), TENANT);
     const result = await svc.saveSearch('my-notes', { category: 'notes' }, 'All notes');
     expect(result.name).toBe('my-notes');
     expect(result.filter).toEqual({ category: 'notes' });
@@ -180,13 +210,13 @@ describe('EnhancedSearchService — saveSearch', () => {
 describe('EnhancedSearchService — deleteSavedSearch', () => {
   it('returns true when row deleted', async () => {
     const pool = { query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [] }) } as any;
-    const svc = new EnhancedSearchService(pool, TENANT);
+    const svc = new EnhancedSearchService(transactional(pool), TENANT);
     expect(await svc.deleteSavedSearch('my-notes')).toBe(true);
   });
 
   it('returns false when not found', async () => {
     const pool = { query: vi.fn().mockResolvedValue({ rowCount: 0, rows: [] }) } as any;
-    const svc = new EnhancedSearchService(pool, TENANT);
+    const svc = new EnhancedSearchService(transactional(pool), TENANT);
     expect(await svc.deleteSavedSearch('ghost')).toBe(false);
   });
 });
@@ -198,7 +228,7 @@ describe('EnhancedSearchService — executeSavedSearch', () => {
         .mockResolvedValueOnce({ rows: [], rowCount: 0 }) // ensure table
         .mockResolvedValueOnce({ rows: [], rowCount: 0 }), // UPDATE returns nothing
     } as any;
-    const svc = new EnhancedSearchService(pool, TENANT);
+    const svc = new EnhancedSearchService(transactional(pool), TENANT);
     await expect(svc.executeSavedSearch('ghost')).rejects.toThrow(/not found/i);
   });
 });
@@ -217,7 +247,7 @@ describe('EnhancedSearchService — filterMemories', () => {
           created_at: new Date('2026-02-01'), updated_at: new Date('2026-02-01'),
         }] }),
     } as any;
-    const svc = new EnhancedSearchService(pool, TENANT);
+    const svc = new EnhancedSearchService(transactional(pool), TENANT);
     const { items, total } = await svc.filterMemories({ category: 'notes' });
     expect(total).toBe(1);
     expect(items[0].content_length).toBe('Hello world'.length);
@@ -229,7 +259,7 @@ describe('EnhancedSearchService — filterMemories', () => {
         .mockResolvedValueOnce({ rows: [{ total: '0' }] })  // COUNT query
         .mockResolvedValueOnce({ rows: [] }),                // data query — empty, no rows to map
     } as any;
-    const svc = new EnhancedSearchService(pool, TENANT);
+    const svc = new EnhancedSearchService(transactional(pool), TENANT);
     const result = await svc.filterMemories({ limit: 9999 });
     // limit should be capped at 500
     expect(result.limit).toBe(500);
@@ -237,5 +267,87 @@ describe('EnhancedSearchService — filterMemories', () => {
     const calls = (pool.query as any).mock.calls;
     const dataCallParams = calls[1][1] as unknown[];
     expect(dataCallParams).toContain(500);
+  });
+
+  it('binds tenant, project, owner and personal-project membership on every read', async () => {
+    const pool = transactional({
+      query: vi.fn().mockImplementation((sql: string) => Promise.resolve({
+        rows: sql.includes('COUNT(*)') ? [{ total: '0' }] : [],
+        rowCount: 0,
+      })),
+    });
+    const svc = new EnhancedSearchService(pool as any, TENANT, PROJECT, USER, `user:${USER}`);
+    await svc.filterMemories({ metadata_filter: { source: 'security-review' } });
+
+    const [countSql, countParams] = pool.query.mock.calls.find(call => String(call[0]).includes('COUNT(*)'))!;
+    expect(countSql).toContain('m.tenant_id = $1');
+    expect(countSql).toContain('m.project_id = $2::uuid');
+    expect(countSql).toContain("m.visibility = 'personal'");
+    expect(countSql).toContain('project_members audience_member');
+    expect(countSql).toContain('m.metadata ->> $4 = $5');
+    expect(countParams).toEqual([TENANT, PROJECT, USER, 'source', 'security-review']);
+    expect(String(countSql)).not.toContain('security-review');
+  });
+
+  it('fails before SQL for unsafe metadata keys and invalid pagination', async () => {
+    const pool = transactional({ query: vi.fn() });
+    const svc = new EnhancedSearchService(pool as any, TENANT, undefined, USER);
+    await expect(svc.filterMemories({ metadata_filter: { "x' OR TRUE --": 'value' } }))
+      .rejects.toThrow(/Metadata filter keys/);
+    await expect(svc.filterMemories({ limit: -1 })).rejects.toThrow(/limit/);
+    expect(pool.query).not.toHaveBeenCalled();
+  });
+});
+
+describe('EnhancedSearchService — audience-safe mutations and saved searches', () => {
+  it('rechecks the same audience predicate in a batch delete', async () => {
+    const memoryId = 'dddddddd-0000-0000-0000-000000000039';
+    const pool = transactional({
+      query: vi.fn().mockImplementation((sql: string) => {
+        if (sql.includes('COUNT(*)')) return Promise.resolve({ rows: [{ total: '1' }], rowCount: 1 });
+        if (sql.includes('SELECT m.id')) return Promise.resolve({ rows: [{
+          id: memoryId,
+          content: 'private',
+          category: 'notes',
+          metadata: {},
+          pii_detected: false,
+          created_at: new Date(),
+          updated_at: new Date(),
+        }], rowCount: 1 });
+        if (sql.includes('DELETE FROM memories')) return Promise.resolve({ rows: [{ id: memoryId }], rowCount: 1 });
+        return Promise.resolve({ rows: [], rowCount: 0 });
+      }),
+    });
+    const svc = new EnhancedSearchService(pool as any, TENANT, PROJECT, USER);
+    const result = await svc.batchDelete({ category: 'notes' });
+    expect(result.ids).toEqual([memoryId]);
+    const deleteSql = String(pool.query.mock.calls.find(call => String(call[0]).includes('DELETE FROM memories'))?.[0]);
+    expect(deleteSql).toContain("m.visibility = 'personal'");
+    expect(deleteSql).toContain('project_members audience_member');
+    expect(deleteSql).toContain('m.project_id =');
+  });
+
+  it('keys saved searches by exact principal and project', async () => {
+    const row = {
+      id: 'eeeeeeee-0000-0000-0000-000000000039',
+      tenant_id: TENANT,
+      project_id: PROJECT,
+      user_id: USER,
+      owner_principal: `user:${USER}`,
+      name: 'security',
+      description: null,
+      filter: { category: 'notes' },
+      created_at: new Date(),
+      last_used_at: null,
+      use_count: 0,
+    };
+    const pool = transactional({ query: vi.fn().mockResolvedValue({ rows: [row], rowCount: 1 }) });
+    const svc = new EnhancedSearchService(pool as any, TENANT, PROJECT, USER, `user:${USER}`);
+    await svc.saveSearch('security', { category: 'notes' });
+    const insert = pool.query.mock.calls.find(call => String(call[0]).includes('INSERT INTO saved_searches'))!;
+    expect(insert[0]).toContain('owner_principal');
+    expect(insert[1]).toEqual([
+      TENANT, PROJECT, USER, `user:${USER}`, 'security', null, JSON.stringify({ category: 'notes' }),
+    ]);
   });
 });

@@ -111,6 +111,64 @@ CREATE INDEX IF NOT EXISTS idx_context_analytics_events_type ON context_analytic
 CREATE INDEX IF NOT EXISTS idx_context_analytics_events_created_at ON context_analytics_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_context_analytics_events_data ON context_analytics_events USING GIN (event_data);
 
+-- Temporal predicates are used by both the direct runtime queries and the
+-- legacy search function. Existing rows become valid from their creation.
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ;
+UPDATE memories SET valid_from = COALESCE(valid_from, created_at, NOW()) WHERE valid_from IS NULL;
+ALTER TABLE memories ALTER COLUMN valid_from SET DEFAULT NOW();
+ALTER TABLE memories ALTER COLUMN valid_from SET NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memories_temporal
+  ON memories (tenant_id, project_id, valid_from, valid_until);
+
+CREATE TABLE IF NOT EXISTS causal_relationships (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL,
+  project_id UUID,
+  cause_memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  effect_memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  causal_type VARCHAR(50) NOT NULL,
+  causal_strength DOUBLE PRECISION NOT NULL,
+  inferred_by VARCHAR(50) NOT NULL,
+  inference_model TEXT,
+  inference_prompt TEXT,
+  confidence_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+  validated_by_user BOOLEAN NOT NULL DEFAULT FALSE,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  valid_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  valid_until TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (cause_memory_id <> effect_memory_id),
+  CHECK (causal_strength >= 0 AND causal_strength <= 1),
+  CHECK (confidence_score >= 0 AND confidence_score <= 1)
+);
+CREATE INDEX IF NOT EXISTS idx_causal_relationships_tenant
+  ON causal_relationships (tenant_id, project_id, valid_until);
+CREATE INDEX IF NOT EXISTS idx_causal_relationships_cause
+  ON causal_relationships (cause_memory_id);
+CREATE INDEX IF NOT EXISTS idx_causal_relationships_effect
+  ON causal_relationships (effect_memory_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_causal_relationships_active_pair
+  ON causal_relationships (tenant_id, cause_memory_id, effect_memory_id)
+  WHERE valid_until IS NULL;
+
+CREATE TABLE IF NOT EXISTS temporal_snapshots (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL,
+  project_id UUID,
+  snapshot_name TEXT NOT NULL,
+  snapshot_time TIMESTAMPTZ NOT NULL,
+  total_memories INTEGER NOT NULL DEFAULT 0,
+  categories_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_by_user_id UUID,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_temporal_snapshots_tenant_time
+  ON temporal_snapshots (tenant_id, project_id, snapshot_time DESC);
+CREATE INDEX IF NOT EXISTS idx_temporal_snapshots_creator
+  ON temporal_snapshots (tenant_id, created_by_user_id);
+
 ALTER TABLE context_sessions ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS context_sessions_tenant_isolation ON context_sessions;
 CREATE POLICY context_sessions_tenant_isolation ON context_sessions
@@ -122,6 +180,20 @@ DROP POLICY IF EXISTS context_analytics_events_tenant_isolation ON context_analy
 CREATE POLICY context_analytics_events_tenant_isolation ON context_analytics_events
   USING (tenant_id::text = current_setting('app.current_tenant', true))
   WITH CHECK (tenant_id::text = current_setting('app.current_tenant', true));
+
+ALTER TABLE causal_relationships ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS causal_relationships_tenant_isolation ON causal_relationships;
+CREATE POLICY causal_relationships_tenant_isolation ON causal_relationships
+  USING (tenant_id::text = current_setting('app.current_tenant', true))
+  WITH CHECK (tenant_id::text = current_setting('app.current_tenant', true));
+ALTER TABLE causal_relationships FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE temporal_snapshots ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS temporal_snapshots_tenant_isolation ON temporal_snapshots;
+CREATE POLICY temporal_snapshots_tenant_isolation ON temporal_snapshots
+  USING (tenant_id::text = current_setting('app.current_tenant', true))
+  WITH CHECK (tenant_id::text = current_setting('app.current_tenant', true));
+ALTER TABLE temporal_snapshots FORCE ROW LEVEL SECURITY;
 
 CREATE OR REPLACE FUNCTION update_context_sessions_updated_at()
 RETURNS TRIGGER AS $$
@@ -184,7 +256,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON rlm_sessions TO rembr_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON rlm_iterations TO rembr_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON context_sessions TO rembr_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON context_analytics_events TO rembr_app;
-GRANT SELECT, INSERT, UPDATE ON causal_relationships TO rembr_app;
-GRANT SELECT, INSERT ON temporal_snapshots TO rembr_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON causal_relationships TO rembr_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON temporal_snapshots TO rembr_app;
 GRANT SELECT, INSERT ON audit_logs TO rembr_app;
 GRANT EXECUTE ON FUNCTION search_memories_at_time(UUID, vector(768), TIMESTAMPTZ, UUID, VARCHAR, INTEGER) TO rembr_app;

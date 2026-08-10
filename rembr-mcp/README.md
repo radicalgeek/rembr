@@ -17,29 +17,37 @@ Rembr solves this by providing:
 - **Semantic memory storage** - Store agent insights with automatic embeddings
 - **Sub-50ms retrieval** - Fast hybrid semantic + text search
 - **Cross-session persistence** - Knowledge compounds over time
-- **Self-evolving maintenance** - Optional background jobs can rewrite, supersede, archive, and prune stale memories
+- **Self-evolving maintenance** - Proposal-first background review with explicit opt-in for mutations
 - **MCP native** - Works with Claude Desktop, Cursor, Windsurf, and custom agents
 
 ## Quick Start
 
-### Installation
+### Start the self-hosted service
 
 ```bash
-npm install @rembr/mcp-server
+git clone https://github.com/radicalgeek/rembr.git
+cd rembr
+cp .env.example .env
+# Generate every required value in .env, then:
+docker compose --profile ollama up -d --build
 ```
+
+Follow [SELF-HOSTING.md](../SELF-HOSTING.md) to initialise the database and
+mint the first scoped API key.
 
 ### Configuration
 
-Add to your MCP client config (Claude Desktop, VS Code, etc.):
+Connect an MCP client to the Streamable HTTP endpoint. The exact field names
+vary by client; the equivalent generic configuration is:
 
 ```json
 {
   "mcpServers": {
     "rembr": {
-      "command": "npx",
-      "args": ["@rembr/mcp-server"],
-      "env": {
-        "REMBR_API_KEY": "your_api_key_here"
+      "type": "http",
+      "url": "http://127.0.0.1:3000/mcp",
+      "headers": {
+        "x-api-key": "your_api_key_here"
       }
     }
   }
@@ -161,7 +169,7 @@ YOUR CODEBASE
 - **Auto Relationship Detection** - LLM-powered graph building
 - **Context Workspaces** - Isolate memories by project
 - **Snapshot Support** - Freeze context for sub-agent handoff
-- **Multi-tenant** - Full tenant isolation with Row-Level Security
+- **Multi-tenant** - Explicit tenant, project and user authorisation with FORCE RLS on MCP-owned tables
 - **Fast** - Sub-50ms semantic search with HNSW indexing
 
 ### MCP Compatibility
@@ -184,11 +192,11 @@ Works with any Model Context Protocol client:
 
 2. **Database accessibility** - Check with:
    ```bash
-   kubectl logs -l app=rembr-mcp --tail=50
+   docker compose logs --tail=50 rembr-mcp
    ```
 
-3. **VS Code OAuth Bug** - VS Code sends redirect URIs as client_id
-   - See [../CRITICAL-VSCODE-OAUTH-FIX-2026-01-25.md](../CRITICAL-VSCODE-OAUTH-FIX-2026-01-25.md)
+3. **Self-hosted OAuth** - Keep `OAUTH_EXPECTED_AUDIENCE` equal to the exact
+   public origin plus `/mcp`; see [SELF-HOSTING.md](../SELF-HOSTING.md).
 
 ## Development
 
@@ -258,9 +266,10 @@ npm run dev
 DATABASE_URL=postgresql://user:pass@host:5432/dbname     # Or DB_HOST + DB_NAME + DB_USER + DB_PASSWORD
 JWT_SECRET=<openssl rand -base64 32>                      # Min 32 characters
 ADMIN_API_KEY=<openssl rand -hex 32>                      # RAD-45: Guards /admin/* endpoints (Header: X-Admin-Key)
+API_KEY_SECRET=<openssl rand -hex 32>                     # HMAC secret for newly issued API keys
 
 # Recommended
-METRICS_SECRET=<openssl rand -hex 32>                     # Guards /metrics endpoint (Bearer or X-Metrics-Token)
+METRICS_SECRET=<openssl rand -hex 32>                     # Required in production; guards /metrics
 
 # Optional
 OLLAMA_HOST=http://localhost:11434                        # Ollama embedding service
@@ -271,14 +280,14 @@ EMBEDDING_DIMENSIONS=768                                  # Vector dimensions
 TEXT_GENERATION_PROVIDER=openai-compatible                # Optional relationship/memory evolution LLM
 LM_STUDIO_BASE_URL=http://localhost:4000/v1               # OpenAI-compatible chat endpoint
 LM_STUDIO_MODEL=qwen3                                     # Provider-specific chat model
-MEMORY_EVOLUTION_APPLY_ENABLED=true                       # Let worker apply keep/rewrite/archive/supersede decisions
+MEMORY_EVOLUTION_APPLY_ENABLED=false                      # Proposal-only safe default
 PORT=3000                                                 # HTTP server port
 CORS_ORIGIN=http://localhost:8080                         # Allowed CORS origins (comma-separated)
 LOG_LEVEL=info                                            # Log verbosity
 NODE_ENV=production                                       # Environment (development|test|production)
 PUBLIC_URL=http://localhost:3000                          # Public-facing URL
 UI_BASE_URL=http://localhost:8080                         # UI/console URL
-ENABLE_OPTIMIZATION=true                                  # Auto-optimization scheduler (default: true)
+ENABLE_OPTIMIZATION=false                                 # Tenant-wide auto-mutation is disabled by default
 REDIS_HOST=localhost                                      # Redis host for caching
 REDIS_PORT=6379                                           # Redis port
 REDIS_PASSWORD=<secret>                                   # Redis password (if required)
@@ -317,7 +326,7 @@ curl http://localhost:3000/health
 curl -H "Authorization: Bearer $METRICS_SECRET" http://localhost:3000/metrics
 
 # Logs
-docker compose logs -f rembr-mcp rembr-maintenance-worker
+docker compose logs -f rembr-mcp
 ```
 
 
@@ -328,7 +337,8 @@ docker compose logs -f rembr-mcp rembr-maintenance-worker
 
 ## Database Schema
 
-The schema is initialized via `manifests/06-postgres-init-db.yaml`.
+The Compose bootstrap applies the base schema and versioned migrations before
+the non-owner MCP runtime starts.
 
 ### Core Tables
 
@@ -352,25 +362,22 @@ The schema is initialized via `manifests/06-postgres-init-db.yaml`.
 
 ### Row-Level Security
 
-All tables enforce tenant isolation via PostgreSQL RLS policies. Every query is automatically scoped by `tenant_id`.
+MCP-owned tenant tables use PostgreSQL FORCE RLS where the runtime contract can
+enforce it safely. Shared authentication, OAuth and plan tables remain protected
+by explicit tenant, project and user predicates verified by the bootstrap gate.
 
 ## Self-Hosting
 
 ### Requirements
-- PostgreSQL 16+ with pgvector extension
-- Ollama with nomic-embed-text model (or OpenAI API key)
-- Node.js 18+
-- Kubernetes cluster (or Docker Compose)
+- Docker with Compose v2
+- Node.js 24 for local development and bootstrap commands
 
 ### Quick Start
 
-```bash
-git clone https://github.com/radicalgeek/rembr.git
-cd rembr/rembr-mcp
-cp .env.example .env
-# Edit .env with your configuration
-./build-and-deploy.sh
-```
+Use the reviewed Docker Compose flow in
+[`SELF-HOSTING.md`](../SELF-HOSTING.md). It builds PostgreSQL + pgvector, applies
+the versioned schema and security migrations, starts the HTTP MCP server, and
+mints the first scoped credential without writing plaintext keys to Git.
 
 ## Performance
 
@@ -397,7 +404,7 @@ Designed for 1M+ memories per tenant with horizontal scaling via read replicas.
 ## Related Documentation
 
 - [Repository Overview](../README.md) - Full stack architecture
-- [Web Dashboard](../rembr-ui/README.md) - UI implementation
+- [Self-hosting guide](../SELF-HOSTING.md) - Hardened engine and console stack
 - [MCP Tools Reference](../docs/MCP-TOOLS-REFERENCE.md) - Complete API docs
 - [RLM Patterns](../docs/rlm-patterns.md) - Implementation patterns
 
@@ -410,7 +417,7 @@ Rembr implements the Recursive Language Model pattern from:
 
 ## License
 
-ISC License - See LICENSE file for details.
+MIT License - See [LICENSE](../LICENSE) for details.
 
 ---
 

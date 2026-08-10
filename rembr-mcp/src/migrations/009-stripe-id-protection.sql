@@ -15,7 +15,7 @@
 -- ----------------------------------------------------------
 -- The `rembr-ui` service encrypts/decrypts `stripe_customer_id` at the
 -- application layer using AES-256-ECB with `STRIPE_ENCRYPTION_KEY`
--- (see migration 005 and rembr-ui/src/lib/crypto.ts).
+-- (see migration 005 and the application-layer encryption implementation).
 --
 -- This migration adds DB-level safety rails:
 -- 1. A CHECK constraint that rejects plaintext Stripe customer IDs
@@ -25,7 +25,7 @@
 -- 3. A monitoring function to detect any remaining plaintext values.
 --
 -- IMPORTANT: Run application-layer encryption migration FIRST (migration 005 /
--- the Node.js script in rembr-ui/scripts/migrate-stripe-encryption.ts).
+-- the reviewed application-layer Stripe encryption migration).
 -- This migration will fail on any row that still contains a plaintext `cus_`
 -- value in `stripe_customer_id`.
 -- =============================================================================
@@ -46,23 +46,32 @@ BEGIN
   IF plaintext_count > 0 THEN
     RAISE EXCEPTION
       'Migration 008 blocked: % tenant(s) have plaintext stripe_customer_id values (matching cus_*). '
-      'Run the encryption migration script first: rembr-ui/scripts/migrate-stripe-encryption.ts',
+      'Run the application-layer Stripe encryption migration first',
       plaintext_count;
   END IF;
 END $$;
 
 -- 2. Add CHECK constraint to reject future plaintext Stripe customer IDs.
-ALTER TABLE tenants
-  ADD CONSTRAINT chk_stripe_customer_id_not_plaintext
-  CHECK (
-    stripe_customer_id IS NULL
-    OR stripe_customer_id NOT LIKE 'cus_%'
-  );
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'chk_stripe_customer_id_not_plaintext'
+      AND conrelid = 'tenants'::regclass
+  ) THEN
+    ALTER TABLE tenants
+      ADD CONSTRAINT chk_stripe_customer_id_not_plaintext
+      CHECK (
+        stripe_customer_id IS NULL
+        OR stripe_customer_id NOT LIKE 'cus_%'
+      );
+  END IF;
+END $$;
 
 COMMENT ON CONSTRAINT chk_stripe_customer_id_not_plaintext ON tenants IS
   'Prevents plaintext Stripe customer IDs (cus_xxx format) from being stored. '
   'Values must be encrypted at the application layer before DB write. '
-  'See rembr-ui/src/lib/crypto.ts — encryptStripeCustomerId().';
+  'Encrypted by the application layer before storage.';
 
 -- 3. Audit trigger: log any attempt to write a plaintext Stripe customer ID.
 --    This fires BEFORE the CHECK constraint so we get a detailed audit trail.
@@ -103,7 +112,6 @@ COMMENT ON FUNCTION check_stripe_customer_id_encryption() IS
 COMMENT ON COLUMN tenants.stripe_customer_id IS
   'AES-256-ECB encrypted Stripe customer ID. '
   'Plaintext format: cus_xxxxxxxxxxxx. '
-  'Encrypted by rembr-ui/src/lib/crypto.ts:encryptStripeCustomerId(). '
-  'Decrypted on read by rembr-ui/src/lib/crypto.ts:decryptStripeCustomerId(). '
+  'Encrypted and decrypted by the application layer. '
   'STRIPE_ENCRYPTION_KEY env var required. '
   'REM-247: plaintext writes rejected by chk_stripe_customer_id_not_plaintext constraint.';

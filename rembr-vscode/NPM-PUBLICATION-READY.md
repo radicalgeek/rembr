@@ -52,7 +52,7 @@ npm whoami
 ### 2. Dry Run (Recommended)
 
 ```bash
-cd /Users/mark/memberberry/rembr-client
+cd /path/to/rembr/rembr-client
 npm publish --dry-run
 ```
 
@@ -61,7 +61,7 @@ Review output for any warnings or errors.
 ### 3. Publish to npm
 
 ```bash
-cd /Users/mark/memberberry/rembr-client
+cd /path/to/rembr/rembr-client
 npm publish --access public
 ```
 
@@ -97,7 +97,7 @@ npx rembr setup
 
 1. **Git Tag Release**
    ```bash
-   cd /Users/mark/rembr
+   cd /path/to/rembr
    git add rembr-client/
    git commit -m "RELEASE: @rembr/client v1.0.0 - npm publication"
    git tag rembr-client-v1.0.0
@@ -276,7 +276,7 @@ npx rembr setup
 
 **Command**:
 ```bash
-cd /Users/mark/memberberry/rembr-client
+cd /path/to/rembr/rembr-client
 npm publish --access public
 ```
 

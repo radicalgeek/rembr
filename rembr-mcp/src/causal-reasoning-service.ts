@@ -84,22 +84,34 @@ export class CausalReasoningService {
     tenantId: string,
     causeMemoryId: string,
     effectMemoryId: string,
-    projectId?: string
+    projectId?: string,
+    userId?: string,
   ): Promise<CausalLink | null> {
     // 1. Fetch both memories
     const memoriesQuery = `
-      SELECT id, content, created_at, category 
-      FROM memories 
-      WHERE id = ANY($1::uuid[]) 
-        AND tenant_id = $2
-        AND ($3::uuid IS NULL OR project_id = $3)
+      SELECT m.id, m.content, m.created_at, m.category, m.project_id
+      FROM memories m
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+      WHERE m.id = ANY($1::uuid[])
+        AND m.tenant_id = $2
+        AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+          OR (
+            COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+            AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $4::uuid
+                 OR EXISTS (SELECT 1 FROM project_members pm
+                            WHERE pm.project_id = p.id AND pm.user_id = $4::uuid))
+          )
+        )
     `;
     
     const result = await this.withTenantContext(tenantId, projectId, (client) =>
       client.query(memoriesQuery, [
         [causeMemoryId, effectMemoryId],
         tenantId,
-        projectId
+        projectId || null,
+        userId || null,
       ])
     );
 
@@ -111,6 +123,11 @@ export class CausalReasoningService {
       a.id === causeMemoryId ? -1 : 1
     );
 
+    if ((cause.project_id || null) !== (effect.project_id || null)) {
+      return null;
+    }
+    const relationshipProjectId = projectId || cause.project_id || null;
+
     // 2. Check temporal ordering (cause must precede effect)
     if (new Date(cause.created_at) > new Date(effect.created_at)) {
       console.log('Causality violation: cause is after effect');
@@ -119,14 +136,16 @@ export class CausalReasoningService {
 
     // 3. Check if relationship already exists
     const existingQuery = `
-      SELECT id FROM causal_relationships
+      SELECT * FROM causal_relationships
       WHERE cause_memory_id = $1 
         AND effect_memory_id = $2
         AND tenant_id = $3
         AND (valid_until IS NULL OR valid_until > NOW())
     `;
     
-    const existing = await this.db.query(existingQuery, [causeMemoryId, effectMemoryId, tenantId]);
+    const existing = await this.withTenantContext(tenantId, relationshipProjectId || undefined, client =>
+      client.query(existingQuery, [causeMemoryId, effectMemoryId, tenantId])
+    );
     if (existing.rows.length > 0) {
       console.log('Causal relationship already exists');
       return existing.rows[0];
@@ -158,7 +177,11 @@ Respond ONLY with valid JSON (no markdown):
 }`;
 
     try {
-      const response = await this.ollama.generateText(prompt, 'You are a causal reasoning expert. Analyze relationships between statements and respond ONLY with valid JSON.');
+      const response = await this.ollama.generateText(
+        prompt,
+        'You are a causal reasoning expert. Analyze relationships between statements and respond ONLY with valid JSON.',
+        { tenantId },
+      );
       
       // Clean up response (remove markdown code blocks if present)
       const cleanResponse = response.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
@@ -183,23 +206,25 @@ Respond ONLY with valid JSON (no markdown):
         RETURNING *
       `;
 
-      const insertResult = await this.db.query(insertQuery, [
-        tenantId,
-        projectId,
-        causeMemoryId,
-        effectMemoryId,
-        analysis.causal_type,
-        analysis.strength,
-        'llm',
-        'llama3.1:8b',
-        prompt,
-        analysis.strength,
-        JSON.stringify({ 
-          explanation: analysis.explanation,
-          cause_category: cause.category,
-          effect_category: effect.category
-        })
-      ]);
+      const insertResult = await this.withTenantContext(tenantId, relationshipProjectId || undefined, client =>
+        client.query(insertQuery, [
+          tenantId,
+          relationshipProjectId,
+          causeMemoryId,
+          effectMemoryId,
+          analysis.causal_type,
+          analysis.strength,
+          'llm',
+          'llama3.1:8b',
+          prompt,
+          analysis.strength,
+          JSON.stringify({
+            explanation: analysis.explanation,
+            cause_category: cause.category,
+            effect_category: effect.category
+          })
+        ])
+      );
 
       console.log(`Created causal link: ${analysis.causal_type} (strength: ${analysis.strength})`);
       return insertResult.rows[0];
@@ -215,24 +240,26 @@ Respond ONLY with valid JSON (no markdown):
           RETURNING *
         `;
 
-        const insertResult = await this.db.query(insertQuery, [
-          tenantId,
-          projectId,
-          causeMemoryId,
-          effectMemoryId,
-          explicitFallback.causal_type,
-          explicitFallback.strength,
-          'system',
-          'explicit-causal-marker',
-          'Explicit Cause:/Effect: markers detected after LLM inference failed',
-          explicitFallback.strength,
-          JSON.stringify({
-            explanation: explicitFallback.explanation,
-            fallback: true,
-            cause_category: cause.category,
-            effect_category: effect.category
-          })
-        ]);
+        const insertResult = await this.withTenantContext(tenantId, relationshipProjectId || undefined, client =>
+          client.query(insertQuery, [
+            tenantId,
+            relationshipProjectId,
+            causeMemoryId,
+            effectMemoryId,
+            explicitFallback.causal_type,
+            explicitFallback.strength,
+            'system',
+            'explicit-causal-marker',
+            'Explicit Cause:/Effect: markers detected after LLM inference failed',
+            explicitFallback.strength,
+            JSON.stringify({
+              explanation: explicitFallback.explanation,
+              fallback: true,
+              cause_category: cause.category,
+              effect_category: effect.category
+            })
+          ])
+        );
 
         return insertResult.rows[0];
       }
@@ -267,7 +294,8 @@ Respond ONLY with valid JSON (no markdown):
     memoryId: string,
     direction: 'causes' | 'caused_by' = 'causes',
     maxDepth: number = 5,
-    projectId?: string
+    projectId?: string,
+    userId?: string,
   ): Promise<CausalChain> {
     const chain: CausalChain = {
       root: memoryId,
@@ -277,9 +305,38 @@ Respond ONLY with valid JSON (no markdown):
       total_links: 0
     };
 
-    await this.withTenantContext(tenantId, projectId, (client) =>
-      this._traceRecursive(client, tenantId, memoryId, direction, maxDepth, 0, chain, new Set([memoryId]), projectId)
-    );
+    await this.withTenantContext(tenantId, projectId, async (client) => {
+      const root = await client.query(
+        `SELECT 1
+         FROM memories m
+         LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+         WHERE m.id = $1 AND m.tenant_id = $2
+           AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+           AND (
+             (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+             OR (
+               COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+               AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $4::uuid
+                    OR EXISTS (SELECT 1 FROM project_members pm
+                               WHERE pm.project_id = p.id AND pm.user_id = $4::uuid))
+             )
+           )`,
+        [memoryId, tenantId, projectId || null, userId || null],
+      );
+      if (root.rows.length === 0) return;
+      await this._traceRecursive(
+        client,
+        tenantId,
+        memoryId,
+        direction,
+        maxDepth,
+        0,
+        chain,
+        new Set([memoryId]),
+        projectId,
+        userId,
+      );
+    });
     
     return chain;
   }
@@ -293,7 +350,8 @@ Respond ONLY with valid JSON (no markdown):
     currentDepth: number,
     chain: CausalChain,
     visited: Set<string>,
-    projectId?: string
+    projectId?: string,
+    userId?: string,
   ): Promise<void> {
     if (currentDepth >= maxDepth) return;
 
@@ -307,15 +365,27 @@ Respond ONLY with valid JSON (no markdown):
         m.category as target_category
       FROM causal_relationships cr
       JOIN memories m ON m.id = cr.${targetColumn}
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
       WHERE cr.${column} = $1
         AND cr.tenant_id = $2
         AND ($3::uuid IS NULL OR cr.project_id = $3)
+        AND m.tenant_id = $2
+        AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+          OR (
+            COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+            AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $4::uuid
+                 OR EXISTS (SELECT 1 FROM project_members pm
+                            WHERE pm.project_id = p.id AND pm.user_id = $4::uuid))
+          )
+        )
         AND (cr.valid_until IS NULL OR cr.valid_until > NOW())
       ORDER BY cr.causal_strength DESC
       LIMIT 10
     `;
 
-    const result = await client.query(query, [memoryId, tenantId, projectId]);
+    const result = await client.query(query, [memoryId, tenantId, projectId || null, userId || null]);
 
     for (const row of result.rows) {
       const targetId = row[targetColumn];
@@ -346,7 +416,8 @@ Respond ONLY with valid JSON (no markdown):
         currentDepth + 1,
         chain,
         visited,
-        projectId
+        projectId,
+        userId,
       );
     }
   }
@@ -357,18 +428,29 @@ Respond ONLY with valid JSON (no markdown):
   async findCausalCandidates(
     tenantId: string,
     batchSize: number = 50,
-    projectId?: string
+    projectId?: string,
+    userId?: string,
   ): Promise<MemoryPair[]> {
     // Strategy: Find temporally ordered pairs with semantic similarity
     const query = `
       WITH recent_memories AS (
-        SELECT id, content, embedding, created_at, category
-        FROM memories
-        WHERE tenant_id = $1
-          AND ($2::uuid IS NULL OR project_id = $2)
-          AND created_at > NOW() - INTERVAL '30 days'
-          AND embedding IS NOT NULL
-        ORDER BY created_at DESC
+        SELECT m.id, m.content, m.embedding, m.created_at, m.category
+        FROM memories m
+        LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+        WHERE m.tenant_id = $1
+          AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+          AND (
+            (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+            OR (
+              COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+              AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $4::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p.id AND pm.user_id = $4::uuid))
+            )
+          )
+          AND m.created_at > NOW() - INTERVAL '30 days'
+          AND m.embedding IS NOT NULL
+        ORDER BY m.created_at DESC
         LIMIT 200
       )
       SELECT 
@@ -392,7 +474,9 @@ Respond ONLY with valid JSON (no markdown):
       LIMIT $3
     `;
 
-    const result = await this.db.query(query, [tenantId, projectId, batchSize]);
+    const result = await this.withTenantContext(tenantId, projectId, (client) =>
+      client.query(query, [tenantId, projectId || null, batchSize, userId || null])
+    );
     return result.rows;
   }
 
@@ -403,7 +487,8 @@ Respond ONLY with valid JSON (no markdown):
     tenantId: string,
     linkId: string,
     isValid: boolean,
-    projectId?: string
+    projectId?: string,
+    userId?: string,
   ): Promise<void> {
     const query = `
       UPDATE causal_relationships
@@ -411,10 +496,29 @@ Respond ONLY with valid JSON (no markdown):
           confidence_score = CASE WHEN $2 THEN 0.95 ELSE 0.30 END,
           updated_at = NOW()
       WHERE id = $1 AND tenant_id = $3
-      RETURNING *
+        AND ($4::uuid IS NULL OR project_id = $4::uuid)
+        AND 2 = (
+          SELECT COUNT(*)
+          FROM memories m
+          LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+          WHERE m.id IN (causal_relationships.cause_memory_id, causal_relationships.effect_memory_id)
+            AND m.tenant_id = $3
+            AND ($4::uuid IS NULL OR m.project_id = $4::uuid)
+            AND (
+              (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $5::uuid)
+              OR (
+                COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+                AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $5::uuid
+                     OR EXISTS (SELECT 1 FROM project_members pm
+                                WHERE pm.project_id = p.id AND pm.user_id = $5::uuid))
+              )
+            )
+        )
     `;
 
-    await this.db.query(query, [linkId, isValid, tenantId]);
+    await this.withTenantContext(tenantId, projectId, (client) =>
+      client.query(query, [linkId, isValid, tenantId, projectId || null, userId || null])
+    );
   }
 
   /**
@@ -424,7 +528,8 @@ Respond ONLY with valid JSON (no markdown):
     tenantId: string,
     memoryId: string,
     direction?: 'causes' | 'caused_by',
-    projectId?: string
+    projectId?: string,
+    userId?: string,
   ): Promise<CausalLink[]> {
     let query = `
       SELECT cr.*, 
@@ -433,12 +538,30 @@ Respond ONLY with valid JSON (no markdown):
       FROM causal_relationships cr
       JOIN memories m1 ON m1.id = cr.cause_memory_id
       JOIN memories m2 ON m2.id = cr.effect_memory_id
+      LEFT JOIN projects p1 ON p1.id = m1.project_id AND p1.tenant_id = m1.tenant_id
+      LEFT JOIN projects p2 ON p2.id = m2.project_id AND p2.tenant_id = m2.tenant_id
       WHERE cr.tenant_id = $1
         AND ($3::uuid IS NULL OR cr.project_id = $3)
+        AND m1.tenant_id = $1 AND m2.tenant_id = $1
+        AND ($3::uuid IS NULL OR (m1.project_id = $3::uuid AND m2.project_id = $3::uuid))
+        AND (
+          (COALESCE(m1.visibility, 'shared') = 'personal' AND m1.user_id = $4::uuid)
+          OR (COALESCE(m1.visibility, 'shared') IN ('shared', 'project')
+              AND (p1.id IS NULL OR p1.is_personal = false OR p1.owner_id = $4::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p1.id AND pm.user_id = $4::uuid)))
+        )
+        AND (
+          (COALESCE(m2.visibility, 'shared') = 'personal' AND m2.user_id = $4::uuid)
+          OR (COALESCE(m2.visibility, 'shared') IN ('shared', 'project')
+              AND (p2.id IS NULL OR p2.is_personal = false OR p2.owner_id = $4::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p2.id AND pm.user_id = $4::uuid)))
+        )
         AND (cr.valid_until IS NULL OR cr.valid_until > NOW())
     `;
 
-    const params: any[] = [tenantId, memoryId, projectId];
+    const params: any[] = [tenantId, memoryId, projectId || null, userId || null];
 
     if (direction === 'causes') {
       query += ` AND cr.cause_memory_id = $2`;
@@ -461,21 +584,41 @@ Respond ONLY with valid JSON (no markdown):
    */
   async deleteCausalLink(
     tenantId: string,
-    linkId: string
+    linkId: string,
+    projectId?: string,
+    userId?: string,
   ): Promise<void> {
     const query = `
       UPDATE causal_relationships
       SET valid_until = NOW()
       WHERE id = $1 AND tenant_id = $2
+        AND ($3::uuid IS NULL OR project_id = $3::uuid)
+        AND 2 = (
+          SELECT COUNT(*)
+          FROM memories m
+          LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+          WHERE m.id IN (causal_relationships.cause_memory_id, causal_relationships.effect_memory_id)
+            AND m.tenant_id = $2
+            AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+            AND (
+              (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+              OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+                  AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $4::uuid
+                       OR EXISTS (SELECT 1 FROM project_members pm
+                                  WHERE pm.project_id = p.id AND pm.user_id = $4::uuid)))
+            )
+        )
     `;
 
-    await this.db.query(query, [linkId, tenantId]);
+    await this.withTenantContext(tenantId, projectId, (client) =>
+      client.query(query, [linkId, tenantId, projectId || null, userId || null])
+    );
   }
 
   /**
    * Get statistics about causal relationships
    */
-  async getCausalStats(tenantId: string, projectId?: string): Promise<any> {
+  async getCausalStats(tenantId: string, projectId?: string, userId?: string): Promise<any> {
     const query = `
       SELECT 
         COUNT(*) as total_links,
@@ -484,14 +627,34 @@ Respond ONLY with valid JSON (no markdown):
         AVG(causal_strength) as avg_strength,
         causal_type,
         COUNT(*) as count_by_type
-      FROM causal_relationships
-      WHERE tenant_id = $1
-        AND ($2::uuid IS NULL OR project_id = $2)
-        AND (valid_until IS NULL OR valid_until > NOW())
-      GROUP BY causal_type
+      FROM causal_relationships cr
+      JOIN memories m1 ON m1.id = cr.cause_memory_id AND m1.tenant_id = cr.tenant_id
+      JOIN memories m2 ON m2.id = cr.effect_memory_id AND m2.tenant_id = cr.tenant_id
+      LEFT JOIN projects p1 ON p1.id = m1.project_id AND p1.tenant_id = m1.tenant_id
+      LEFT JOIN projects p2 ON p2.id = m2.project_id AND p2.tenant_id = m2.tenant_id
+      WHERE cr.tenant_id = $1
+        AND ($2::uuid IS NULL OR (cr.project_id = $2::uuid AND m1.project_id = $2::uuid AND m2.project_id = $2::uuid))
+        AND (
+          (COALESCE(m1.visibility, 'shared') = 'personal' AND m1.user_id = $3::uuid)
+          OR (COALESCE(m1.visibility, 'shared') IN ('shared', 'project')
+              AND (p1.id IS NULL OR p1.is_personal = false OR p1.owner_id = $3::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p1.id AND pm.user_id = $3::uuid)))
+        )
+        AND (
+          (COALESCE(m2.visibility, 'shared') = 'personal' AND m2.user_id = $3::uuid)
+          OR (COALESCE(m2.visibility, 'shared') IN ('shared', 'project')
+              AND (p2.id IS NULL OR p2.is_personal = false OR p2.owner_id = $3::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p2.id AND pm.user_id = $3::uuid)))
+        )
+        AND (cr.valid_until IS NULL OR cr.valid_until > NOW())
+      GROUP BY cr.causal_type
     `;
 
-    const result = await this.db.query(query, [tenantId, projectId]);
+    const result = await this.withTenantContext(tenantId, projectId, (client) =>
+      client.query(query, [tenantId, projectId || null, userId || null])
+    );
     
     return {
       total_links: result.rows.reduce((sum, r) => sum + parseInt(r.count_by_type), 0),

@@ -12,7 +12,6 @@ describe('QualityScorerService', () => {
 
   it('should calculate quality score for a tenant', async () => {
     mockDb.query
-      .mockResolvedValueOnce({ rows: [] }) // SET tenant
       .mockResolvedValueOnce({ rows: [{ // memory stats
         total_memories: '100',
         active_memories: '95',
@@ -40,7 +39,6 @@ describe('QualityScorerService', () => {
 
   it('should store quality metrics', async () => {
     mockDb.query
-      .mockResolvedValueOnce({ rows: [] }) // SET tenant
       .mockResolvedValueOnce({ rows: [{ id: 'metric-1' }] }); // INSERT
 
     const result = await service.storeMetrics({
@@ -68,7 +66,6 @@ describe('QualityScorerService', () => {
 
   it('should detect quality anomalies', async () => {
     mockDb.query
-      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({
         rows: [
           { memory_id: 'm1', overall_score: 0.2 },

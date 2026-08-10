@@ -17,7 +17,6 @@ describe('RelationshipMaintainerService', () => {
     const embedding = new Array(768).fill(0.5);
     
     mockDb.query
-      .mockResolvedValueOnce({ rows: [] }) // SET tenant
       .mockResolvedValueOnce({ // SELECT memories with low relationships
         rows: [
           { id: 'm1', content: 'A', category: 'facts', embedding, relationship_count: '0' },
@@ -39,7 +38,6 @@ describe('RelationshipMaintainerService', () => {
     }));
 
     mockDb.query
-      .mockResolvedValueOnce({ rows: [] }) // SET tenant
       .mockResolvedValueOnce({
         rows: [
           {
@@ -52,7 +50,7 @@ describe('RelationshipMaintainerService', () => {
           },
           {
             id: 'm2',
-            content: 'Production Rembr now uses the new OpenAI-compatible MCP endpoint.',
+            content: 'Production Rembr now uses the new LiteLLM-backed MCP endpoint.',
             category: 'facts',
             embedding,
             relationship_count: '0',
@@ -80,7 +78,6 @@ describe('RelationshipMaintainerService', () => {
     mockOllama.generateText = vi.fn().mockResolvedValue('not json');
 
     mockDb.query
-      .mockResolvedValueOnce({ rows: [] }) // SET tenant
       .mockResolvedValueOnce({
         rows: [
           { id: 'm1', content: 'A', category: 'facts', embedding, relationship_count: '0' },
@@ -100,7 +97,6 @@ describe('RelationshipMaintainerService', () => {
 
   it('should create relationships', async () => {
     mockDb.query
-      .mockResolvedValueOnce({ rows: [] }) // SET tenant
       .mockResolvedValueOnce({ rows: [{ id: 'r1' }] }); // INSERT
 
     const result = await service.createRelationships([{
@@ -116,7 +112,6 @@ describe('RelationshipMaintainerService', () => {
 
   it('should update relationship weights', async () => {
     mockDb.query
-      .mockResolvedValueOnce({ rows: [] }) // SET tenant
       .mockResolvedValueOnce({ rows: [], rowCount: 5 }); // UPDATE
 
     const result = await service.updateWeights('tenant-1');
@@ -125,7 +120,6 @@ describe('RelationshipMaintainerService', () => {
 
   it('should prune weak relationships', async () => {
     mockDb.query
-      .mockResolvedValueOnce({ rows: [] }) // SET tenant
       .mockResolvedValueOnce({ rows: [], rowCount: 3 }); // DELETE
 
     const result = await service.pruneWeak('tenant-1', 0.5);
@@ -134,7 +128,6 @@ describe('RelationshipMaintainerService', () => {
 
   it('should get relationship statistics', async () => {
     mockDb.query
-      .mockResolvedValueOnce({ rows: [] }) // SET tenant
       .mockResolvedValueOnce({ rows: [{ 
         total_relationships: '100',
         total_memories: '50',

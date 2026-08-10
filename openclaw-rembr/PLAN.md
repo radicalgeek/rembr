@@ -16,7 +16,7 @@ MCP server — plus a zero-code MCP-registry path for the rest of Rembr's tool s
 |---|---|
 | "98 MCP tools across 12 categories" | Live surface is ~18–20 **consolidated** tools (core server: `memory`, `search`, `stats`, `context`, `snapshot`). 83 legacy names (`store_memory`, …) route through for compat. New code targets the consolidated tools with `operation` params. |
 | Self-hosted via stdio (`node dist/index.js`) | **No stdio transport exists.** rembr-mcp is HTTP-only (stateless `POST /mcp`). Self-hosted instances also register as `streamable-http`, pointed at localhost; they need PostgreSQL + pgvector. |
-| Hosted at `https://mcp.rembr.ai/mcp` | Hosted endpoint is **`https://rembr.ai/mcp`** (prod ingress host is `rembr.ai`; test is `test.rembr.ai`). |
+| Hosted at `https://mcp.rembr.ai/mcp` | Hosted endpoint is **`https://rembr.ai/mcp`**. |
 | "MCP/REST API" | MCP only. No REST endpoints. |
 | `tenant` config knob | Tenancy is **bound to the credential**, not a request parameter. Project scoping = project-scoped API keys. |
 | Rembr needs batch ops, health endpoint, embedding pass-through | Top-N recall is one `search` call; `/health` exists; embeddings are **server-side** (pass-through neither exists nor is needed). All three "Rembr-side requirements" are already satisfied — open question 1 resolves to "Rembr owns embeddings". |

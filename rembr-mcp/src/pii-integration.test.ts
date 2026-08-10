@@ -67,6 +67,14 @@ describe('PII Integration (REM-50)', () => {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+    await migrationPool.query(`
+      CREATE TABLE IF NOT EXISTS project_members (
+        project_id UUID NOT NULL,
+        user_id UUID NOT NULL,
+        role VARCHAR(50) NOT NULL DEFAULT 'member',
+        PRIMARY KEY (project_id, user_id)
+      )
+    `);
     await ensureTenantsTable(migrationPool);
     await migrationPool.query(
       `INSERT INTO tenants (id, name, email) VALUES ($1, 'PII Test Tenant', 'pii-test@test.local')

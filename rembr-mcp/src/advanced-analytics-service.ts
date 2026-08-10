@@ -45,6 +45,10 @@ export interface ContextGraph {
   edges: GraphEdge[];
   clusters: GraphCluster[];
   metrics: GraphMetrics;
+  truncated: boolean;
+  returned_count: number;
+  total_count: number;
+  continuation?: string;
 }
 
 export interface GraphNode {
@@ -111,6 +115,10 @@ export interface PredictiveAnalytics {
 }
 
 export class AdvancedAnalyticsService {
+  private static readonly GRAPH_MAX_NODES = 100;
+  private static readonly GRAPH_MAX_EDGES = 500;
+  private static readonly GRAPH_NEIGHBOURS_PER_NODE = 5;
+  private static readonly GRAPH_CONTENT_CHARS = 2_048;
   private database: MemoryDatabase;
   private embeddingProvider?: EmbeddingProvider;
   private ollamaClient: OllamaClient;
@@ -187,12 +195,19 @@ export class AdvancedAnalyticsService {
   async detectContradictions(
     tenantId: string,
     contextId?: string,
-    minConfidence: number = 0.7
+    minConfidence: number = 0.7,
+    projectId?: string,
+    userId?: string,
   ): Promise<ContradictionResult[]> {
     console.log('🔍 Starting hybrid contradiction detection...');
     
     // Get memories to analyze
-    const memories = await this.getMemoriesForAnalysis(tenantId, contextId);
+    const memories = await this.getMemoriesForAnalysis(
+      tenantId,
+      contextId,
+      projectId,
+      userId,
+    );
     const contradictions: ContradictionResult[] = [];
 
     // PERFORMANCE FIX: Limit analysis to prevent O(n²) hangs
@@ -211,10 +226,10 @@ export class AdvancedAnalyticsService {
       
       for (const memory of memoriesToAnalyze) {
         try {
-          const embedding = await this.embeddingProvider.generateEmbedding(memory.content);
+          const embedding = await this.embeddingProvider.generateEmbedding(memory.content, { tenantId });
           embeddingsMap.set(memory.id, embedding);
         } catch (err) {
-          console.warn(`Failed to get embedding for memory ${memory.id}:`, err);
+          console.warn('Failed to obtain an embedding during contradiction analysis');
         }
       }
       
@@ -263,7 +278,7 @@ export class AdvancedAnalyticsService {
         }
 
         if (!contradiction) {
-          const llmResult = await this.analyzeContradictionWithLLM(pair.memoryA, pair.memoryB);
+          const llmResult = await this.analyzeContradictionWithLLM(pair.memoryA, pair.memoryB, tenantId);
 
           if (llmResult && llmResult.isContradiction && llmResult.confidence >= minConfidence) {
             contradiction = {
@@ -311,7 +326,7 @@ export class AdvancedAnalyticsService {
               ],
               tenantId
             );
-            console.log(`💾 Stored contradiction: ${pair.memoryA.id} <-> ${pair.memoryB.id}`);
+            if (process.env.NODE_ENV !== 'production') console.log('Stored contradiction relationship');
           } catch (err) {
             console.error('Failed to store contradiction relationship:', err);
           }
@@ -361,7 +376,7 @@ export class AdvancedAnalyticsService {
   /**
    * Use LLM (llama3.1:8b) to analyze if two memories contradict each other
    */
-  private async analyzeContradictionWithLLM(memoryA: any, memoryB: any): Promise<{
+  private async analyzeContradictionWithLLM(memoryA: any, memoryB: any, tenantId: string): Promise<{
     isContradiction: boolean;
     type: 'factual' | 'temporal' | 'logical' | 'preference';
     confidence: number;
@@ -421,7 +436,8 @@ Do these statements contradict each other? Analyze carefully.`;
 
       const generatePromise = this.ollamaClient.generateText(prompt, systemPrompt, {
         temperature: 0.1, // Low temperature for consistent analysis
-        maxTokens: 300
+        maxTokens: 300,
+        tenantId,
       });
 
       const response = await Promise.race([generatePromise, timeoutPromise]);
@@ -429,7 +445,7 @@ Do these statements contradict each other? Analyze carefully.`;
       // Parse JSON response
       const jsonMatch = response.match(/\{[\s\S]*\}/);
       if (!jsonMatch) {
-        console.warn('LLM response was not valid JSON:', response);
+        console.warn('Contradiction model returned invalid JSON');
         return null;
       }
       
@@ -484,7 +500,7 @@ Do these statements contradict each other? Analyze carefully.`;
     tenantId: string,
     minConfidence: number = 0.7
   ): Promise<ContradictionResult[]> {
-    console.log(`🔍 Checking new memory ${memoryId} for contradictions...`);
+    if (process.env.NODE_ENV !== 'production') console.log('Checking a new memory for contradictions');
     
     const contradictions: ContradictionResult[] = [];
     
@@ -494,39 +510,65 @@ Do these statements contradict each other? Analyze carefully.`;
     }
 
     try {
+      // Derive the comparison scope from the stored source record. Callers do
+      // not get to widen it by supplying a different project or user.
+      const newMemoryResult = await this.database.query(
+        `SELECT m.*
+         FROM memories m
+         WHERE m.id = $1 AND m.tenant_id = $2`,
+        [memoryId, tenantId],
+        tenantId,
+      );
+      const newMemory = newMemoryResult.rows[0];
+
+      if (!newMemory) {
+        console.warn('Contradiction source memory was not found');
+        return contradictions;
+      }
+
       // Generate embedding for the new memory
-      const newEmbedding = await this.embeddingProvider.generateEmbedding(memoryContent);
+      const newEmbedding = await this.embeddingProvider.generateEmbedding(newMemory.content || memoryContent, { tenantId });
       
       // Find similar memories using pgvector (similarity > 0.5 for nomic-embed-text)
       // 0.7 was too aggressive for local embedding models
       // RAD-62: Cap at CONTRADICTION_MAX_CANDIDATES (default 5) to limit total LLM calls
       const similarResult = await this.database.query(
-        `SELECT m.id, m.content, m.category, m.created_at, 
+        `SELECT m.id, m.content, m.category, m.created_at,
                 1 - (me.embedding <=> $1::vector) as similarity
          FROM memories m
          JOIN memory_embeddings me ON m.id = me.memory_id
+         LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
          WHERE m.tenant_id = $2 
            AND m.id != $3
+           AND m.project_id IS NOT DISTINCT FROM $4::uuid
+           AND (
+             ($5::text = 'personal'
+               AND COALESCE(m.visibility, 'shared') = 'personal'
+               AND m.user_id = $6::uuid)
+             OR (
+               COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+               AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $6::uuid
+                    OR EXISTS (SELECT 1 FROM project_members pm
+                               WHERE pm.project_id = p.id AND pm.user_id = $6::uuid))
+             )
+           )
            AND 1 - (me.embedding <=> $1::vector) > 0.5
          ORDER BY similarity DESC
-         LIMIT $4`,
-        [`[${newEmbedding.join(',')}]`, tenantId, memoryId, this.CONTRADICTION_MAX_CANDIDATES]
+         LIMIT $7`,
+        [
+          `[${newEmbedding.join(',')}]`,
+          tenantId,
+          memoryId,
+          newMemory.project_id || null,
+          newMemory.visibility || 'shared',
+          newMemory.user_id || null,
+          this.CONTRADICTION_MAX_CANDIDATES,
+        ],
+        tenantId,
       );
       
       const candidateMemories = similarResult.rows;
       console.log(`🎯 Found ${candidateMemories.length} similar memories to check (max: ${this.CONTRADICTION_MAX_CANDIDATES})`);
-      
-      // Get the new memory's full record
-      const newMemoryResult = await this.database.query(
-        'SELECT * FROM memories WHERE id = $1 AND tenant_id = $2',
-        [memoryId, tenantId]
-      );
-      const newMemory = newMemoryResult.rows[0];
-      
-      if (!newMemory) {
-        console.warn(`Memory ${memoryId} not found`);
-        return contradictions;
-      }
       
       // Analyze each candidate with deterministic patterns first, then LLM.
       for (const candidate of candidateMemories) {
@@ -539,7 +581,7 @@ Do these statements contradict each other? Analyze carefully.`;
           }
 
           if (!contradiction) {
-            const llmResult = await this.analyzeContradictionWithLLM(newMemory, candidate);
+            const llmResult = await this.analyzeContradictionWithLLM(newMemory, candidate, tenantId);
 
             if (llmResult && llmResult.isContradiction && llmResult.confidence >= minConfidence) {
               contradiction = {
@@ -596,15 +638,15 @@ Do these statements contradict each other? Analyze carefully.`;
                 ],
                 tenantId
               );
-              console.log(`💾 Stored contradiction: ${newMemory.id} <-> ${candidate.id}`);
+              if (process.env.NODE_ENV !== 'production') console.log('Stored contradiction relationship');
             } else {
-              console.log(`⏭️  Skipping duplicate contradiction: ${newMemory.id} <-> ${candidate.id}`);
+              if (process.env.NODE_ENV !== 'production') console.log('Skipped duplicate contradiction relationship');
             }
-            console.log(`💾 Stored contradiction: ${newMemory.id} <-> ${candidate.id}`);
+            if (process.env.NODE_ENV !== 'production') console.log('Stored contradiction relationship');
           }
         } catch (err) {
           // RAD-62: Per-candidate fallback — if LLM fails, try pattern-based detection
-          console.warn(`LLM analysis failed for candidate ${candidate.id}, falling back to pattern analysis:`, (err as Error)?.message);
+          console.warn('Contradiction model analysis failed; using pattern analysis');
           try {
             const patternResult = await this.analyzeContradiction(newMemory, candidate);
             if (patternResult && patternResult.confidence >= minConfidence) {
@@ -625,12 +667,12 @@ Do these statements contradict each other? Analyze carefully.`;
               );
             }
           } catch (patternErr) {
-            console.error(`Pattern analysis also failed for candidate ${candidate.id}:`, patternErr);
+            console.error('Pattern contradiction analysis failed');
           }
         }
       }
       
-      console.log(`✅ Detected ${contradictions.length} contradictions for memory ${memoryId}`);
+      if (process.env.NODE_ENV !== 'production') console.log(`Detected ${contradictions.length} contradictions`);
       return contradictions;
       
     } catch (err) {
@@ -645,12 +687,34 @@ Do these statements contradict each other? Analyze carefully.`;
   async generateContextGraph(
     tenantId: string,
     contextId?: string,
-    includeRelationships: boolean = true
+    includeRelationships: boolean = true,
+    projectId?: string,
+    userId?: string,
   ): Promise<ContextGraph> {
-    const memories = await this.getMemoriesForAnalysis(tenantId, contextId);
+    const memories = await this.getMemoriesForAnalysis(
+      tenantId,
+      contextId,
+      projectId,
+      userId,
+      AdvancedAnalyticsService.GRAPH_MAX_NODES,
+      AdvancedAnalyticsService.GRAPH_CONTENT_CHARS,
+    );
+    const totalCount = Number(memories[0]?.total_count || memories.length);
+    const boundedMemories = memories.slice(0, AdvancedAnalyticsService.GRAPH_MAX_NODES).map(memory => {
+      const content = String(memory.content || '').slice(0, AdvancedAnalyticsService.GRAPH_CONTENT_CHARS);
+      let metadata: Record<string, any> = {};
+      try {
+        if (Buffer.byteLength(JSON.stringify(memory.metadata || {}), 'utf8') <= 8_192) {
+          metadata = memory.metadata || {};
+        }
+      } catch {
+        metadata = {};
+      }
+      return { ...memory, content, metadata };
+    });
     
     // Create nodes
-    const nodes: GraphNode[] = memories.map(memory => ({
+    const nodes: GraphNode[] = boundedMemories.map(memory => ({
       id: memory.id,
       label: this.generateNodeLabel(memory.content),
       content: memory.content,
@@ -665,9 +729,13 @@ Do these statements contradict each other? Analyze carefully.`;
     const edges: GraphEdge[] = [];
     
     if (includeRelationships && this.embeddingProvider) {
-      for (let i = 0; i < memories.length; i++) {
-        for (let j = i + 1; j < memories.length; j++) {
-          const edge = await this.calculateMemoryEdge(memories[i], memories[j]);
+      for (let i = 0; i < boundedMemories.length && edges.length < AdvancedAnalyticsService.GRAPH_MAX_EDGES; i++) {
+        const neighbourLimit = Math.min(
+          boundedMemories.length,
+          i + 1 + AdvancedAnalyticsService.GRAPH_NEIGHBOURS_PER_NODE,
+        );
+        for (let j = i + 1; j < neighbourLimit && edges.length < AdvancedAnalyticsService.GRAPH_MAX_EDGES; j++) {
+          const edge = await this.calculateMemoryEdge(boundedMemories[i], boundedMemories[j]);
           if (edge) {
             edges.push(edge);
           }
@@ -685,7 +753,13 @@ Do these statements contradict each other? Analyze carefully.`;
       nodes,
       edges,
       clusters,
-      metrics
+      metrics,
+      truncated: totalCount > nodes.length,
+      returned_count: nodes.length,
+      total_count: totalCount,
+      continuation: totalCount > nodes.length
+        ? 'Narrow the context or time range before requesting another graph segment.'
+        : undefined,
     };
   }
 
@@ -727,54 +801,90 @@ Do these statements contradict each other? Analyze carefully.`;
     tenantId: string,
     projectId?: string
   ): Promise<PredictiveAnalytics> {
-    // Analyze historical data for predictions
-    const historicalData = await this.getHistoricalData(tenantId, projectId, 90); // 90 days of data
-    
-    // Predict memory growth
-    const growthPrediction = this.predictMemoryGrowth(historicalData);
-    
-    // Predict category usage
-    const categoryPrediction = this.predictCategoryUsage(historicalData);
-    
-    // Predict relationship formation
-    const relationshipLikelihood = this.predictRelationshipFormation(historicalData);
-    
-    // Assess quality degradation risk
-    const qualityRisk = await this.assessQualityDegradationRisk(tenantId, projectId);
-
-    return {
-      memory_growth_prediction: growthPrediction,
-      category_usage_prediction: categoryPrediction,
-      relationship_formation_likelihood: relationshipLikelihood,
-      quality_degradation_risk: qualityRisk
-    };
+    void tenantId;
+    void projectId;
+    throw new Error('Predictive analytics are unavailable until scoped historical models are implemented');
   }
 
   /**
    * Helper methods for analysis
    */
-  private async getMemoriesForAnalysis(tenantId: string, contextId?: string): Promise<any[]> {
+  private async getMemoriesForAnalysis(
+    tenantId: string,
+    contextId?: string,
+    projectId?: string,
+    userId?: string,
+    limit: number = 200,
+    contentCharacterLimit: number = 16_000,
+  ): Promise<any[]> {
+    const safeLimit = Number.isSafeInteger(limit) ? Math.min(Math.max(limit, 1), 200) : 200;
+    const safeContentLimit = Number.isSafeInteger(contentCharacterLimit)
+      ? Math.min(Math.max(contentCharacterLimit, 1), 16_000)
+      : 16_000;
     let query: string;
     let params: any[];
 
     if (contextId) {
       query = `
-        SELECT m.*, mc.relevance_score as context_relevance
+        SELECT m.id, LEFT(m.content, $5::integer) AS content, m.category,
+               CASE WHEN octet_length(m.metadata::text) <= 8192
+                    THEN m.metadata ELSE '{}'::jsonb END AS metadata,
+               m.created_at, m.updated_at, m.relevance_score,
+               mc.relevance_score AS context_relevance,
+               COUNT(*) OVER()::integer AS total_count
         FROM memories m
         JOIN memory_contexts mc ON m.id = mc.memory_id
+        JOIN contexts c ON c.id = mc.context_id AND c.project_id = m.project_id
+        JOIN projects cp ON cp.id = c.project_id AND cp.tenant_id = m.tenant_id
         WHERE mc.context_id = $1 AND m.tenant_id = $2
-        ORDER BY m.created_at DESC
+          AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+          AND (
+            (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+            OR (
+              COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+              AND (cp.is_personal = false OR cp.owner_id = $4::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = cp.id AND pm.user_id = $4::uuid))
+            )
+          )
+        ORDER BY m.created_at DESC, m.id DESC
+        LIMIT $6::integer
       `;
-      params = [contextId, tenantId];
+      params = [
+        contextId,
+        tenantId,
+        projectId || null,
+        userId || null,
+        safeContentLimit,
+        safeLimit,
+      ];
     } else {
       query = `
-        SELECT * FROM memories 
-        WHERE tenant_id = $1 
-        AND created_at >= NOW() - INTERVAL '90 days'
-        ORDER BY created_at DESC
-        LIMIT 200
+        SELECT m.id, LEFT(m.content, $4::integer) AS content, m.category,
+               CASE WHEN octet_length(m.metadata::text) <= 8192
+                    THEN m.metadata ELSE '{}'::jsonb END AS metadata,
+               m.created_at, m.updated_at, m.relevance_score,
+               COUNT(*) OVER()::integer AS total_count
+        FROM memories m
+        LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+        WHERE m.tenant_id = $1
+          AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+          AND (
+            (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+            OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+            OR (
+              COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+              AND p.id IS NOT NULL
+              AND (p.is_personal = false OR p.owner_id = $3::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p.id AND pm.user_id = $3::uuid))
+            )
+          )
+        AND m.created_at >= NOW() - INTERVAL '90 days'
+        ORDER BY m.created_at DESC, m.id DESC
+        LIMIT $5::integer
       `;
-      params = [tenantId];
+      params = [tenantId, projectId || null, userId || null, safeContentLimit, safeLimit];
     }
 
     const result = await this.database.query(query, params, tenantId);
@@ -1366,7 +1476,18 @@ Do these statements contradict each other? Analyze carefully.`;
 
   private calculateGraphMetrics(nodes: GraphNode[], edges: GraphEdge[]): GraphMetrics {
     const nodeCount = nodes.length;
-    const edgeCount = edges.length;
+    const nodeIds = new Set(nodes.map(node => node.id));
+    const seenEdges = new Set<string>();
+    const validEdges = edges.filter(edge => {
+      if (edge.source === edge.target || !nodeIds.has(edge.source) || !nodeIds.has(edge.target)) return false;
+      const key = edge.source < edge.target
+        ? `${edge.source}\0${edge.target}`
+        : `${edge.target}\0${edge.source}`;
+      if (seenEdges.has(key)) return false;
+      seenEdges.add(key);
+      return true;
+    });
+    const edgeCount = validEdges.length;
     const maxPossibleEdges = (nodeCount * (nodeCount - 1)) / 2;
     
     // Find most connected node
@@ -1375,7 +1496,7 @@ Do these statements contradict each other? Analyze carefully.`;
       nodeDegrees.set(node.id, 0);
     }
     
-    for (const edge of edges) {
+    for (const edge of validEdges) {
       nodeDegrees.set(edge.source, (nodeDegrees.get(edge.source) || 0) + 1);
       nodeDegrees.set(edge.target, (nodeDegrees.get(edge.target) || 0) + 1);
     }
@@ -1386,9 +1507,9 @@ Do these statements contradict each other? Analyze carefully.`;
     return {
       total_nodes: nodeCount,
       total_edges: edgeCount,
-      avg_clustering_coefficient: edgeCount > 0 ? this.calculateClusteringCoefficient(nodes, edges) : 0,
+      avg_clustering_coefficient: edgeCount > 0 ? this.calculateClusteringCoefficient(nodes, validEdges) : 0,
       density: maxPossibleEdges > 0 ? edgeCount / maxPossibleEdges : 0,
-      connected_components: this.countConnectedComponents(nodes, edges),
+      connected_components: this.countConnectedComponents(nodes, validEdges),
       most_central_node: mostCentralNode
     };
   }
@@ -1414,43 +1535,6 @@ Do these statements contradict each other? Analyze carefully.`;
     return null; // Placeholder
   }
 
-  private async getHistoricalData(tenantId: string, projectId: string | undefined, days: number): Promise<any[]> {
-    // Get historical memory data for predictions
-    return []; // Placeholder
-  }
-
-  private predictMemoryGrowth(historicalData: any[]): any {
-    // Implement growth prediction algorithm
-    return {
-      next_30_days: 50,
-      growth_rate: 0.1,
-      seasonal_patterns: false
-    };
-  }
-
-  private predictCategoryUsage(historicalData: any[]): Record<string, number> {
-    // Predict future category usage
-    return {
-      facts: 0.3,
-      patterns: 0.2,
-      insights: 0.15
-    };
-  }
-
-  private predictRelationshipFormation(historicalData: any[]): number {
-    // Predict likelihood of new relationships
-    return 0.75;
-  }
-
-  private async assessQualityDegradationRisk(tenantId: string, projectId?: string): Promise<any> {
-    // Assess risk of data quality degradation
-    return {
-      risk_level: 'low' as const,
-      risk_factors: [],
-      recommendations: ['Continue regular usage patterns']
-    };
-  }
-
   private textSimilarity(textA: string, textB: string): number {
     // Simple text similarity (Jaccard index)
     const wordsA = new Set(textA.toLowerCase().split(/\W+/));
@@ -1461,12 +1545,72 @@ Do these statements contradict each other? Analyze carefully.`;
   }
 
   private calculateClusteringCoefficient(nodes: GraphNode[], edges: GraphEdge[]): number {
-    // Simplified clustering coefficient calculation
-    return 0.5; // Placeholder
+    if (nodes.length === 0) return 0;
+
+    const nodeIds = new Set(nodes.map(node => node.id));
+    const adjacency = new Map<string, Set<string>>(
+      nodes.map(node => [node.id, new Set<string>()]),
+    );
+    for (const edge of edges) {
+      if (edge.source === edge.target || !nodeIds.has(edge.source) || !nodeIds.has(edge.target)) {
+        continue;
+      }
+      adjacency.get(edge.source)!.add(edge.target);
+      adjacency.get(edge.target)!.add(edge.source);
+    }
+
+    let coefficientSum = 0;
+    for (const node of nodes) {
+      const neighbours = [...(adjacency.get(node.id) || [])];
+      if (neighbours.length < 2) continue;
+
+      let connectedPairs = 0;
+      for (let left = 0; left < neighbours.length; left++) {
+        for (let right = left + 1; right < neighbours.length; right++) {
+          if (adjacency.get(neighbours[left])?.has(neighbours[right])) {
+            connectedPairs++;
+          }
+        }
+      }
+      const possiblePairs = neighbours.length * (neighbours.length - 1) / 2;
+      coefficientSum += connectedPairs / possiblePairs;
+    }
+
+    return coefficientSum / nodes.length;
   }
 
   private countConnectedComponents(nodes: GraphNode[], edges: GraphEdge[]): number {
-    // Count connected components in the graph
-    return Math.max(1, Math.ceil(nodes.length / 10)); // Simplified
+    if (nodes.length === 0) return 0;
+
+    const nodeIds = new Set(nodes.map(node => node.id));
+    const adjacency = new Map<string, Set<string>>(
+      nodes.map(node => [node.id, new Set<string>()]),
+    );
+    for (const edge of edges) {
+      if (edge.source === edge.target || !nodeIds.has(edge.source) || !nodeIds.has(edge.target)) {
+        continue;
+      }
+      adjacency.get(edge.source)!.add(edge.target);
+      adjacency.get(edge.target)!.add(edge.source);
+    }
+
+    const visited = new Set<string>();
+    let components = 0;
+    for (const node of nodes) {
+      if (visited.has(node.id)) continue;
+      components++;
+      const pending = [node.id];
+      visited.add(node.id);
+      while (pending.length > 0) {
+        const current = pending.pop()!;
+        for (const neighbour of adjacency.get(current) || []) {
+          if (!visited.has(neighbour)) {
+            visited.add(neighbour);
+            pending.push(neighbour);
+          }
+        }
+      }
+    }
+    return components;
   }
 }

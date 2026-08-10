@@ -9,7 +9,13 @@
 <body>
   <header>
     <h1>Rembr <span>Console</span></h1>
-    <div id="status" class="status">checking…</div>
+    <div class="auth">
+      <label for="console-token">Console token</label>
+      <input id="console-token" type="password" autocomplete="current-password" />
+      <button id="connect-console" type="button">Connect</button>
+      <button id="forget-console" type="button" class="secondary">Forget</button>
+      <div id="status" class="status">authentication required</div>
+    </div>
   </header>
 
   <nav id="tabs">
@@ -29,6 +35,7 @@
       <pre id="memories-output" class="output">Loading…</pre>
 
       <h2>New memory</h2>
+      <p class="hint">Requires <code>REMBR_CONSOLE_MODE=read-write</code>.</p>
       <form id="create-form">
         <textarea id="create-content" rows="3" placeholder="What should be remembered?" required></textarea>
         <div class="row">
@@ -52,6 +59,7 @@
       <pre id="create-output" class="output small"></pre>
 
       <h2>Delete memory</h2>
+      <p class="hint">Requires <code>REMBR_CONSOLE_MODE=read-write</code>.</p>
       <form id="delete-form" class="row">
         <input id="delete-id" placeholder="memory id" required />
         <button type="submit" class="danger">Delete</button>

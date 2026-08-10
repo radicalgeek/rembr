@@ -22,7 +22,7 @@ describe('MemoryRelationshipService contradiction heuristics', () => {
     const service = createService();
 
     expect(service.hasContradictionPattern(
-      'Rembr production is hosted on the Hoofer cluster and serves MCP traffic.',
+      'Rembr production is hosted on the test cluster and serves MCP traffic.',
       'API key last_used_at is not reliable proof of recent agent activity.'
     )).toBe(false);
   });

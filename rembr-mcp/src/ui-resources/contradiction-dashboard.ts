@@ -10,7 +10,7 @@
  * - Severity color coding
  */
 
-import { renderTemplate, STYLE_INCLUDES } from './index.js';
+import { renderTemplate, STYLE_INCLUDES, safeJsonForHtml } from './index.js';
 
 export interface ContradictionData {
   contradictions: Array<{
@@ -38,7 +38,7 @@ export interface ContradictionData {
  * Render the contradiction detection dashboard
  */
 export function renderContradictionDashboard(data: ContradictionData): string {
-  const dataJson = JSON.stringify(data, null, 2);
+  const dataJson = safeJsonForHtml(data);
   
   // Generate HTML for each contradiction
   const contradictionsHtml = data.contradictions.map((c, index) => `
@@ -77,7 +77,7 @@ export function renderContradictionDashboard(data: ContradictionData): string {
       <!-- Explanation -->
       <div style="margin-bottom: 1rem; padding: 0.75rem; background: var(--rembr-bg); border-radius: 6px; border-left: 3px solid ${getSeverityColor(c.severity)};">
         <div style="font-weight: 600; margin-bottom: 0.5rem; font-size: 0.875rem;">Why this contradicts:</div>
-        <div style="color: var(--rembr-text-secondary); font-size: 0.875rem;">${c.explanation}</div>
+        <div style="color: var(--rembr-text-secondary); font-size: 0.875rem;">${escapeHtml(c.explanation)}</div>
       </div>
 
       <!-- Side-by-side comparison -->
@@ -88,7 +88,7 @@ export function renderContradictionDashboard(data: ContradictionData): string {
             <div>
               <div style="font-weight: 600; margin-bottom: 0.25rem;">Memory A</div>
               <div style="font-size: 0.75rem; color: var(--rembr-text-secondary);">
-                ${c.memory_a.category} · ${formatDate(c.memory_a.created_at)}
+                ${escapeHtml(c.memory_a.category)} · ${formatDate(c.memory_a.created_at)}
               </div>
             </div>
             <button class="rembr-button" onclick="resolveContradiction(${index}, 'keep_a')">
@@ -106,7 +106,7 @@ export function renderContradictionDashboard(data: ContradictionData): string {
             <div>
               <div style="font-weight: 600; margin-bottom: 0.25rem;">Memory B</div>
               <div style="font-size: 0.75rem; color: var(--rembr-text-secondary);">
-                ${c.memory_b.category} · ${formatDate(c.memory_b.created_at)}
+                ${escapeHtml(c.memory_b.category)} · ${formatDate(c.memory_b.created_at)}
               </div>
             </div>
             <button class="rembr-button" onclick="resolveContradiction(${index}, 'keep_b')">
@@ -338,7 +338,7 @@ export function renderContradictionDashboard(data: ContradictionData): string {
           content.innerHTML = \`
             <div style="margin-bottom: 1rem;">
               <label style="display: block; margin-bottom: 0.5rem; font-weight: 600;">Merged Content:</label>
-              <textarea style="width: 100%; min-height: 150px; padding: 0.75rem; background: var(--rembr-bg); border: 1px solid var(--rembr-border); border-radius: 6px; color: var(--rembr-text); resize: vertical;" id="merged-content">\${c.memory_a.content}\\n\\n\${c.memory_b.content}</textarea>
+              <textarea style="width: 100%; min-height: 150px; padding: 0.75rem; background: var(--rembr-bg); border: 1px solid var(--rembr-border); border-radius: 6px; color: var(--rembr-text); resize: vertical;" id="merged-content">\${escapeHtml(c.memory_a.content)}\\n\\n\${escapeHtml(c.memory_b.content)}</textarea>
             </div>
             <div style="font-size: 0.875rem; color: var(--rembr-text-secondary);">
               Edit the merged content above, then confirm to create a new memory that resolves this contradiction.
@@ -375,7 +375,11 @@ export function renderContradictionDashboard(data: ContradictionData): string {
       </script>
 
       <script>
-        function escapeHtml(text) { return text; }
+        function escapeHtml(value) {
+          return String(value ?? '').replace(/[&<>"']/g, character => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+          })[character]);
+        }
         function formatDate(date) {
           return new Date(date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
         }

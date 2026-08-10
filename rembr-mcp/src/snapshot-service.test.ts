@@ -182,3 +182,201 @@ describe('SnapshotService - Immutability Guarantees (REM-256)', () => {
   });
 });
 
+describe('SnapshotService - tenant, project, and personal scope', () => {
+  it('rejects a caller-supplied project outside a scoped credential', async () => {
+    const db = { query: vi.fn() };
+    const service = new SnapshotService(db as any);
+
+    await expect(service.listSnapshots({
+      tenant_id: 'tenant-1',
+      project_id: 'project-a',
+      user_id: 'user-1',
+    }, 'project-b')).rejects.toThrow('outside the credential scope');
+    expect(db.query).not.toHaveBeenCalled();
+  });
+
+  it('filters immutable snapshot copies by tenant and personal owner', async () => {
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rows: [{ id: 'snapshot-1', tenant_id: 'tenant-1', visibility: 'personal' }] })
+      .mockResolvedValueOnce({ rows: [] });
+    const service = new SnapshotService({ query } as any);
+
+    await service.getSnapshot('snapshot-1', {
+      tenant_id: 'tenant-1',
+      project_id: 'project-a',
+      user_id: 'user-1',
+    });
+
+    expect(query.mock.calls[0][0]).toContain('s.tenant_id = $2');
+    expect(query.mock.calls[0][0]).toContain("s.user_id = $4::uuid");
+    expect(query.mock.calls[1][0]).toContain("sm.user_id = $3::uuid");
+    expect(query.mock.calls[1][0]).toContain('LIMIT $5 OFFSET $6');
+    expect(query.mock.calls[1][1]).toEqual([
+      'snapshot-1', 'tenant-1', 'user-1', 'project-a', 25, 0, 1024 * 1024,
+    ]);
+  });
+});
+
+describe('SnapshotService - atomic storage quota', () => {
+  const tenantId = '550e8400-e29b-41d4-a716-446655440000';
+  const memoryId = '550e8400-e29b-41d4-a716-446655440001';
+
+  function quotaDb(memoryLimit: number, failCopies = false) {
+    let storedItems = 0;
+    let snapshots = 0;
+    let tail = Promise.resolve();
+    const queries: Array<{ sql: string; params: unknown[] }> = [];
+
+    const client = {
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        if (sql.includes('SELECT m.* FROM memories')) {
+          return { rows: [{
+            id: memoryId, tenant_id: tenantId, project_id: null, user_id: null,
+            visibility: 'shared', content: 'snapshot source', category: 'facts',
+            metadata: {}, relevance_score: 1, created_at: new Date(),
+          }], rowCount: 1 };
+        }
+        if (sql.includes('AS source_count')) {
+          return {
+            rows: [{ source_count: 1, source_bytes: 15, source_tokens: 4 }],
+            rowCount: 1,
+          };
+        }
+        if (sql.includes('AS memory_limit')) return { rows: [{ memory_limit: memoryLimit }], rowCount: 1 };
+        if (sql.includes('AS stored_items')) return { rows: [{ stored_items: storedItems }], rowCount: 1 };
+        if (sql.includes('INSERT INTO context_snapshots')) {
+          snapshots += 1;
+          return { rows: [{
+            id: `snapshot-${snapshots}`, tenant_id: tenantId, project_id: null,
+            visibility: 'shared', memory_count: 1, token_count: 4,
+          }], rowCount: 1 };
+        }
+        if (sql.includes('INSERT INTO snapshot_memories')) {
+          if (failCopies) throw new Error('copy insert failed');
+          storedItems += 1;
+          return { rows: [{
+            id: `copy-${storedItems}`, snapshot_id: `snapshot-${snapshots}`,
+            memory_id: memoryId, content: 'snapshot source', category: 'facts',
+            relevance_score: 1, position: 0,
+          }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      }),
+    };
+
+    const db = {
+      withTenantTransaction: vi.fn(async (_tenant: string, work: (tx: typeof client) => Promise<any>) => {
+        let release!: () => void;
+        const previous = tail;
+        tail = new Promise<void>(resolve => { release = resolve; });
+        await previous;
+        const before = { storedItems, snapshots };
+        try {
+          return await work(client);
+        } catch (error) {
+          storedItems = before.storedItems;
+          snapshots = before.snapshots;
+          throw error;
+        } finally {
+          release();
+        }
+      }),
+      searchMemories: vi.fn(),
+    };
+    return { db, queries, state: () => ({ storedItems, snapshots }) };
+  }
+
+  const auth = { tenant_id: tenantId };
+  const options = { memoryIds: [memoryId] };
+
+  it('serialises concurrent requests so only one can spend the final quota slot', async () => {
+    const fake = quotaDb(1);
+    const service = new SnapshotService(fake.db as any);
+    const results = await Promise.allSettled([
+      service.createSnapshot(auth, options),
+      service.createSnapshot(auth, options),
+    ]);
+
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter(result => result.status === 'rejected')).toHaveLength(1);
+    expect(fake.state()).toEqual({ storedItems: 1, snapshots: 1 });
+    expect(fake.queries.filter(query => query.sql.includes('pg_advisory_xact_lock'))).toHaveLength(2);
+  });
+
+  it('counts immutable copies, so repeated snapshots exhaust the same plan limit', async () => {
+    const fake = quotaDb(2);
+    const service = new SnapshotService(fake.db as any);
+    await service.createSnapshot(auth, options);
+    await service.createSnapshot(auth, options);
+    await expect(service.createSnapshot(auth, options)).rejects.toThrow(/exceed memory limit/);
+    expect(fake.state()).toEqual({ storedItems: 2, snapshots: 2 });
+  });
+
+  it('rolls the snapshot record back when immutable-copy insertion fails', async () => {
+    const fake = quotaDb(10, true);
+    const service = new SnapshotService(fake.db as any);
+    await expect(service.createSnapshot(auth, options)).rejects.toThrow('copy insert failed');
+    expect(fake.state()).toEqual({ storedItems: 0, snapshots: 0 });
+  });
+
+  it('cleans expired rows only through an exact tenant predicate before counting', async () => {
+    const fake = quotaDb(10);
+    const service = new SnapshotService(fake.db as any);
+    await service.createSnapshot(auth, options);
+    const cleanup = fake.queries.find(query => query.sql.includes('WITH expired AS'))!;
+    expect(cleanup.sql).toContain('tenant_id = $1');
+    expect(cleanup.params).toEqual([tenantId]);
+    const cleanupIndex = fake.queries.indexOf(cleanup);
+    const usageIndex = fake.queries.findIndex(query => query.sql.includes('AS stored_items'));
+    expect(cleanupIndex).toBeLessThan(usageIndex);
+  });
+
+  it('preserves userless agent-bootstrap snapshots within the free quota', async () => {
+    const fake = quotaDb(1000);
+    const service = new SnapshotService(fake.db as any);
+    const result = await service.createSnapshot(auth, options);
+    expect(result.snapshot.visibility).toBe('shared');
+    expect(result.memories).toHaveLength(1);
+  });
+
+  it('enforces maxTokens for explicit sources without partial snapshot writes', async () => {
+    const fake = quotaDb(1000);
+    const service = new SnapshotService(fake.db as any);
+    await expect(service.createSnapshot(auth, { ...options, maxTokens: 3 }))
+      .rejects.toThrow(/exceeding maxTokens 3/);
+    expect(fake.state()).toEqual({ storedItems: 0, snapshots: 0 });
+    expect(fake.queries.some(query => query.sql.includes('INSERT INTO context_snapshots'))).toBe(false);
+  });
+
+  it('rejects an oversized context from aggregate statistics before materialising memory rows', async () => {
+    const queries: string[] = [];
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
+        if (sql.includes('SELECT c.id, c.project_id')) {
+          return { rows: [{ id: 'context-1', project_id: null }] };
+        }
+        if (sql.includes('AS source_count')) {
+          return {
+            rows: [{ source_count: 501, source_bytes: 501_000, source_tokens: 125_250 }],
+          };
+        }
+        if (sql.includes('SELECT m.* FROM memories')) {
+          throw new Error('memory content should not be materialised');
+        }
+        return { rows: [] };
+      }),
+    };
+    const db = {
+      withTenantTransaction: vi.fn(async (_tenant: string, work: any) => work(client)),
+      searchMemories: vi.fn(),
+    };
+    const service = new SnapshotService(db as any);
+
+    await expect(service.createSnapshot(auth, { contextIds: ['context-1'] }))
+      .rejects.toThrow('hard copy boundary');
+    expect(queries.some(sql => sql.includes('SELECT m.* FROM memories'))).toBe(false);
+    expect(queries.some(sql => sql.includes('octet_length(m.content)'))).toBe(true);
+  });
+});

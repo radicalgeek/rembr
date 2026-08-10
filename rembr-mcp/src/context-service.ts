@@ -25,6 +25,15 @@ export interface ContextMemory {
   added_at: Date;
 }
 
+const CONTEXT_LIMITS: Record<string, number> = {
+  dev: 100,
+  free: 100,
+  pro: 2_500,
+  team: 25_000,
+  business: 100_000,
+  enterprise: 1_000_000,
+};
+
 /**
  * ContextService handles context operations for RLM integration.
  * Provides logical groupings within projects: Project → Context → Memories
@@ -32,46 +41,24 @@ export interface ContextMemory {
 export class ContextService {
   private tenantId: string;
   private projectId: string | undefined;
+  private userId: string | undefined;
   private db: MemoryDatabase;
 
-  constructor(tenantId: string, projectId: string | undefined, db: MemoryDatabase) {
+  constructor(tenantId: string, projectId: string | undefined, db: MemoryDatabase, userId?: string) {
     this.tenantId = tenantId;
     this.projectId = projectId;
     this.db = db;
-  }
-
-  /**
-   * Check project limit before creating context
-   */
-  private async checkProjectLimit(): Promise<void> {
-    const plan = await this.db.getTenantPlan(this.tenantId);
-    if (!plan) {
-      throw new Error('Tenant plan not found');
-    }
-
-    // Get project count for this tenant
-    const projectCount = await this.db.getProjectCount(this.tenantId);
-    if (projectCount >= plan.project_limit) {
-      throw new Error(`Project limit reached (${plan.project_limit} projects). Please upgrade your plan.`);
-    }
+    this.userId = userId;
   }
 
   /**
    * Check search limit before searching
    */
   private async checkSearchLimit(): Promise<void> {
-    const plan = await this.db.getTenantPlan(this.tenantId);
-    if (!plan) {
-      throw new Error('Tenant plan not found');
-    }
-
-    const searchCount = await this.db.getTodaySearchCount(this.tenantId);
-    if (plan.search_limit_daily > 0 && searchCount >= plan.search_limit_daily) {
-      throw new Error(`Daily search limit reached (${plan.search_limit_daily} searches). Resets at midnight UTC.`);
-    }
-
-    // Track usage
-    await this.db.incrementSearchCount(this.tenantId, await this.getOrCreateDefaultProject());
+    await this.db.reserveSearchQuota(
+      this.tenantId,
+      await this.getOrCreateDefaultProject(),
+    );
   }
 
   /**
@@ -79,26 +66,57 @@ export class ContextService {
    */
   private async getOrCreateDefaultProject(): Promise<string> {
     if (this.projectId) {
+      const scoped = await this.db.query(
+        `SELECT p.id FROM projects p
+         WHERE p.id = $1 AND p.tenant_id = $2
+           AND (p.is_personal = false OR p.owner_id = $3::uuid
+                OR EXISTS (SELECT 1 FROM project_members pm
+                           WHERE pm.project_id = p.id AND pm.user_id = $3::uuid))`,
+        [this.projectId, this.tenantId, this.userId || null],
+        this.tenantId,
+      );
+      if (scoped.rows.length === 0) {
+        throw new Error('Project not found or access denied');
+      }
       return this.projectId;
     }
 
-    // Check if tenant has a default project
-    let result = await this.db.dbPool.query(
-      'SELECT id FROM projects WHERE tenant_id = $1 AND name = $2',
-      [this.tenantId, 'default']
-    );
-
-    if (result.rows.length === 0) {
-      // Create default project
-      const projectId = randomUUID();
-      await this.db.dbPool.query(
-        'INSERT INTO projects (id, tenant_id, name, description) VALUES ($1, $2, $3, $4)',
-        [projectId, this.tenantId, 'default', 'Default project for this tenant']
+    // Unscoped credentials may use only the shared system default. A personal
+    // project named "default" must never be selected through name collision.
+    const sharedDefaultName = '__rembr_shared_default__';
+    return this.db.withTenantTransaction(this.tenantId, async client => {
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+        [`default-hierarchy:${this.tenantId}`],
       );
-      return projectId;
-    }
+      const result = await client.query(
+        `SELECT id FROM projects
+         WHERE tenant_id = $1 AND name = $2 AND is_personal = false
+         ORDER BY created_at, id LIMIT 1`,
+        [this.tenantId, sharedDefaultName],
+      );
+      if (result.rows[0]) return result.rows[0].id;
 
-    return result.rows[0].id;
+      const projectId = randomUUID();
+      const inserted = await client.query(
+        `INSERT INTO projects (id, tenant_id, name, description, is_personal)
+         VALUES ($1, $2, $3, $4, false)
+         ON CONFLICT (tenant_id)
+           WHERE name = '__rembr_shared_default__' AND is_personal = false
+         DO NOTHING
+         RETURNING id`,
+        [projectId, this.tenantId, sharedDefaultName, 'Shared default project for this tenant'],
+      );
+      if (inserted.rows[0]) return inserted.rows[0].id;
+      const existing = await client.query(
+        `SELECT id FROM projects
+         WHERE tenant_id = $1 AND name = $2 AND is_personal = false
+         ORDER BY created_at, id LIMIT 1`,
+        [this.tenantId, sharedDefaultName],
+      );
+      if (!existing.rows[0]) throw new Error('Unable to provision shared default project');
+      return existing.rows[0].id;
+    });
   }
 
   /**
@@ -107,23 +125,51 @@ export class ContextService {
   private async getOrCreateDefaultContext(): Promise<string> {
     const projectId = await this.getOrCreateDefaultProject();
     
-    // Check if project has a default context
-    let result = await this.db.dbPool.query(
-      'SELECT id FROM contexts WHERE project_id = $1 AND name = $2',
-      [projectId, 'default']
-    );
-
-    if (result.rows.length === 0) {
-      // Create default context
-      const contextId = randomUUID();
-      await this.db.dbPool.query(
-        'INSERT INTO contexts (id, project_id, name, description) VALUES ($1, $2, $3, $4)',
-        [contextId, projectId, 'default', 'Default context for this project']
+    return this.db.withTenantTransaction(this.tenantId, async client => {
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+        [`context-quota:${this.tenantId}`],
       );
-      return contextId;
-    }
+      const result = await client.query(
+        `SELECT id FROM contexts WHERE project_id = $1 AND name = $2
+         ORDER BY created_at, id LIMIT 1`,
+        [projectId, 'default'],
+      );
+      if (result.rows[0]) return result.rows[0].id;
 
-    return result.rows[0].id;
+      const tenant = await client.query(
+        `SELECT LOWER(COALESCE(plan, 'free')) AS plan
+         FROM tenants WHERE id = $1 FOR UPDATE`,
+        [this.tenantId],
+      );
+      if (!tenant.rows[0]) throw new Error('Tenant plan not found');
+      const contextLimit = CONTEXT_LIMITS[String(tenant.rows[0].plan || 'free')] || CONTEXT_LIMITS.free;
+      const usage = await client.query(
+        `SELECT COUNT(*)::int AS context_count
+         FROM contexts c JOIN projects p ON p.id = c.project_id
+         WHERE p.tenant_id = $1`,
+        [this.tenantId],
+      );
+      if (Number(usage.rows[0]?.context_count || 0) >= contextLimit) {
+        throw new Error(`Context limit reached (${contextLimit} contexts). Please upgrade your plan.`);
+      }
+
+      const inserted = await client.query(
+        `INSERT INTO contexts (id, project_id, name, description)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (project_id, name) DO NOTHING
+         RETURNING id`,
+        [randomUUID(), projectId, 'default', 'Default context for this project'],
+      );
+      if (inserted.rows[0]) return inserted.rows[0].id;
+      const existing = await client.query(
+        `SELECT id FROM contexts WHERE project_id = $1 AND name = $2
+         ORDER BY created_at, id LIMIT 1`,
+        [projectId, 'default'],
+      );
+      if (!existing.rows[0]) throw new Error('Unable to provision default context');
+      return existing.rows[0].id;
+    });
   }
 
   /**
@@ -138,9 +184,9 @@ export class ContextService {
   /**
    * List all contexts for the current project
    */
-  async listContexts(category?: string): Promise<Context[]> {
+  async listContexts(category?: string, limit: number = 50): Promise<Context[]> {
     const projectId = await this.getOrCreateDefaultProject();
-    return await this.db.listContexts(projectId, category);
+    return await this.db.listContexts(projectId, this.tenantId, category, limit);
   }
 
   /**
@@ -153,9 +199,6 @@ export class ContextService {
   ): Promise<Context> {
     const projectId = await this.getOrCreateDefaultProject();
 
-    // Check project limit (contexts are part of project quota)
-    await this.checkProjectLimit();
-
     const context: Context = {
       id: randomUUID(),
       project_id: projectId,
@@ -167,8 +210,51 @@ export class ContextService {
     };
 
     try {
-      await this.db.createContext(context);
-      return context;
+      return await this.db.withTenantTransaction(this.tenantId, async client => {
+        await client.query(
+          `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+          [`context-quota:${this.tenantId}`],
+        );
+
+        const project = await client.query(
+          `SELECT 1 FROM projects p
+           WHERE p.id = $1 AND p.tenant_id = $2
+             AND (p.is_personal = false OR p.owner_id = $3::uuid
+                  OR EXISTS (SELECT 1 FROM project_members pm
+                             WHERE pm.project_id = p.id AND pm.user_id = $3::uuid))
+           FOR SHARE OF p`,
+          [projectId, this.tenantId, this.userId || null],
+        );
+        if (project.rows.length === 0) throw new Error('Project not found or access denied');
+
+        const tenant = await client.query(
+          `SELECT LOWER(COALESCE(plan, 'free')) AS plan
+           FROM tenants WHERE id = $1 FOR UPDATE`,
+          [this.tenantId],
+        );
+        if (!tenant.rows[0]) throw new Error('Tenant plan not found');
+        const planName = String(tenant.rows[0].plan || 'free');
+        const contextLimit = CONTEXT_LIMITS[planName] || CONTEXT_LIMITS.free;
+        const usage = await client.query(
+          `SELECT COUNT(*)::int AS context_count
+           FROM contexts c
+           JOIN projects p ON p.id = c.project_id
+           WHERE p.tenant_id = $1`,
+          [this.tenantId],
+        );
+        const contextCount = Number(usage.rows[0]?.context_count || 0);
+        if (contextCount >= contextLimit) {
+          throw new Error(`Context limit reached (${contextLimit} contexts). Please upgrade your plan.`);
+        }
+
+        const inserted = await client.query(
+          `INSERT INTO contexts (id, project_id, name, description, category)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING *`,
+          [context.id, projectId, name, description || null, category || null],
+        );
+        return inserted.rows[0] as Context;
+      });
     } catch (error: any) {
       if (error.code === '23505' && error.constraint === 'contexts_project_id_name_key') {
         throw new Error(`Context with name '${name}' already exists in this project`);
@@ -192,16 +278,16 @@ export class ContextService {
       throw new Error(`Context ${contextId} not found or access denied`);
     }
 
-    // Check if we have a cached summary and don't need to regenerate
-    if (!regenerate) {
-      const existingSummary = await this.db.getContextSummary(contextId);
-      if (existingSummary) {
-        return existingSummary;
-      }
-    }
-
     // Get all memories in this context  
-    const memories = await this.db.getContextMemories(contextId, this.tenantId);
+    const memories = await this.db.getContextMemories(
+      contextId,
+      this.tenantId,
+      this.projectId,
+      this.userId,
+      500,
+      1,
+      false,
+    );
     
     // Generate summary text (simple concatenation for now - could use LLM later)
     const summaryText = memories.length > 0
@@ -213,11 +299,13 @@ export class ContextService {
     const summary: ContextSummary = {
       context_id: contextId,
       summary_text: summaryText,
-      memory_count: memories.length,
+      memory_count: Number(memories[0]?.total_count || memories.length),
       generated_at: new Date(),
     };
 
-    await this.db.saveContextSummary(summary);
+    // Context membership can include personal memories, so a single cached
+    // summary row cannot represent every caller's audience safely. Return the
+    // caller-scoped summary ephemerally until summaries have an audience key.
     return summary;
   }
 
@@ -244,7 +332,15 @@ export class ContextService {
       throw new Error(`Context ${contextId} not found or access denied`);
     }
 
-    return await this.db.searchContextMemories(contextId, query, limit, minSimilarity);
+    return await this.db.searchContextMemories(
+      contextId,
+      query,
+      limit,
+      minSimilarity,
+      this.tenantId,
+      this.projectId,
+      this.userId,
+    );
   }
 
   /**
@@ -267,7 +363,7 @@ export class ContextService {
     }
 
     // Verify memory belongs to this tenant (use default project)
-    const memory = await this.db.getMemoryById(memoryId, this.tenantId, projectId);
+    const memory = await this.db.getMemoryById(memoryId, this.tenantId, projectId, this.userId);
     if (!memory) {
       throw new Error(`Memory ${memoryId} not found or access denied`);
     }
@@ -279,6 +375,11 @@ export class ContextService {
       added_at: new Date(),
     };
 
-    await this.db.addMemoryToContext(contextMemory);
+    await this.db.addMemoryToContext(
+      contextMemory,
+      this.tenantId,
+      projectId,
+      this.userId,
+    );
   }
 }

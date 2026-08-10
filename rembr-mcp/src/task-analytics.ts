@@ -114,34 +114,41 @@ export class TaskAnalyticsService {
     projectId?: string,
     periods: number = 8
   ): Promise<VelocityAnalysis> {
+    if (!['day', 'week', 'month'].includes(period)) {
+      throw new Error('period must be day, week, or month');
+    }
+    if (!Number.isSafeInteger(periods) || periods < 1 || periods > 104) {
+      throw new Error('periods must be an integer between 1 and 104');
+    }
     // Determine period length in days
     const periodDays = period === 'day' ? 1 : period === 'week' ? 7 : 30;
+    const datePart = period === 'day' ? 'day' : period === 'week' ? 'week' : 'month';
     
     // Query to get completed tasks per period
     const query = `
       WITH period_bounds AS (
         SELECT 
           generate_series(
-            CURRENT_DATE - INTERVAL '${periodDays * periods} days',
+            CURRENT_DATE - ($4::int * INTERVAL '1 day'),
             CURRENT_DATE,
-            INTERVAL '${periodDays} days'
+            $5::int * INTERVAL '1 day'
           )::date AS period_start
       ),
       task_completions AS (
         SELECT 
-          DATE_TRUNC('${period === 'day' ? 'day' : period === 'week' ? 'week' : 'month'}', completed_at) AS completion_period,
+          DATE_TRUNC($3::text, completed_at) AS completion_period,
           COUNT(*) AS completed_count,
           AVG(EXTRACT(EPOCH FROM (completed_at - created_at)) / 3600) AS avg_cycle_hours
         FROM tasks
         WHERE tenant_id = $1
           AND ($2::uuid IS NULL OR project_id = $2)
           AND completed_at IS NOT NULL
-          AND completed_at >= CURRENT_DATE - INTERVAL '${periodDays * periods} days'
-        GROUP BY DATE_TRUNC('${period === 'day' ? 'day' : period === 'week' ? 'week' : period === 'month'}', completed_at)
+          AND completed_at >= CURRENT_DATE - ($4::int * INTERVAL '1 day')
+        GROUP BY DATE_TRUNC($3::text, completed_at)
       ),
       task_starts AS (
         SELECT 
-          DATE_TRUNC('${period === 'day' ? 'day' : period === 'week' ? 'week' : 'month'}', 
+          DATE_TRUNC($3::text,
             (SELECT MIN(transitioned_at) 
              FROM task_state_transitions 
              WHERE task_id = t.id AND to_state = 'in_progress')
@@ -154,24 +161,27 @@ export class TaskAnalyticsService {
             SELECT 1 FROM task_state_transitions 
             WHERE task_id = t.id 
               AND to_state = 'in_progress'
-              AND transitioned_at >= CURRENT_DATE - INTERVAL '${periodDays * periods} days'
+              AND transitioned_at >= CURRENT_DATE - ($4::int * INTERVAL '1 day')
           )
         GROUP BY start_period
       )
       SELECT 
         pb.period_start,
-        pb.period_start + INTERVAL '${periodDays} days' AS period_end,
+        pb.period_start + ($5::int * INTERVAL '1 day') AS period_end,
         COALESCE(tc.completed_count, 0)::integer AS tasks_completed,
         COALESCE(ts.started_count, 0)::integer AS tasks_started,
         COALESCE(tc.avg_cycle_hours, 0)::numeric AS avg_cycle_time_hours
       FROM period_bounds pb
-      LEFT JOIN task_completions tc ON DATE_TRUNC('${period === 'day' ? 'day' : period === 'week' ? 'week' : 'month'}', pb.period_start) = tc.completion_period
-      LEFT JOIN task_starts ts ON DATE_TRUNC('${period === 'day' ? 'day' : period === 'week' ? 'week' : 'month'}', pb.period_start) = ts.start_period
+      LEFT JOIN task_completions tc ON DATE_TRUNC($3::text, pb.period_start) = tc.completion_period
+      LEFT JOIN task_starts ts ON DATE_TRUNC($3::text, pb.period_start) = ts.start_period
       ORDER BY pb.period_start DESC
-      LIMIT $3
+      LIMIT $6
     `;
 
-    const result = await this.pool.query(query, [tenantId, projectId, periods]);
+    const result = await this.pool.query(
+      query,
+      [tenantId, projectId, datePart, periodDays * periods, periodDays, periods],
+    );
     const dataPoints: VelocityDataPoint[] = result.rows.map(row => ({
       period_start: row.period_start,
       period_end: row.period_end,

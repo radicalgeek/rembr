@@ -88,44 +88,6 @@ export interface QueueStats {
   avg_completion_seconds: number | null;
 }
 
-// ─── Schema ───────────────────────────────────────────────────────────────────
-
-const SCHEMA_SQL = `
-  CREATE TABLE IF NOT EXISTS work_queue (
-    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id        UUID NOT NULL,
-    queue_name       TEXT NOT NULL,
-    task_type        TEXT NOT NULL,
-    priority         TEXT NOT NULL DEFAULT 'normal'
-                     CHECK (priority IN ('critical','high','normal','low')),
-    status           TEXT NOT NULL DEFAULT 'pending'
-                     CHECK (status IN ('pending','claimed','completed','failed','dead_letter')),
-    payload          JSONB NOT NULL DEFAULT '{}',
-    handoff          JSONB,
-    attempt_count    INTEGER NOT NULL DEFAULT 0,
-    max_attempts     INTEGER NOT NULL DEFAULT 3,
-    claimed_by       TEXT,
-    claimed_at       TIMESTAMPTZ,
-    lease_expires_at TIMESTAMPTZ,
-    completed_at     TIMESTAMPTZ,
-    failed_at        TIMESTAMPTZ,
-    failure_reason   TEXT,
-    scheduled_after  TIMESTAMPTZ,
-    idempotency_key  TEXT,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (tenant_id, idempotency_key)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_work_queue_claim
-    ON work_queue (tenant_id, queue_name, status, priority DESC, scheduled_after ASC, created_at ASC)
-    WHERE status = 'pending';
-
-  CREATE INDEX IF NOT EXISTS idx_work_queue_lease_expiry
-    ON work_queue (lease_expires_at)
-    WHERE status = 'claimed';
-`;
-
 // Priority ordering (higher number = picked first)
 const PRIORITY_ORDER: Record<QueuePriority, number> = {
   critical: 4,
@@ -172,13 +134,11 @@ export class WorkQueueService {
   private async ensureSchema(): Promise<void> {
     if (this.schemaEnsured) return;
     const existing = await this.pool.query(`SELECT to_regclass('public.work_queue') AS table_name`);
-    if (existing.rows.length === 0 || existing.rows[0]?.table_name) {
+    if (existing.rows[0]?.table_name) {
       this.schemaEnsured = true;
       return;
     }
-
-    await this.pool.query(SCHEMA_SQL);
-    this.schemaEnsured = true;
+    throw new Error('Work queue is unavailable: migration 024 has not been applied');
   }
 
   /**
@@ -237,7 +197,7 @@ export class WorkQueueService {
         status = 'claimed',
         claimed_by = $3,
         claimed_at = NOW(),
-        lease_expires_at = NOW() + ($4 || ' seconds')::INTERVAL,
+        lease_expires_at = NOW() + $4::int * interval '1 second',
         attempt_count = attempt_count + 1,
         updated_at = NOW()
       WHERE id = (
@@ -363,7 +323,7 @@ export class WorkQueueService {
 
     const result = await this.pool.query(`
       UPDATE work_queue SET
-        lease_expires_at = NOW() + ($4 || ' seconds')::INTERVAL,
+        lease_expires_at = NOW() + $4::int * interval '1 second',
         updated_at = NOW()
       WHERE id = $1 AND tenant_id = $2 AND claimed_by = $3 AND status = 'claimed'
       RETURNING *

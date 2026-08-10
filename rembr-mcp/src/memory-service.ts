@@ -4,12 +4,12 @@ import { QueryIntentService, QueryIntent } from './query-intent-service.js';
 import { MemoryRelationshipService } from './memory-relationship-service.js';
 import { ContextualEmbeddingService } from './contextual-embedding-service.js';
 import { AdvancedAnalyticsService } from './advanced-analytics-service.js';
+import { MemoryMaintenanceService } from './memory-maintenance-service.js';
 import { piiDetector } from './pii-detector.js';
 import { 
   trackEmbeddingFailure, 
   trackEmbeddingInflight, 
   trackBackgroundProcessing,
-  trackContradictionFailure,
   updateEmbeddingBacklog,
   embeddingRetryCounter
 } from './metrics.js';
@@ -83,9 +83,11 @@ export interface MemoryStats {
   by_category: Record<string, number>;
   plan: string;
   memory_limit: number;
-  searches_today: number;
+  searches_today: number | null;
+  searches_today_scope: 'tenant' | 'project' | 'unavailable';
   search_limit_daily: number;
   usage_percentage: number;
+  scope: 'authorised_audience';
 }
 
 export interface EmbeddingStats {
@@ -159,51 +161,48 @@ export class MemoryService {
       return this.projectId;
     }
 
-    // Check if tenant has a default project
-    let result = await this.db.dbPool.query(
-      'SELECT id FROM projects WHERE tenant_id = $1 AND name = $2',
-      [this.tenantId, 'default']
-    );
-
-    if (result.rows.length === 0) {
-      // Create default project
-      const projectId = randomUUID();
-      await this.db.dbPool.query(
-        'INSERT INTO projects (id, tenant_id, name, description) VALUES ($1, $2, $3, $4)',
-        [projectId, this.tenantId, 'default', 'Default project for this tenant']
+    // Use a reserved shared sentinel so a personal project named "default"
+    // can never be selected by an unscoped agent.  The advisory lock and
+    // partial unique index make concurrent first-use provisioning idempotent.
+    const sharedDefaultName = '__rembr_shared_default__';
+    return this.db.withTenantTransaction(this.tenantId, async client => {
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+        [`default-hierarchy:${this.tenantId}`],
       );
-      return projectId;
-    }
+      const result = await client.query(
+        `SELECT id FROM projects
+         WHERE tenant_id = $1 AND name = $2 AND is_personal = false
+         ORDER BY created_at, id LIMIT 1`,
+        [this.tenantId, sharedDefaultName],
+      );
+      if (result.rows[0]) return result.rows[0].id;
 
-    return result.rows[0].id;
-  }
+      const projectId = randomUUID();
+      const inserted = await client.query(
+        `INSERT INTO projects (id, tenant_id, name, description, is_personal)
+         VALUES ($1, $2, $3, $4, false)
+         ON CONFLICT (tenant_id)
+           WHERE name = '__rembr_shared_default__' AND is_personal = false
+         DO NOTHING
+         RETURNING id`,
+        [projectId, this.tenantId, sharedDefaultName, 'Shared default project for this tenant'],
+      );
+      if (inserted.rows[0]) return inserted.rows[0].id;
 
-  // Check rate limits before operations
-  private async checkRateLimits(operation: 'memory' | 'search'): Promise<void> {
-    const plan = await this.db.getTenantPlan(this.tenantId);
-    if (!plan) {
-      throw new Error('Tenant plan not found');
-    }
-
-    if (operation === 'memory') {
-      const count = await this.db.getMemoryCount(this.tenantId);
-      if (count >= plan.memory_limit) {
-        throw new Error(`Memory limit reached (${plan.memory_limit} memories). Please upgrade your plan.`);
-      }
-    }
-
-    if (operation === 'search') {
-      const searchCount = await this.db.getTodaySearchCount(this.tenantId);
-      if (plan.search_limit_daily > 0 && searchCount >= plan.search_limit_daily) {
-        throw new Error(`Daily search limit reached (${plan.search_limit_daily} searches). Resets at midnight UTC.`);
-      }
-    }
+      const existing = await client.query(
+        `SELECT id FROM projects
+         WHERE tenant_id = $1 AND name = $2 AND is_personal = false
+         ORDER BY created_at, id LIMIT 1`,
+        [this.tenantId, sharedDefaultName],
+      );
+      if (!existing.rows[0]) throw new Error('Unable to provision shared default project');
+      return existing.rows[0].id;
+    });
   }
 
   // Store a new memory
   async storeMemory(input: CreateMemoryInput): Promise<Memory> {
-    await this.checkRateLimits('memory');
-
     const id = randomUUID();
     
     // Always use default project to ensure consistency
@@ -231,7 +230,8 @@ export class MemoryService {
       input.category,
       input.metadata || {},
       input.relevance_score || 1.0,
-      piiData
+      piiData,
+      this.userId,
     );
 
     // Keep store_memory on the durable write path only. Continuous indexing,
@@ -251,12 +251,9 @@ export class MemoryService {
   private static readonly MAX_INFLIGHT_EMBEDDINGS = 3;
   private static inflightEmbeddings = 0;
   private static missingEmbeddingBackfills = new Set<string>();
-  /** Max concurrent contradiction detection jobs (uses LLM — exclusive GPU time) */
-  private static readonly MAX_INFLIGHT_CONTRADICTIONS = 1;
-  private static inflightContradictions = 0;
   /** Total in-flight background jobs across all types */
   static get totalInflight(): number {
-    return MemoryService.inflightEmbeddings + MemoryService.inflightContradictions;
+    return MemoryService.inflightEmbeddings;
   }
   /** Max retry attempts for failed embedding generation */
   private static readonly MAX_EMBEDDING_RETRIES = 3;
@@ -272,40 +269,23 @@ export class MemoryService {
     if (this.embeddingProvider) {
       this.scheduleEmbeddingWithRetry(memoryId, projectId, content, 0);
     } else {
-      console.warn(`⚠️  No embedding provider available for memory ${memoryId} - semantic search will not work for this memory`);
+      console.warn('Embedding provider unavailable; a stored memory remains pending semantic indexing');
     }
 
-    // Background contradiction detection (independent of embeddings)
-    // Concurrency-limited: uses LLM (GPU), serialised to 1 concurrent job
-    if (this.advancedAnalyticsService) {
-      if (MemoryService.inflightContradictions >= MemoryService.MAX_INFLIGHT_CONTRADICTIONS) {
-        console.log(`⏳ Contradiction queue full, skipping detection for memory ${memoryId} (will be caught by next backfill run)`);
-      } else {
-        MemoryService.inflightContradictions++;
-        const contradictionStart = Date.now();
-        this.advancedAnalyticsService.detectContradictionsForMemory(
-          memoryId,
-          content,
-          this.tenantId,
-          0.7 // minConfidence
-        ).then(contradictions => {
-          const durationSec = (Date.now() - contradictionStart) / 1000;
-          trackBackgroundProcessing('contradiction', 'success', this.tenantId, durationSec);
-          if (contradictions.length > 0) {
-            console.log(`⚠️  Detected ${contradictions.length} contradiction(s) for memory ${memoryId}`);
-          }
-        }).catch(error => {
-          const durationSec = (Date.now() - contradictionStart) / 1000;
-          trackBackgroundProcessing('contradiction', 'error', this.tenantId, durationSec);
-          const reason = error?.message?.includes('timeout') ? 'timeout' : 
-                         error?.message?.includes('ECONNREFUSED') ? 'ollama_down' : 'unknown';
-          trackContradictionFailure(reason, this.tenantId);
-          console.error(`❌ Background contradiction detection failed for memory ${memoryId}:`, error?.message || error);
-        }).finally(() => {
-          MemoryService.inflightContradictions--;
-        });
-      }
-    }
+    this.enqueueContradictionDetection(memoryId);
+  }
+
+  private enqueueContradictionDetection(memoryId: string): void {
+    const maintenance = new MemoryMaintenanceService(this.db);
+    maintenance.enqueueContradictionDetectionJobForMemory(this.tenantId, memoryId)
+      .then(result => {
+        if (result.created > 0) {
+          if (process.env.NODE_ENV !== 'production') console.log('Queued contradiction detection');
+        }
+      })
+      .catch(error => {
+        console.error('Failed to queue contradiction detection');
+      });
   }
 
   /**
@@ -316,7 +296,7 @@ export class MemoryService {
     // Concurrency gate: if too many in-flight, delay and retry
     if (MemoryService.inflightEmbeddings >= MemoryService.MAX_INFLIGHT_EMBEDDINGS) {
       const delayMs = 1000 * (attempt + 1); // Back off on concurrency pressure
-      console.log(`⏳ Embedding queue full (${MemoryService.inflightEmbeddings}/${MemoryService.MAX_INFLIGHT_EMBEDDINGS}), delaying ${memoryId} by ${delayMs}ms`);
+      console.log(`⏳ Embedding queue full (${MemoryService.inflightEmbeddings}/${MemoryService.MAX_INFLIGHT_EMBEDDINGS}); delaying a pending job by ${delayMs}ms`);
       setTimeout(() => this.scheduleEmbeddingWithRetry(memoryId, projectId, content, attempt), delayMs);
       return;
     }
@@ -325,12 +305,14 @@ export class MemoryService {
     trackEmbeddingInflight(1);
     const startTime = Date.now();
 
-    console.log(`🔮 Generating embedding for memory ${memoryId} (attempt ${attempt + 1}/${MemoryService.MAX_EMBEDDING_RETRIES}, content: ${content.length} chars, inflight: ${MemoryService.inflightEmbeddings})`);
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`Generating memory embedding (attempt ${attempt + 1}/${MemoryService.MAX_EMBEDDING_RETRIES}, inflight: ${MemoryService.inflightEmbeddings})`);
+    }
 
-    this.embeddingProvider!.generateEmbedding(content)
+    this.embeddingProvider!.generateEmbedding(content, { tenantId: this.tenantId })
       .then(async (embedding) => {
         const durationSec = (Date.now() - startTime) / 1000;
-        console.log(`✅ Generated embedding for ${memoryId} in ${durationSec.toFixed(2)}s (dims: ${embedding.length})`);
+        if (process.env.NODE_ENV !== 'production') console.log(`Generated embedding in ${durationSec.toFixed(2)}s`);
         
         await this.db.storeEmbedding(
           memoryId,
@@ -342,7 +324,7 @@ export class MemoryService {
         );
         
         trackBackgroundProcessing('embedding', 'success', this.tenantId, durationSec);
-        console.log(`💾 Stored embedding for memory ${memoryId}`);
+        if (process.env.NODE_ENV !== 'production') console.log('Stored memory embedding');
         
         // After embedding is ready, infer relationships
         return this.scheduleRelationshipInference(memoryId, projectId);
@@ -360,11 +342,11 @@ export class MemoryService {
         // Retry with exponential backoff
         if (attempt < MemoryService.MAX_EMBEDDING_RETRIES - 1) {
           const backoffMs = Math.min(1000 * Math.pow(2, attempt), 30000); // 1s, 2s, 4s... max 30s
-          embeddingRetryCounter.labels(this.tenantId).inc();
-          console.warn(`⚠️  Embedding failed for ${memoryId} (attempt ${attempt + 1}/${MemoryService.MAX_EMBEDDING_RETRIES}, reason: ${reason}). Retrying in ${backoffMs}ms...`);
+          embeddingRetryCounter.inc();
+          console.warn(`Embedding failed (attempt ${attempt + 1}/${MemoryService.MAX_EMBEDDING_RETRIES}, reason: ${reason}); retrying in ${backoffMs}ms`);
           setTimeout(() => this.scheduleEmbeddingWithRetry(memoryId, projectId, content, attempt + 1), backoffMs);
         } else {
-          console.error(`❌ Embedding generation permanently failed for memory ${memoryId} after ${MemoryService.MAX_EMBEDDING_RETRIES} attempts (reason: ${reason}):`, error?.message || error);
+          console.error(`Embedding generation failed after ${MemoryService.MAX_EMBEDDING_RETRIES} attempts (reason: ${reason})`);
         }
       })
       .finally(() => {
@@ -393,7 +375,7 @@ export class MemoryService {
       const qualityRelationships = relationships.filter(r => r.confidence >= 0.6);
       
       if (qualityRelationships.length > 0) {
-        console.log(`💾 Auto-storing ${qualityRelationships.length} background inferred relationships for memory ${memoryId}`);
+        if (process.env.NODE_ENV !== 'production') console.log(`Storing ${qualityRelationships.length} inferred relationships`);
         
         await this.relationshipService.storeRelationships(
           qualityRelationships,
@@ -406,17 +388,16 @@ export class MemoryService {
     } catch (error) {
       const durationSec = (Date.now() - startTime) / 1000;
       trackBackgroundProcessing('relationship', 'error', this.tenantId, durationSec);
-      console.error('Background relationship inference failed:', error);
+      console.error('Background relationship inference failed');
     }
   }
 
   // Hybrid search: combine semantic and text search with graph-aware ranking
   async searchMemory(input: SearchMemoryInput): Promise<SearchMemoryResults> {
-    await this.checkRateLimits('search');
+    await this.db.reserveSearchQuota(this.tenantId, this.projectId);
 
     const limit = input.limit || 10;
-    const defaultMinSimilarity = this.getDefaultSearchMinSimilarity();
-    const minSimilarity = input.min_similarity ?? defaultMinSimilarity;
+    const minSimilarity = input.min_similarity ?? this.getDefaultSearchMinSimilarity();
     const searchMode = input.search_mode || 'hybrid';
 
     // Weights for hybrid search
@@ -430,10 +411,9 @@ export class MemoryService {
       min_similarity: minSimilarity,
       embedding_coverage: null,
       embedding_pending: null,
-      embedding_total: null
+      embedding_total: null,
     };
 
-    // Semantic search if embedding provider is available
     if ((searchMode === 'semantic' || searchMode === 'hybrid') && !this.embeddingProvider) {
       diagnostics.semantic_status = 'unavailable';
       diagnostics.semantic_error = 'No embedding provider configured';
@@ -443,10 +423,11 @@ export class MemoryService {
       }
     }
 
+    // Semantic search if embedding provider is available
     if ((searchMode === 'semantic' || searchMode === 'hybrid') && this.embeddingProvider) {
       try {
-        console.log(`🔍 Generating embedding for query: "${input.query}"`);
-        const queryEmbedding = await this.embeddingProvider.generateEmbedding(input.query);
+        if (process.env.NODE_ENV !== 'production') console.log('Generating search-query embedding');
+        const queryEmbedding = await this.embeddingProvider.generateEmbedding(input.query, { tenantId: this.tenantId });
         console.log(`✅ Query embedding generated, length: ${queryEmbedding.length}`);
         
         const semanticResults = await this.db.semanticSearch(
@@ -461,7 +442,6 @@ export class MemoryService {
         console.log(`📊 Semantic search returned ${semanticResults.length} results`);
 
         for (const result of semanticResults) {
-          console.log(`  - Memory ${result.id}: similarity=${result.similarity.toFixed(3)} (threshold=${minSimilarity})`);
           if (result.similarity >= minSimilarity) {
             results.push({
               ...result,
@@ -473,11 +453,11 @@ export class MemoryService {
         console.log(`✅ ${results.length} results passed similarity threshold`);
         diagnostics.semantic_status = 'succeeded';
       } catch (error) {
-        console.error('❌ Semantic search failed:', error);
+        console.error('Semantic search failed');
         diagnostics.semantic_status = 'failed';
-        diagnostics.semantic_error = (error as Error).message;
+        diagnostics.semantic_error = 'Embedding-backed search failed';
         if (searchMode === 'semantic') {
-          throw new Error(`Semantic search unavailable: ${(error as Error).message}`);
+          throw new Error('Semantic search unavailable');
         }
         diagnostics.fallback_used = true;
       }
@@ -492,7 +472,8 @@ export class MemoryService {
         limit * 2,
         searchMode === 'phrase',
         input.metadata_filter,
-        this.userId
+        this.userId,
+        this.projectId
       );
 
       // Merge text results with semantic results
@@ -534,7 +515,7 @@ export class MemoryService {
         ? (embeddingStatus.total - embeddingStatus.pending) / embeddingStatus.total
         : 1;
     } catch (error) {
-      console.warn('Failed to calculate search embedding coverage:', (error as Error).message);
+      console.warn('Failed to calculate search embedding coverage');
     }
     
     // Apply token budget truncation if requested (REM-103)
@@ -550,9 +531,9 @@ export class MemoryService {
         );
         if (budgetLimit) {
           maxTokens = budgetLimit;
-          console.log(`📊 Using budget limit ${budgetLimit} tokens for category "${input.token_budget_category}"`);
+          if (process.env.NODE_ENV !== 'production') console.log(`Using a ${budgetLimit}-token search budget`);
         } else {
-          console.warn(`⚠️  Budget category "${input.token_budget_category}" not found or inactive`);
+          console.warn('Requested search-budget category was not found or is inactive');
         }
       } catch (error) {
         console.error('❌ Failed to fetch budget limit:', error);
@@ -577,7 +558,7 @@ export class MemoryService {
 
   private withSearchMetadata(
     results: ExpandedSearchResult[],
-    diagnostics: SearchDiagnostics
+    diagnostics: SearchDiagnostics,
   ): SearchMemoryResults {
     const enriched = results as SearchMemoryResults;
     enriched.search_metadata = diagnostics;
@@ -591,34 +572,36 @@ export class MemoryService {
     }
 
     const provider = this.embeddingProvider?.name.toLowerCase() || '';
-    if (provider.includes('openai-compatible')) {
-      return 0.35;
-    }
-
-    return 0.5;
+    return provider.includes('openai-compatible') ? 0.35 : 0.5;
   }
 
   // List recent memories
   async listMemories(limit: number = 10, category?: string): Promise<Memory[]> {
-    console.log(`🔍 MemoryService.listMemories called with limit=${limit}, category=${category}, tenantId=${this.tenantId}`);
+    if (process.env.NODE_ENV !== 'production') console.log(`Listing memories with limit ${limit}`);
     try {
-      const memories = await this.db.getRecentMemories(this.tenantId, limit, category);
+      const memories = await this.db.getRecentMemories(
+        this.tenantId,
+        limit,
+        category,
+        this.projectId,
+        this.userId,
+      );
       console.log(`✅ MemoryService.listMemories completed, retrieved ${memories.length} memories`);
       return memories;
     } catch (error) {
-      console.error('❌ MemoryService.listMemories failed:', error);
+      console.error('Memory listing failed');
       throw error;
     }
   }
 
   // Get specific memory by ID
   async getMemory(id: string): Promise<Memory | null> {
-    return await this.db.getMemoryById(id, this.tenantId);
+    return await this.db.getMemoryById(id, this.tenantId, this.projectId, this.userId);
   }
 
   // Update memory
   async updateMemory(id: string, updates: UpdateMemoryInput): Promise<Memory | null> {
-    const updated = await this.db.updateMemory(id, this.tenantId, updates);
+    const updated = await this.db.updateMemory(id, this.tenantId, updates, this.projectId, this.userId);
     
     // Re-scan for PII if content changed (REM-50/REM-51)
     if (updated && updates.content) {
@@ -644,7 +627,7 @@ export class MemoryService {
     // Regenerate embedding if content changed
     if (updated && updates.content && this.embeddingProvider) {
       try {
-        const embedding = await this.embeddingProvider.generateEmbedding(updates.content);
+        const embedding = await this.embeddingProvider.generateEmbedding(updates.content, { tenantId: this.tenantId });
         await this.db.storeEmbedding(
           id,
           this.tenantId,
@@ -654,21 +637,7 @@ export class MemoryService {
           this.embeddingProvider.getModelFingerprint()  // REM-249
         );
         
-        // Re-check for contradictions with updated content
-        if (this.advancedAnalyticsService) {
-          this.advancedAnalyticsService.detectContradictionsForMemory(
-            id,
-            updates.content,
-            this.tenantId,
-            0.7
-          ).then(contradictions => {
-            if (contradictions.length > 0) {
-              console.log(`⚠️  Detected ${contradictions.length} contradiction(s) for updated memory ${id}`);
-            }
-          }).catch(error => {
-            console.error('Automatic contradiction detection failed:', error);
-          });
-        }
+        this.enqueueContradictionDetection(id);
       } catch (error) {
         console.error('Failed to regenerate embedding:', error);
       }
@@ -679,7 +648,7 @@ export class MemoryService {
 
   // Delete memory
   async deleteMemory(id: string): Promise<boolean> {
-    return await this.db.deleteMemory(id, this.tenantId);
+    return await this.db.deleteMemory(id, this.tenantId, this.projectId, this.userId);
   }
 
   /**
@@ -699,22 +668,39 @@ export class MemoryService {
           mr.target_memory_id,
           mr.relationship_type,
           mr.confidence,
-          mr.evidence,
+          LEFT(mr.evidence, 2048) AS evidence,
           m.id,
-          m.content,
+          LEFT(m.content, 2048) AS content,
           m.category,
           m.created_at
         FROM memory_relationships mr
         JOIN memories m ON (m.id = mr.source_memory_id OR m.id = mr.target_memory_id)
+        LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
         WHERE (mr.source_memory_id = ANY($1) OR mr.target_memory_id = ANY($1))
           AND mr.confidence > 0.6  -- Only high-confidence relationships
           AND m.tenant_id = $2
+          AND ($4::uuid IS NULL OR m.project_id = $4::uuid)
+          AND (
+            (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+            OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+            OR (
+              COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+              AND p.id IS NOT NULL
+              AND (p.is_personal = false OR p.owner_id = $3::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p.id AND pm.user_id = $3::uuid))
+            )
+          )
           AND m.id != ALL($1)  -- Exclude original results
         ORDER BY mr.confidence DESC
         LIMIT 50  -- Cap connected memories to avoid explosion
       `;
 
-      const result = await this.db.query(query, [memoryIds, this.tenantId], this.tenantId);
+      const result = await this.db.query(
+        query,
+        [memoryIds, this.tenantId, this.userId || null, this.projectId || null],
+        this.tenantId,
+      );
       const connectedRows = result.rows;
 
       // Group connected memories by source memory
@@ -791,20 +777,54 @@ export class MemoryService {
   }
 
   // Get statistics
-  async getStats(): Promise<MemoryStats> {
+  async getStats(includeTenantSearchUsage: boolean = false): Promise<MemoryStats> {
     const plan = await this.db.getTenantPlan(this.tenantId);
     if (!plan) {
       throw new Error('Tenant plan not found');
     }
 
-    const totalMemories = await this.db.getMemoryCount(this.tenantId);
-    const searchesToday = await this.db.getTodaySearchCount(this.tenantId);
+    const scopedEmbeddingState = await this.getPendingEmbeddingCount();
+    const totalMemories = scopedEmbeddingState.total;
+    // Usage rows are project-keyed but not user-keyed. Only an explicitly
+    // privileged tenant view may receive the unscoped tenant aggregate.
+    const searchesToday = this.projectId
+      ? Number(await this.db.getTodaySearchCount(this.tenantId, this.projectId))
+      : includeTenantSearchUsage
+        ? Number(await this.db.getTodaySearchCount(this.tenantId))
+        : null;
 
-    // Get category breakdown
-    const byCategory: Record<string, number> = {};
-    for (const category of MEMORY_CATEGORIES) {
-      const memories = await this.db.getRecentMemories(this.tenantId, 1000, category);
-      byCategory[category] = memories.length;
+    // Exact bounded aggregate. The former per-category recent-memory query
+    // silently capped every category at 1,000 and therefore reported false
+    // totals for mature agent tenants.
+    const categoryResult = await this.db.query(
+      `SELECT m.category, COUNT(*)::integer AS count
+       FROM memories m
+       LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+       WHERE m.tenant_id = $1
+         AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+         AND m.category = ANY($4::text[])
+         AND (
+           (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+           OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+           OR (
+             COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+             AND p.id IS NOT NULL
+             AND (p.is_personal = false OR p.owner_id = $3::uuid
+                  OR EXISTS (SELECT 1 FROM project_members pm
+                             WHERE pm.project_id = p.id AND pm.user_id = $3::uuid))
+           )
+         )
+       GROUP BY m.category`,
+      [this.tenantId, this.projectId || null, this.userId || null, [...MEMORY_CATEGORIES]],
+      this.tenantId,
+    );
+    const byCategory: Record<string, number> = Object.fromEntries(
+      MEMORY_CATEGORIES.map(category => [category, 0]),
+    );
+    for (const row of categoryResult.rows) {
+      if (typeof row.category === 'string' && row.category in byCategory) {
+        byCategory[row.category] = Number(row.count || 0);
+      }
     }
 
     return {
@@ -813,8 +833,12 @@ export class MemoryService {
       plan: plan.plan,
       memory_limit: plan.memory_limit,
       searches_today: searchesToday,
+      searches_today_scope: this.projectId
+        ? 'project'
+        : includeTenantSearchUsage ? 'tenant' : 'unavailable',
       search_limit_daily: plan.search_limit_daily,
-      usage_percentage: Math.round((totalMemories / plan.memory_limit) * 100)
+      usage_percentage: Math.round((totalMemories / plan.memory_limit) * 100),
+      scope: 'authorised_audience',
     };
   }
 
@@ -829,18 +853,25 @@ export class MemoryService {
       throw new Error('Semantic search not available - embeddings not configured');
     }
 
-    // Get the source memory's embedding
+    // Authorise the source before touching its embedding. Otherwise an
+    // arbitrary same-tenant UUID becomes a private/project existence oracle.
+    const sourceMemory = await this.db.getMemoryById(
+      memoryId,
+      this.tenantId,
+      this.projectId,
+      this.userId,
+    );
+    if (!sourceMemory) {
+      throw new Error('Memory not found or access denied');
+    }
+
+    // Get the authorised source memory's embedding.
     const embedding = await this.db.getEmbedding(memoryId, this.tenantId);
     if (!embedding) {
       throw new Error('Memory has no embedding');
     }
 
-    console.log('Retrieved embedding object:', embedding);
-    console.log('Embedding field type:', typeof embedding.embedding);
-    console.log('Is embedding field an array?', Array.isArray(embedding.embedding));
-    if (Array.isArray(embedding.embedding)) {
-      console.log('Embedding array length:', embedding.embedding.length);
-    }
+    await this.db.reserveSearchQuota(this.tenantId, this.projectId);
 
     // Ensure we have a valid embedding array
     let embeddingArray: number[];
@@ -856,7 +887,9 @@ export class MemoryService {
       this.projectId,
       embeddingArray,
       limit + 1, // +1 to exclude the source memory
-      category
+      category,
+      undefined,
+      this.userId,
     );
 
     // Filter out the source memory and apply similarity threshold
@@ -867,9 +900,10 @@ export class MemoryService {
 
   // Get embedding statistics
   async getEmbeddingStats(): Promise<EmbeddingStats> {
-    const totalMemories = await this.db.getMemoryCount(this.tenantId);
-    const embeddingCount = await this.db.getEmbeddingCount(this.tenantId);
-    const backlog = totalMemories - embeddingCount;
+    const scoped = await this.getPendingEmbeddingCount();
+    const totalMemories = scoped.total;
+    const backlog = scoped.pending;
+    const embeddingCount = totalMemories - backlog;
 
     // Update Prometheus gauge so alerting can fire on backlog growth
     updateEmbeddingBacklog(this.tenantId, backlog);
@@ -882,10 +916,6 @@ export class MemoryService {
       provider = this.embeddingProvider.name;
       model = this.embeddingProvider.model;
       dimensions = this.embeddingProvider.dimensions;
-    }
-
-    if (backlog > 0) {
-      this.scheduleMissingEmbeddingBackfill(backlog);
     }
 
     return {
@@ -903,8 +933,27 @@ export class MemoryService {
    * Lightweight query for use in search responses.
    */
   async getPendingEmbeddingCount(): Promise<{ pending: number; total: number }> {
-    const total = await this.db.getMemoryCount(this.tenantId);
-    const indexed = await this.db.getEmbeddingCount(this.tenantId);
+    const result = await this.db.query(`
+      SELECT COUNT(*)::int AS total, COUNT(e.memory_id)::int AS indexed
+      FROM memories m
+      LEFT JOIN memory_embeddings e ON e.memory_id = m.id
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+      WHERE m.tenant_id = $1
+        AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+          OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+          OR (
+            COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+            AND p.id IS NOT NULL
+            AND (p.is_personal = false OR p.owner_id = $3::uuid
+                 OR EXISTS (SELECT 1 FROM project_members pm
+                            WHERE pm.project_id = p.id AND pm.user_id = $3::uuid))
+          )
+        )
+    `, [this.tenantId, this.projectId || null, this.userId || null], this.tenantId);
+    const total = Number(result.rows[0]?.total || 0);
+    const indexed = Number(result.rows[0]?.indexed || 0);
     return { pending: Math.max(0, total - indexed), total };
   }
 
@@ -923,10 +972,21 @@ export class MemoryService {
       SELECT m.id, m.content, m.tenant_id
       FROM memories m
       LEFT JOIN memory_embeddings me ON m.id = me.memory_id
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
       WHERE m.tenant_id = $1 AND me.memory_id IS NULL
+        AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+          OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+          OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+              AND p.id IS NOT NULL
+              AND (p.is_personal = false OR p.owner_id = $3::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p.id AND pm.user_id = $3::uuid)))
+        )
       ORDER BY m.created_at DESC
-      LIMIT $2
-    `, [this.tenantId, batchSize], this.tenantId);
+      LIMIT $4
+    `, [this.tenantId, this.projectId || null, this.userId || null, batchSize], this.tenantId);
 
     let generated = 0;
     let failed = 0;
@@ -936,7 +996,7 @@ export class MemoryService {
         trackEmbeddingInflight(1);
         const startTime = Date.now();
         
-        const embedding = await this.embeddingProvider.generateEmbedding(row.content);
+        const embedding = await this.embeddingProvider.generateEmbedding(row.content, { tenantId: this.tenantId });
         await this.db.storeEmbedding(
           row.id,
           this.tenantId,
@@ -949,13 +1009,13 @@ export class MemoryService {
         const durationSec = (Date.now() - startTime) / 1000;
         trackBackgroundProcessing('embedding', 'success', this.tenantId, durationSec);
         generated++;
-        console.log(`✅ Backfill: generated embedding for ${row.id} in ${durationSec.toFixed(2)}s`);
+        if (process.env.NODE_ENV !== 'production') console.log(`Backfill generated an embedding in ${durationSec.toFixed(2)}s`);
       } catch (error: any) {
         const reason = error?.message?.includes('timeout') ? 'timeout' :
                        error?.message?.includes('ECONNREFUSED') ? 'ollama_down' : 'unknown';
         trackEmbeddingFailure(reason, this.tenantId);
         failed++;
-        console.error(`❌ Backfill: failed for ${row.id} (${reason}):`, error?.message || error);
+        console.error(`Backfill embedding failed (${reason})`);
         
         // If Ollama is down, stop the batch early — no point continuing
         if (reason === 'ollama_down' || reason === 'timeout') {
@@ -968,9 +1028,7 @@ export class MemoryService {
     }
 
     // Update backlog gauge without recursively scheduling another backfill.
-    const totalMemories = await this.db.getMemoryCount(this.tenantId);
-    const embeddingCount = await this.db.getEmbeddingCount(this.tenantId);
-    const remaining = Math.max(0, totalMemories - embeddingCount);
+    const remaining = (await this.getPendingEmbeddingCount()).pending;
     updateEmbeddingBacklog(this.tenantId, remaining);
     console.log(`📊 Backfill complete: ${generated} generated, ${failed} failed, ${remaining} remaining`);
 
@@ -987,7 +1045,7 @@ export class MemoryService {
       try {
         await this.backfillMissingEmbeddings(Math.min(25, Math.max(1, backlog)));
       } catch (error) {
-        console.error(`Tenant embedding backfill failed for ${this.tenantId}:`, error);
+        console.error('Tenant embedding backfill failed');
       } finally {
         MemoryService.missingEmbeddingBackfills.delete(this.tenantId);
       }
@@ -1018,7 +1076,8 @@ export class MemoryService {
     const relationships = await this.relationshipService.inferRelationshipsForMemory(
       memoryId, 
       this.tenantId, 
-      this.projectId
+      this.projectId,
+      this.userId,
     );
     
     // Filter by confidence and store high-confidence relationships
@@ -1084,7 +1143,7 @@ export class MemoryService {
             expandedResults.add(rel.target_memory_id);
           }
         } catch (error) {
-          console.log('Relationship expansion failed for memory:', result.id);
+          console.warn('Relationship expansion failed for a search result');
         }
       }
 
@@ -1131,18 +1190,29 @@ export class MemoryService {
    */
   private async getMemoriesByIds(ids: string[]): Promise<HybridSearchResult[]> {
     if (ids.length === 0) return [];
-    
-    const placeholders = ids.map((_, index) => `$${index + 3}`).join(',');
+
     const query = `
-      SELECT id, content, category, metadata, created_at, updated_at, relevance_score
-      FROM memories 
-      WHERE tenant_id = $1 
-      ${this.projectId ? 'AND project_id = $2' : 'AND project_id IS NULL'}
-      AND id IN (${placeholders})
-      ORDER BY created_at DESC
+      SELECT m.id, m.content, m.category, m.metadata, m.created_at, m.updated_at, m.relevance_score
+      FROM memories m
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+      WHERE m.tenant_id = $1
+        AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+        AND m.id = ANY($3::uuid[])
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+          OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+          OR (
+            COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+            AND p.id IS NOT NULL
+            AND (p.is_personal = false OR p.owner_id = $4::uuid
+                 OR EXISTS (SELECT 1 FROM project_members pm
+                            WHERE pm.project_id = p.id AND pm.user_id = $4::uuid))
+          )
+        )
+      ORDER BY m.created_at DESC
     `;
-    
-    const params = this.projectId ? [this.tenantId, this.projectId, ...ids] : [this.tenantId, null, ...ids];
+
+    const params = [this.tenantId, this.projectId || null, ids, this.userId || null];
     const result = await this.db.query(query, params, this.tenantId);
     
     return result.rows.map((row: any) => ({
@@ -1157,18 +1227,28 @@ export class MemoryService {
   private async getPatternInsights(since: Date): Promise<any> {
     // Analyze common patterns in memory content
     const query = `
-      SELECT category, COUNT(*) as count, 
-             AVG(LENGTH(content)) as avg_length,
-             COUNT(CASE WHEN metadata IS NOT NULL AND metadata != '{}' THEN 1 END) as with_metadata
-      FROM memories 
-      WHERE tenant_id = $1 
-      ${this.projectId ? 'AND project_id = $2' : ''}
-      AND created_at >= $${this.projectId ? '3' : '2'}
-      GROUP BY category
+      SELECT m.category, COUNT(*) as count,
+             AVG(LENGTH(m.content)) as avg_length,
+             COUNT(CASE WHEN m.metadata IS NOT NULL AND m.metadata != '{}' THEN 1 END) as with_metadata
+      FROM memories m
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+      WHERE m.tenant_id = $1
+        AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+          OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+          OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+              AND p.id IS NOT NULL
+              AND (p.is_personal = false OR p.owner_id = $3::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p.id AND pm.user_id = $3::uuid)))
+        )
+        AND m.created_at >= $4
+      GROUP BY m.category
       ORDER BY count DESC
     `;
-    
-    const params = this.projectId ? [this.tenantId, this.projectId, since] : [this.tenantId, since];
+
+    const params = [this.tenantId, this.projectId || null, this.userId || null, since];
     const result = await this.db.query(query, params, this.tenantId);
     
     return {
@@ -1183,14 +1263,41 @@ export class MemoryService {
       const query = `
         SELECT mr.relationship_type, COUNT(*) as count, AVG(mr.confidence) as avg_confidence
         FROM memory_relationships mr
-        JOIN memories m ON m.id = mr.source_memory_id
-        WHERE m.tenant_id = $1
-          AND mr.created_at >= $2
+        JOIN memories ms ON ms.id = mr.source_memory_id
+        JOIN memories mt ON mt.id = mr.target_memory_id
+        LEFT JOIN projects ps ON ps.id = ms.project_id AND ps.tenant_id = ms.tenant_id
+        LEFT JOIN projects pt ON pt.id = mt.project_id AND pt.tenant_id = mt.tenant_id
+        WHERE ms.tenant_id = $1 AND mt.tenant_id = $1
+          AND ($2::uuid IS NULL OR (ms.project_id = $2::uuid AND mt.project_id = $2::uuid))
+          AND (
+            (COALESCE(ms.visibility, 'shared') = 'personal' AND ms.user_id = $3::uuid)
+            OR (COALESCE(ms.visibility, 'shared') = 'shared' AND ms.project_id IS NULL)
+            OR (COALESCE(ms.visibility, 'shared') IN ('shared', 'project')
+                AND ps.id IS NOT NULL
+                AND (ps.is_personal = false OR ps.owner_id = $3::uuid
+                     OR EXISTS (SELECT 1 FROM project_members pm
+                                WHERE pm.project_id = ps.id AND pm.user_id = $3::uuid)))
+          )
+          AND (
+            (COALESCE(mt.visibility, 'shared') = 'personal' AND mt.user_id = $3::uuid)
+            OR (COALESCE(mt.visibility, 'shared') = 'shared' AND mt.project_id IS NULL)
+            OR (COALESCE(mt.visibility, 'shared') IN ('shared', 'project')
+                AND pt.id IS NOT NULL
+                AND (pt.is_personal = false OR pt.owner_id = $3::uuid
+                     OR EXISTS (SELECT 1 FROM project_members pm
+                                WHERE pm.project_id = pt.id AND pm.user_id = $3::uuid)))
+          )
+          AND mr.created_at >= $4
         GROUP BY mr.relationship_type
         ORDER BY count DESC
+        LIMIT 100
       `;
-      
-      const result = await this.db.query(query, [this.tenantId, since], this.tenantId);
+
+      const result = await this.db.query(
+        query,
+        [this.tenantId, this.projectId || null, this.userId || null, since],
+        this.tenantId,
+      );
       
       return {
         relationship_types: result.rows,
@@ -1208,19 +1315,29 @@ export class MemoryService {
   private async getUsageInsights(since: Date): Promise<any> {
     const query = `
       SELECT 
-        DATE_TRUNC('day', created_at) as date,
+        DATE_TRUNC('day', m.created_at) as date,
         COUNT(*) as memories_created,
-        COUNT(DISTINCT category) as categories_used
-      FROM memories 
-      WHERE tenant_id = $1 
-      ${this.projectId ? 'AND project_id = $2' : ''}
-      AND created_at >= $${this.projectId ? '3' : '2'}
-      GROUP BY DATE_TRUNC('day', created_at)
+        COUNT(DISTINCT m.category) as categories_used
+      FROM memories m
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+      WHERE m.tenant_id = $1
+        AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+          OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+          OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+              AND p.id IS NOT NULL
+              AND (p.is_personal = false OR p.owner_id = $3::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p.id AND pm.user_id = $3::uuid)))
+        )
+        AND m.created_at >= $4
+      GROUP BY DATE_TRUNC('day', m.created_at)
       ORDER BY date DESC
       LIMIT 30
     `;
     
-    const params = this.projectId ? [this.tenantId, this.projectId, since] : [this.tenantId, since];
+    const params = [this.tenantId, this.projectId || null, this.userId || null, since];
     const result = await this.db.query(query, params, this.tenantId);
     
     return {
@@ -1235,20 +1352,30 @@ export class MemoryService {
   private async getCategoryInsights(since: Date): Promise<any> {
     const query = `
       SELECT 
-        category,
+        m.category,
         COUNT(*) as count,
         COUNT(*) * 100.0 / SUM(COUNT(*)) OVER () as percentage,
-        AVG(relevance_score) as avg_relevance
-      FROM memories 
-      WHERE tenant_id = $1 
-      ${this.projectId ? 'AND project_id = $2' : ''}
-      AND created_at >= $${this.projectId ? '3' : '2'}
-      AND category IS NOT NULL
-      GROUP BY category
+        AVG(m.relevance_score) as avg_relevance
+      FROM memories m
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+      WHERE m.tenant_id = $1
+        AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+          OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+          OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+              AND p.id IS NOT NULL
+              AND (p.is_personal = false OR p.owner_id = $3::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p.id AND pm.user_id = $3::uuid)))
+        )
+        AND m.created_at >= $4
+        AND m.category IS NOT NULL
+      GROUP BY m.category
       ORDER BY count DESC
     `;
     
-    const params = this.projectId ? [this.tenantId, this.projectId, since] : [this.tenantId, since];
+    const params = [this.tenantId, this.projectId || null, this.userId || null, since];
     const result = await this.db.query(query, params, this.tenantId);
     
     const categoryStats = result.rows.map((row: any) => ({
@@ -1268,16 +1395,26 @@ export class MemoryService {
   private async getDomainInsights(since: Date): Promise<any> {
     // Analyze domain patterns from content and metadata
     const query = `
-      SELECT content, metadata, category
-      FROM memories 
-      WHERE tenant_id = $1 
-      ${this.projectId ? 'AND project_id = $2' : ''}
-      AND created_at >= $${this.projectId ? '3' : '2'}
-      ORDER BY created_at DESC
+      SELECT LEFT(m.content, $5::integer) AS content, m.category
+      FROM memories m
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+      WHERE m.tenant_id = $1
+        AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+          OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+          OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+              AND p.id IS NOT NULL
+              AND (p.is_personal = false OR p.owner_id = $3::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p.id AND pm.user_id = $3::uuid)))
+        )
+        AND m.created_at >= $4
+      ORDER BY m.created_at DESC
       LIMIT 100
     `;
     
-    const params = this.projectId ? [this.tenantId, this.projectId, since] : [this.tenantId, since];
+    const params = [this.tenantId, this.projectId || null, this.userId || null, since, 2_048];
     const result = await this.db.query(query, params, this.tenantId);
     
     // Analyze content for domain indicators
@@ -1355,9 +1492,9 @@ export class MemoryService {
 
     for (const row of staleEmbeddings) {
       try {
-        console.log(`♻️  Re-embedding stale memory ${row.memory_id} (old model: ${row.old_model})`);
+        if (process.env.NODE_ENV !== 'production') console.log('Re-embedding stale memory data');
         
-        const embedding = await this.embeddingProvider.generateEmbedding(row.content);
+        const embedding = await this.embeddingProvider.generateEmbedding(row.content, { tenantId: this.tenantId });
         await this.db.storeEmbedding(
           row.memory_id,
           this.tenantId,
@@ -1368,9 +1505,9 @@ export class MemoryService {
         );
 
         reEmbedded++;
-        console.log(`✅ Re-embedded ${row.memory_id}`);
+        if (process.env.NODE_ENV !== 'production') console.log('Re-embedded stale memory data');
       } catch (error) {
-        console.error(`❌ Failed to re-embed ${row.memory_id}:`, error);
+        console.error('Failed to re-embed stale memory data');
       }
     }
 

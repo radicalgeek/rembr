@@ -203,14 +203,18 @@ This is additive — existing code that ignores the `metadata` field continues t
 Tools are now partitioned by server type for high-volume deployments:
 
 ```bash
+# Install and build the exact lockfile once, then use the local runtime.
+npm ci
+npm run build
+
 # Core memory operations only
-SERVER_TYPE=core npx @rembr/mcp-server
+SERVER_TYPE=core npm start
 
 # RLM + task management tools only  
-SERVER_TYPE=rlm npx @rembr/mcp-server
+SERVER_TYPE=rlm npm start
 
 # All tools (default, same as before)
-SERVER_TYPE=all npx @rembr/mcp-server
+SERVER_TYPE=all npm start
 ```
 
 Single-server deployments don't need to change anything — `SERVER_TYPE=all` is the default.

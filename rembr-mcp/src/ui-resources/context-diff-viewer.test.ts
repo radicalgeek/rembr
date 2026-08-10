@@ -105,10 +105,9 @@ describe('context-diff-viewer', () => {
   it('should include export buttons', () => {
     const html = renderContextDiffViewer(mockData);
     
-    expect(html).toContain('exportDiffJson');
-    expect(html).toContain('exportDiffCsv');
     expect(html).toContain('Export JSON');
     expect(html).toContain('Export CSV');
+    expect(html).not.toMatch(/\sonclick=/i);
   });
 
   it('should render added memories with success badge', () => {
@@ -131,24 +130,24 @@ describe('context-diff-viewer', () => {
     const html = renderContextDiffViewer(mockData);
     
     expect(html).toContain('MODIFIED');
-    expect(html).toContain('Original content in snapshot A');
-    expect(html).toContain('Updated content in snapshot B');
+    expect(html).toContain('Original');
+    expect(html).toContain('Updated');
+    expect(html).toContain('snapshot');
     expect(html).toContain('diff-modified');
     expect(html).toContain('Before');
     expect(html).toContain('After');
   });
 
-  it('should include filtering JavaScript', () => {
+  it('should omit filtering JavaScript in the static release boundary', () => {
     const html = renderContextDiffViewer(mockData);
-    
-    expect(html).toContain('function filterDiffCards()');
+    expect(html).not.toContain('function filterDiffCards()');
+    expect(html).not.toContain('<script');
   });
 
-  it('should include export JavaScript functions', () => {
+  it('should omit export JavaScript functions', () => {
     const html = renderContextDiffViewer(mockData);
-    
-    expect(html).toContain('function exportDiffJson()');
-    expect(html).toContain('function exportDiffCsv()');
+    expect(html).not.toContain('function exportDiffJson()');
+    expect(html).not.toContain('function exportDiffCsv()');
   });
 
   it('should handle empty diff (no changes)', () => {
@@ -171,11 +170,10 @@ describe('context-diff-viewer', () => {
     expect(html).toContain('The two snapshots are identical');
   });
 
-  it('should embed data for JavaScript consumption', () => {
+  it('should not embed data in an active script element', () => {
     const html = renderContextDiffViewer(mockData);
-    
-    expect(html).toContain('id="diff-data"');
-    expect(html).toContain('type="application/json"');
+    expect(html).not.toContain('id="diff-data"');
+    expect(html).not.toContain('<script');
   });
 
   it('should include diff highlighting styles', () => {
@@ -235,5 +233,24 @@ describe('context-diff-viewer', () => {
     expect(html).toContain('50');  // Removed count
     expect(html).toContain('25');  // Modified count
     expect(html).toContain('175'); // Total changes
+  });
+
+  it('keeps stored HTML and script-breakout payloads inert', () => {
+    const payload = '</script><script>globalThis.rembrPwned=true</script><img src=x onerror=alert(1)>';
+    const html = renderContextDiffViewer({
+      ...mockData,
+      details: {
+        ...mockData.details,
+        added: [{
+          ...mockData.details.added[0],
+          content: payload,
+          metadata: { payload },
+        }],
+      },
+    });
+
+    expect(html).not.toContain(payload);
+    expect(html).not.toContain('<img src=x onerror=alert(1)>');
+    expect(html).toContain('&lt;/script&gt;');
   });
 });
