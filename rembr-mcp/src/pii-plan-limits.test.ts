@@ -2,7 +2,7 @@
  * PII Plan-Tier Limits Tests (RAD-35 / REM-51)
  */
 
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import {
   getPIICapabilities,
   clampSensitivity,
@@ -11,6 +11,7 @@ import {
   getPIIScanUsage,
   PII_PLAN_CAPABILITIES,
   PII_SCANS_UNLIMITED,
+  __piiQuotaTesting,
   type PlanTier,
 } from './pii-plan-limits.js';
 
@@ -230,8 +231,8 @@ describe('RAD-35: piiScansPerMonth per plan tier', () => {
   });
 });
 
-describe('RAD-35: checkPIIScanQuota (Redis-free / fail-open)', () => {
-  // Without Redis these tests use the fail-open path
+describe('RAD-35: checkPIIScanQuota atomic and bounded fallback', () => {
+  afterEach(() => __piiQuotaTesting.reset());
 
   it('enterprise plan: always allowed (unlimited, skips Redis)', async () => {
     const result = await checkPIIScanQuota('tenant-ent', 'enterprise');
@@ -240,9 +241,9 @@ describe('RAD-35: checkPIIScanQuota (Redis-free / fail-open)', () => {
     expect(result.remaining).toBe(-1);
   });
 
-  it('unknown plan: defaults to free quota, fails open without Redis', async () => {
+  it('unknown plan defaults to the bounded free quota during an outage', async () => {
+    __piiQuotaTesting.setRedisClient({ eval: vi.fn().mockRejectedValue(new Error('offline')) } as any);
     const result = await checkPIIScanQuota('tenant-unknown', 'unknown_plan');
-    // Fail-open → allowed:true
     expect(result.allowed).toBe(true);
   });
 
@@ -251,9 +252,36 @@ describe('RAD-35: checkPIIScanQuota (Redis-free / fail-open)', () => {
     expect(result.planTier).toBe('free');
     expect(result.resetsAt).toBeTruthy();
   });
+
+  it('uses one atomic compare-and-increment Redis script', async () => {
+    const evalMock = vi.fn().mockResolvedValue([1, 80]);
+    __piiQuotaTesting.setRedisClient({ eval: evalMock } as any);
+
+    const result = await checkPIIScanQuota('tenant-atomic', 'free', 80);
+    expect(result).toMatchObject({ allowed: true, count: 80, remaining: 20 });
+    expect(evalMock).toHaveBeenCalledTimes(1);
+    expect(evalMock.mock.calls[0][0]).toContain("current + increment > quota");
+  });
+
+  it('does not overshoot when concurrent calls fall back after Redis failure', async () => {
+    __piiQuotaTesting.setRedisClient({ eval: vi.fn().mockRejectedValue(new Error('offline')) } as any);
+
+    const [first, second] = await Promise.all([
+      checkPIIScanQuota('tenant-fallback', 'free', 60),
+      checkPIIScanQuota('tenant-fallback', 'free', 60),
+    ]);
+    expect([first.allowed, second.allowed].sort()).toEqual([false, true]);
+    expect(Math.max(first.count, second.count)).toBe(60);
+  });
+
+  it('rejects malformed or oversized reservations', async () => {
+    await expect(checkPIIScanQuota('tenant-invalid', 'free', Number.NaN)).rejects.toThrow(/integer/);
+    await expect(checkPIIScanQuota('tenant-invalid', 'free', 1001)).rejects.toThrow(/between 1 and 1000/);
+  });
 });
 
 describe('RAD-35: getPIIScanUsage (Redis-free)', () => {
+  afterEach(() => __piiQuotaTesting.reset());
   it('enterprise: limit=-1, remaining=-1', async () => {
     const result = await getPIIScanUsage('tenant-ent', 'enterprise');
     expect(result.limit).toBe(-1);

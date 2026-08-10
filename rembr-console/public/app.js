@@ -1,10 +1,23 @@
-// rembr-console UI. Talks only to this console's /api/call proxy.
+// Keep the browser-to-console bearer token in this page process only. A reload
+// deliberately requires re-entry so browser storage cannot persist it.
+let consoleToken = ""
+
+function currentToken() {
+  return consoleToken
+}
 
 async function call(tool, args) {
+  const token = currentToken()
+  if (!token) return { ok: false, error: "Enter the console access token" }
   const response = await fetch("/api/call", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${token}`,
+    },
     body: JSON.stringify({ tool, args }),
+    credentials: "same-origin",
+    redirect: "error",
   })
   const payload = await response.json().catch(() => ({ ok: false, error: "Bad response from console server" }))
   return payload
@@ -21,31 +34,25 @@ function show(id, payload, emptyMessage = "Nothing found.") {
   }
 }
 
-// --- Tabs ---
 document.querySelectorAll("nav button").forEach((button) => {
   button.addEventListener("click", () => {
-    document.querySelectorAll("nav button").forEach((b) => b.classList.remove("active"))
-    document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"))
+    document.querySelectorAll("nav button").forEach((entry) => entry.classList.remove("active"))
+    document.querySelectorAll(".tab").forEach((tab) => tab.classList.remove("active"))
     button.classList.add("active")
     document.getElementById(`tab-${button.dataset.tab}`).classList.add("active")
   })
 })
 
-// --- Connection status + initial loads ---
 async function checkStatus() {
   const el = document.getElementById("status")
   const result = await call("stats", { operation: "usage" })
-  if (result.ok) {
-    el.textContent = "connected"
-    el.className = "status ok"
-  } else {
-    el.textContent = result.error
-    el.className = "status err"
-  }
+  el.textContent = result.ok ? "connected" : result.error
+  el.className = result.ok ? "status ok" : "status err"
+  return result.ok
 }
 
 async function loadMemories() {
-  show("memories-output", await call("memory", { operation: "list", limit: 20 }), "No memories yet — store one below.")
+  show("memories-output", await call("memory", { operation: "list", limit: 20 }), "No memories yet.")
 }
 async function loadContexts() {
   show("contexts-output", await call("context", { operation: "list" }), "No contexts yet.")
@@ -57,13 +64,32 @@ async function loadStats() {
   show("stats-usage", await call("stats", { operation: "usage" }))
   show("stats-embeddings", await call("stats", { operation: "embeddings" }))
 }
+async function loadAll() {
+  if (!await checkStatus()) return
+  await Promise.all([loadMemories(), loadContexts(), loadSnapshots(), loadStats()])
+}
+
+document.getElementById("connect-console").addEventListener("click", () => {
+  const input = document.getElementById("console-token")
+  const token = input.value.trim()
+  input.value = ""
+  if (token) consoleToken = token
+  loadAll()
+})
+document.getElementById("forget-console").addEventListener("click", () => {
+  consoleToken = ""
+  document.getElementById("status").textContent = "authentication required"
+  document.getElementById("status").className = "status"
+})
+document.getElementById("console-token").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") document.getElementById("connect-console").click()
+})
 
 document.getElementById("refresh-memories").addEventListener("click", loadMemories)
 document.getElementById("refresh-contexts").addEventListener("click", loadContexts)
 document.getElementById("refresh-snapshots").addEventListener("click", loadSnapshots)
 document.getElementById("refresh-stats").addEventListener("click", loadStats)
 
-// --- Create memory ---
 document.getElementById("create-form").addEventListener("submit", async (event) => {
   event.preventDefault()
   const content = document.getElementById("create-content").value.trim()
@@ -77,7 +103,6 @@ document.getElementById("create-form").addEventListener("submit", async (event) 
   }
 })
 
-// --- Delete memory ---
 document.getElementById("delete-form").addEventListener("submit", async (event) => {
   event.preventDefault()
   const id = document.getElementById("delete-id").value.trim()
@@ -90,22 +115,14 @@ document.getElementById("delete-form").addEventListener("submit", async (event) 
   }
 })
 
-// --- Search ---
 document.getElementById("search-form").addEventListener("submit", async (event) => {
   event.preventDefault()
   const query = document.getElementById("search-query").value.trim()
   const mode = document.getElementById("search-mode").value
   if (!query) return
   document.getElementById("search-output").textContent = "Searching…"
-  show(
-    "search-output",
-    await call("search", { operation: "query", query, search_mode: mode, limit: 20 }),
-    "No matching memories.",
-  )
+  show("search-output", await call("search", { operation: "query", query, search_mode: mode, limit: 20 }),
+    "No matching memories.")
 })
 
-checkStatus()
-loadMemories()
-loadContexts()
-loadSnapshots()
-loadStats()
+if (currentToken()) loadAll()

@@ -23,6 +23,7 @@ export interface Memory {
   pii_types?: string[];
   pii_confidence?: number;
   pii_scanned_at?: Date;
+  total_count?: number;
 }
 
 export interface MemoryEmbedding {
@@ -66,6 +67,43 @@ export interface ContextMemory {
   added_at: Date;
 }
 
+const METADATA_FILTER_KEY = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/**
+ * Validate the defence-in-depth database boundary for metadata filters.
+ * Public requests are also checked by Zod, but internal callers must not be
+ * able to re-introduce dynamic SQL or unbounded JSON traversal.
+ */
+export function normaliseMetadataFilter(filter?: Record<string, any>): Record<string, string | number | boolean | null> | undefined {
+  if (filter === undefined) return undefined;
+  if (!filter || typeof filter !== 'object' || Array.isArray(filter)) {
+    throw new Error('metadata_filter must be a plain object');
+  }
+
+  const entries = Object.entries(filter);
+  if (entries.length > 20) {
+    throw new Error('metadata_filter may contain at most 20 keys');
+  }
+
+  const normalised: Record<string, string | number | boolean | null> = {};
+  for (const [key, value] of entries) {
+    if (!METADATA_FILTER_KEY.test(key)) {
+      throw new Error(`Invalid metadata filter key: ${key}`);
+    }
+    if (value !== null && !['string', 'number', 'boolean'].includes(typeof value)) {
+      throw new Error(`Metadata filter value for ${key} must be a scalar`);
+    }
+    if (typeof value === 'string' && value.length > 2_000) {
+      throw new Error(`Metadata filter value for ${key} is too long`);
+    }
+    if (typeof value === 'number' && !Number.isFinite(value)) {
+      throw new Error(`Metadata filter value for ${key} must be finite`);
+    }
+    normalised[key] = value as string | number | boolean | null;
+  }
+  return normalised;
+}
+
 export class MemoryDatabase {
   private pool: PoolType;
   private readPool: PoolType | null = null;
@@ -90,11 +128,11 @@ export class MemoryDatabase {
       // Build from components - this is the reliable way
       const encodedPassword = encodeURIComponent(dbPassword);
       primaryConnectionString = `postgresql://${dbUser}:${encodedPassword}@${dbHost}:${dbPort}/${dbName}`;
-      console.log(`✅ Database connection built from components: ${dbUser}@${dbHost}:${dbPort}/${dbName}`);
+      console.log('✅ Database connection built from configured components');
       
       if (dbReadHost) {
         readConnectionString = `postgresql://${dbUser}:${encodedPassword}@${dbReadHost}:${dbPort}/${dbName}`;
-        console.log(`✅ Read replica connection: ${dbUser}@${dbReadHost}:${dbPort}/${dbName}`);
+        console.log('✅ Read replica connection configured');
       }
     } else if (process.env.DATABASE_URL) {
       // Fall back to connection string
@@ -177,6 +215,8 @@ export class MemoryDatabase {
           id UUID PRIMARY KEY,
           tenant_id UUID NOT NULL,
           project_id UUID,
+          user_id UUID,
+          visibility VARCHAR(20) NOT NULL DEFAULT 'shared',
           content TEXT NOT NULL,
           category TEXT NOT NULL,
           metadata JSONB DEFAULT '{}',
@@ -184,6 +224,19 @@ export class MemoryDatabase {
           updated_at TIMESTAMPTZ DEFAULT NOW(),
           relevance_score REAL DEFAULT 1.0
         )
+      `);
+      await client.query(`
+        ALTER TABLE memories
+          ADD COLUMN IF NOT EXISTS user_id UUID,
+          ADD COLUMN IF NOT EXISTS visibility VARCHAR(20) DEFAULT 'shared'
+      `);
+      await client.query(`
+        UPDATE memories SET visibility = 'shared' WHERE visibility IS NULL
+      `);
+      await client.query(`
+        ALTER TABLE memories
+          ALTER COLUMN visibility SET DEFAULT 'shared',
+          ALTER COLUMN visibility SET NOT NULL
       `);
 
       // Create embeddings table with pgvector
@@ -195,6 +248,39 @@ export class MemoryDatabase {
           model TEXT NOT NULL,
           dimensions INTEGER NOT NULL,
           created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+      `);
+
+      // createMemory accounts immutable snapshot copies against the same
+      // storage quota. Keep the explicit dev/test initializer compatible with
+      // that production query; deployment migrations remain the only schema
+      // owner in production.
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS context_snapshots (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          tenant_id UUID NOT NULL,
+          project_id UUID,
+          name VARCHAR(255),
+          description TEXT,
+          query TEXT,
+          max_tokens INTEGER,
+          token_count INTEGER DEFAULT 0,
+          memory_count INTEGER DEFAULT 0,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          expires_at TIMESTAMPTZ,
+          metadata JSONB NOT NULL DEFAULT '{}'
+        )
+      `);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS snapshot_memories (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          snapshot_id UUID NOT NULL REFERENCES context_snapshots(id) ON DELETE CASCADE,
+          memory_id UUID,
+          content TEXT NOT NULL,
+          category VARCHAR(50),
+          metadata JSONB,
+          relevance_score FLOAT DEFAULT 1.0,
+          position INTEGER NOT NULL
         )
       `);
 
@@ -395,6 +481,31 @@ export class MemoryDatabase {
     }
   }
 
+  /**
+   * Execute a multi-statement unit of work under one transaction-local tenant
+   * GUC. Services use this for quota checks that must be serialised with their
+   * writes; exposing only the callback-scoped client prevents session GUCs
+   * leaking through PgBouncer or back into the pool.
+   */
+  async withTenantTransaction<T>(
+    tenantId: string,
+    work: (client: any) => Promise<T>,
+  ): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await this.setTenantContext(client, tenantId);
+      const result = await work(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   // Get tenant plan info with fallback to default limits
   async getTenantPlan(tenantId: string): Promise<TenantPlan | null> {
     const client = await this.readDbPool.connect();
@@ -472,27 +583,66 @@ export class MemoryDatabase {
     category: string,
     metadata: Record<string, any>,
     relevanceScore: number = 1.0,
-    piiData?: { detected: boolean; types: string[]; confidence: number }
+    piiData?: { detected: boolean; types: string[]; confidence: number },
+    userId?: string,
   ): Promise<Memory> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
 
+      // Memory rows and immutable snapshot copies share the advertised memory
+      // storage allowance.  Serialising the count and insert under the same
+      // transaction prevents concurrent store/snapshot requests spending the
+      // final quota slot more than once.
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+        [`storage-quota:${tenantId}`],
+      );
+      const planResult = await client.query(
+        `SELECT memory_limit
+         FROM tenant_plans
+         WHERE tenant_id = $1
+         FOR UPDATE`,
+        [tenantId],
+      );
+      if (!planResult.rows[0]) {
+        throw new Error('Tenant plan not found');
+      }
+      const memoryLimit = Number(planResult.rows[0].memory_limit);
+      if (!Number.isSafeInteger(memoryLimit) || memoryLimit < 1) {
+        throw new Error('Tenant memory limit is invalid');
+      }
+      const usageResult = await client.query(
+        `SELECT
+           (SELECT COUNT(*) FROM memories WHERE tenant_id = $1) +
+           (SELECT COUNT(*) FROM snapshot_memories sm
+            JOIN context_snapshots s ON s.id = sm.snapshot_id
+            WHERE s.tenant_id = $1) AS stored_items`,
+        [tenantId],
+      );
+      const storedItems = Number(usageResult.rows[0]?.stored_items || 0);
+      if (!Number.isSafeInteger(storedItems) || storedItems < 0) {
+        throw new Error('Tenant memory usage is invalid');
+      }
+      if (storedItems >= memoryLimit) {
+        throw new Error(`Memory limit reached (${memoryLimit} stored items)`);
+      }
+
       const metadataString = typeof metadata === 'string' ? metadata : JSON.stringify(metadata);
 
       // Include PII fields if provided
       const query = piiData
-        ? `INSERT INTO memories (id, tenant_id, project_id, content, category, metadata, relevance_score, pii_detected, pii_types, pii_confidence, pii_scanned_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+        ? `INSERT INTO memories (id, tenant_id, project_id, user_id, content, category, metadata, relevance_score, pii_detected, pii_types, pii_confidence, pii_scanned_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
            RETURNING *`
-        : `INSERT INTO memories (id, tenant_id, project_id, content, category, metadata, relevance_score)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
+        : `INSERT INTO memories (id, tenant_id, project_id, user_id, content, category, metadata, relevance_score)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
            RETURNING *`;
 
       const params = piiData
-        ? [id, tenantId, projectId, content, category, metadataString, relevanceScore, piiData.detected, piiData.types, piiData.confidence]
-        : [id, tenantId, projectId, content, category, metadataString, relevanceScore];
+        ? [id, tenantId, projectId, userId || null, content, category, metadataString, relevanceScore, piiData.detected, piiData.types, piiData.confidence]
+        : [id, tenantId, projectId, userId || null, content, category, metadataString, relevanceScore];
 
       const result = await client.query(query, params);
 
@@ -540,7 +690,7 @@ export class MemoryDatabase {
         [memoryId, tenantId]
       );
       if (memoryExists.rowCount === 0) {
-        console.warn(`Skipping embedding storage for ${memoryId}: memory no longer exists or is not visible for tenant ${tenantId}`);
+        console.warn('Skipping embedding storage because the memory is absent or outside the active tenant');
         await client.query('COMMIT');
         return;
       }
@@ -594,27 +744,46 @@ export class MemoryDatabase {
 
   // Get memory by ID
   // List recent memories (uses read pool for better distribution)
-  async getRecentMemories(tenantId: string, limit: number = 10, category?: string): Promise<Memory[]> {
-    console.log(`🔍 Database.getRecentMemories called with tenantId=${tenantId}, limit=${limit}, category=${category}`);
+  async getRecentMemories(
+    tenantId: string,
+    limit: number = 10,
+    category?: string,
+    projectId?: string,
+    userId?: string,
+  ): Promise<Memory[]> {
     const client = await this.readDbPool.connect();
     try {
       await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
       // Explicit tenant filter + RLS via app.current_tenant GUC
-      let query = 'SELECT * FROM memories WHERE tenant_id = $1';
-      const params: any[] = [tenantId];
+      let query = `SELECT m.* FROM memories m
+        LEFT JOIN projects p ON p.id = m.project_id
+        WHERE m.tenant_id = $1
+          AND (
+            (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $2::uuid)
+            OR (
+              COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+              AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $2::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p.id AND pm.user_id = $2::uuid))
+            )
+          )`;
+      const params: any[] = [tenantId, userId || null];
+
+      if (projectId) {
+        query += ' AND m.project_id = $' + (params.length + 1);
+        params.push(projectId);
+      }
 
       if (category) {
-        query += ' AND category = $' + (params.length + 1);
+        query += ' AND m.category = $' + (params.length + 1);
         params.push(category);
       }
 
-      query += ' ORDER BY created_at DESC LIMIT $' + (params.length + 1);
+      query += ' ORDER BY m.created_at DESC LIMIT $' + (params.length + 1);
       params.push(limit);
 
-      console.log(`📞 Executing query: ${query} with params:`, params);
       const result = await client.query(query, params);
-      console.log(`✅ Query completed, returned ${result.rows.length} rows`);
 
       const memories = result.rows.map(row => {
         const metadata = row.metadata;
@@ -624,7 +793,6 @@ export class MemoryDatabase {
         };
       });
       
-      console.log(`✅ Database.getRecentMemories completed successfully`);
       await client.query('COMMIT');
       return memories;
     } catch (err) {
@@ -643,7 +811,8 @@ export class MemoryDatabase {
     limit: number = 10,
     phraseSearch: boolean = false,
     metadataFilter?: Record<string, any>,
-    userId?: string
+    userId?: string,
+    projectId?: string
   ): Promise<Memory[]> {
     const client = await this.readDbPool.connect();
     try {
@@ -665,9 +834,13 @@ export class MemoryDatabase {
                WHERE m.tenant_id = $${paramIndex + 1} 
                  AND to_tsvector('english', m.content) @@ phraseto_tsquery('english', $${paramIndex}::text)
                  AND (
-                   p.is_personal = false  -- Shared projects
-                   OR p.is_personal IS NULL  -- No project assigned
-                   OR (p.is_personal = true AND p.owner_id = $${paramIndex + 2})  -- Own personal projects
+                   (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $${paramIndex + 2}::uuid)
+                   OR (
+                     COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+                     AND (p.is_personal = false OR p.is_personal IS NULL OR p.owner_id = $${paramIndex + 2}::uuid
+                          OR EXISTS (SELECT 1 FROM project_members pm
+                                     WHERE pm.project_id = p.id AND pm.user_id = $${paramIndex + 2}::uuid))
+                   )
                  )`;
         params.push(phraseQuery);
         params.push(tenantId);
@@ -682,9 +855,13 @@ export class MemoryDatabase {
                WHERE m.tenant_id = $2 
                  AND LOWER(m.content) LIKE $1
                  AND (
-                   p.is_personal = false  -- Shared projects
-                   OR p.is_personal IS NULL  -- No project assigned
-                   OR (p.is_personal = true AND p.owner_id = $3)  -- Own personal projects
+                   (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+                   OR (
+                     COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+                     AND (p.is_personal = false OR p.is_personal IS NULL OR p.owner_id = $3::uuid
+                          OR EXISTS (SELECT 1 FROM project_members pm
+                                     WHERE pm.project_id = p.id AND pm.user_id = $3::uuid))
+                   )
                  )`;
         params.push(searchQuery);
         params.push(tenantId);
@@ -698,13 +875,18 @@ export class MemoryDatabase {
         paramIndex++;
       }
 
-      // Add metadata filtering
-      if (metadataFilter && Object.keys(metadataFilter).length > 0) {
-        for (const [key, value] of Object.entries(metadataFilter)) {
-          sql += ` AND metadata->>'${key}' = $${paramIndex}`;
-          params.push(String(value));
-          paramIndex++;
-        }
+      if (projectId) {
+        sql += ` AND m.project_id = $${paramIndex}`;
+        params.push(projectId);
+        paramIndex++;
+      }
+
+      // Bind the complete JSONB filter. No key or value becomes SQL syntax.
+      const safeMetadataFilter = normaliseMetadataFilter(metadataFilter);
+      if (safeMetadataFilter && Object.keys(safeMetadataFilter).length > 0) {
+        sql += ` AND m.metadata @> $${paramIndex}::jsonb`;
+        params.push(JSON.stringify(safeMetadataFilter));
+        paramIndex++;
       }
 
       sql += phraseSearch 
@@ -746,15 +928,6 @@ export class MemoryDatabase {
       await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
 
-      // Increment search counter
-      await client.query(
-        `INSERT INTO usage_daily (id, tenant_id, project_id, date, searches_performed)
-         VALUES (gen_random_uuid(), $1, $2, CURRENT_DATE, 1)
-         ON CONFLICT (tenant_id, project_id, date)
-         DO UPDATE SET searches_performed = usage_daily.searches_performed + 1`,
-        [tenantId, projectId]
-      );
-
       // Ensure queryEmbedding is a proper array
       let embeddingArray: number[];
       
@@ -791,9 +964,13 @@ export class MemoryDatabase {
         LEFT JOIN projects p ON m.project_id = p.id
         WHERE m.tenant_id = $2
           AND (
-            p.is_personal = false  -- Shared projects
-            OR p.is_personal IS NULL  -- No project assigned
-            OR (p.is_personal = true AND p.owner_id = $3)  -- Own personal projects
+            (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+            OR (
+              COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+              AND (p.is_personal = false OR p.is_personal IS NULL OR p.owner_id = $3::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p.id AND pm.user_id = $3::uuid))
+            )
           )
       `;
       const params: any[] = [embeddingStr, tenantId, userId];
@@ -811,26 +988,18 @@ export class MemoryDatabase {
         paramIndex++;
       }
 
-      // Add metadata filtering
-      if (metadataFilter && Object.keys(metadataFilter).length > 0) {
-        for (const [key, value] of Object.entries(metadataFilter)) {
-          sql += ` AND m.metadata->>'${key}' = $${paramIndex}`;
-          params.push(String(value));
-          paramIndex++;
-        }
+      // Bind the complete JSONB filter. No key or value becomes SQL syntax.
+      const safeMetadataFilter = normaliseMetadataFilter(metadataFilter);
+      if (safeMetadataFilter && Object.keys(safeMetadataFilter).length > 0) {
+        sql += ` AND m.metadata @> $${paramIndex}::jsonb`;
+        params.push(JSON.stringify(safeMetadataFilter));
+        paramIndex++;
       }
 
       sql += ` ORDER BY e.embedding <=> $1::vector LIMIT $${paramIndex}`;
       params.push(limit);
 
-      console.log(`🔍 Executing semantic search SQL with ${params.length} params`);
-      console.log(`   Tenant: ${tenantId}, Project: ${projectId || 'null'}, Category: ${category || 'any'}`);
-      console.log(`   Embedding dimension: ${embeddingArray.length}`);
-      console.log(`   SQL: ${sql}`);
-      console.log(`   Params: ${JSON.stringify(params.map((p, i) => i === 0 ? `[embedding:${embeddingArray.length}d]` : p))}`);
-      
       const result = await client.query(sql, params);
-      console.log(`✅ Semantic search query returned ${result.rows.length} rows`);
 
       const rows = result.rows.map((row: any) => {
         const metadata = row.metadata;
@@ -853,7 +1022,9 @@ export class MemoryDatabase {
   async updateMemory(
     id: string,
     tenantId: string,
-    updates: Partial<Pick<Memory, 'content' | 'category' | 'metadata' | 'relevance_score'>>
+    updates: Partial<Pick<Memory, 'content' | 'category' | 'metadata' | 'relevance_score'>>,
+    projectId?: string,
+    userId?: string,
   ): Promise<Memory | null> {
     const client = await this.pool.connect();
     try {
@@ -885,11 +1056,30 @@ export class MemoryDatabase {
 
       fields.push(`updated_at = NOW()`);
       values.push(id);
-
-      // Explicit tenant filter — superuser bypasses RLS
       values.push(tenantId);
+      values.push(projectId || null);
+      values.push(userId || null);
       const result = await client.query(
-        `UPDATE memories SET ${fields.join(', ')} WHERE id = $${paramCount} AND tenant_id = $${paramCount + 1} RETURNING *`,
+        `UPDATE memories m SET ${fields.join(', ')}
+         WHERE m.id = $${paramCount}
+           AND m.tenant_id = $${paramCount + 1}
+           AND ($${paramCount + 2}::uuid IS NULL OR m.project_id = $${paramCount + 2}::uuid)
+           AND (
+             (
+               COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+               AND (
+                 m.project_id IS NULL OR EXISTS (
+                   SELECT 1 FROM projects p
+                   WHERE p.id = m.project_id
+                     AND (p.is_personal = false OR p.owner_id = $${paramCount + 3}::uuid
+                          OR EXISTS (SELECT 1 FROM project_members pm
+                                     WHERE pm.project_id = p.id AND pm.user_id = $${paramCount + 3}::uuid))
+                 )
+               )
+             )
+             OR (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $${paramCount + 3}::uuid)
+           )
+         RETURNING *`,
         values
       );
 
@@ -911,7 +1101,7 @@ export class MemoryDatabase {
   }
 
   // Delete memory
-  async deleteMemory(id: string, tenantId: string): Promise<boolean> {
+  async deleteMemory(id: string, tenantId: string, projectId?: string, userId?: string): Promise<boolean> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -919,8 +1109,25 @@ export class MemoryDatabase {
 
       // Explicit tenant filter — superuser bypasses RLS
       const result = await client.query(
-        'DELETE FROM memories WHERE id = $1 AND tenant_id = $2',
-        [id, tenantId]
+        `DELETE FROM memories m
+         WHERE m.id = $1 AND m.tenant_id = $2
+           AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+           AND (
+             (
+               COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+               AND (
+                 m.project_id IS NULL OR EXISTS (
+                   SELECT 1 FROM projects p
+                   WHERE p.id = m.project_id
+                     AND (p.is_personal = false OR p.owner_id = $4::uuid
+                          OR EXISTS (SELECT 1 FROM project_members pm
+                                     WHERE pm.project_id = p.id AND pm.user_id = $4::uuid))
+                 )
+               )
+             )
+             OR (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+           )`,
+        [id, tenantId, projectId || null, userId || null]
       );
 
       await client.query('COMMIT');
@@ -956,16 +1163,17 @@ export class MemoryDatabase {
   }
 
   // Get today's search count for rate limiting
-  async getTodaySearchCount(tenantId: string): Promise<number> {
+  async getTodaySearchCount(tenantId: string, projectId?: string): Promise<number> {
     const client = await this.readDbPool.connect();
     try {
       await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
       const result = await client.query(
-        `SELECT COALESCE(searches_performed, 0) as count 
+        `SELECT COALESCE(SUM(searches_performed), 0) as count
          FROM usage_daily 
-         WHERE tenant_id = $1 AND date = CURRENT_DATE`,
-        [tenantId]
+         WHERE tenant_id = $1 AND date = CURRENT_DATE
+           AND ($2::uuid IS NULL OR project_id = $2::uuid)`,
+        [tenantId, projectId || null]
       );
       await client.query('COMMIT');
       return result.rows[0]?.count || 0;
@@ -999,18 +1207,81 @@ export class MemoryDatabase {
 
   // Increment search count for usage tracking
   async incrementSearchCount(tenantId: string, projectId?: string): Promise<void> {
+    await this.reserveSearchQuota(tenantId, projectId);
+  }
+
+  /**
+   * Atomically reserve one tenant search before any database/model work.
+   *
+   * All search modes use this single entry point, so hybrid fallback cannot
+   * double count while text/phrase searches cannot bypass the daily limit.
+   * The tenant lock also handles the nullable project_id case that PostgreSQL
+   * UNIQUE constraints historically treated as distinct rows.
+   */
+  async reserveSearchQuota(tenantId: string, projectId?: string): Promise<void> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
-      const today = new Date().toISOString().split('T')[0];
       await client.query(
-        `INSERT INTO usage_daily (id, tenant_id, project_id, date, searches_performed)
-         VALUES (gen_random_uuid(), $1, $2, $3, 1)
-         ON CONFLICT (tenant_id, project_id, date)
-         DO UPDATE SET searches_performed = usage_daily.searches_performed + 1`,
-        [tenantId, projectId, today]
+        `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+        [`search-quota:${tenantId}`],
       );
+
+      const planResult = await client.query(
+        `SELECT search_limit_daily
+         FROM tenant_plans
+         WHERE tenant_id = $1
+         FOR UPDATE`,
+        [tenantId],
+      );
+      if (!planResult.rows[0]) throw new Error('Tenant plan not found');
+      const searchLimit = Number(planResult.rows[0].search_limit_daily);
+      if (!Number.isSafeInteger(searchLimit) || searchLimit < 0) {
+        throw new Error('Tenant search limit is invalid');
+      }
+
+      const usageResult = await client.query(
+        `SELECT COALESCE(SUM(searches_performed), 0) AS searches
+         FROM usage_daily
+         WHERE tenant_id = $1 AND date = CURRENT_DATE`,
+        [tenantId],
+      );
+      const searches = Number(usageResult.rows[0]?.searches || 0);
+      if (!Number.isSafeInteger(searches) || searches < 0) {
+        throw new Error('Tenant search usage is invalid');
+      }
+      if (searchLimit > 0 && searches >= searchLimit) {
+        throw new Error(`Daily search limit reached (${searchLimit} searches)`);
+      }
+
+      const existing = await client.query(
+        `SELECT id
+         FROM usage_daily
+         WHERE tenant_id = $1
+           AND project_id IS NOT DISTINCT FROM $2::uuid
+           AND date = CURRENT_DATE
+         ORDER BY id
+         LIMIT 1
+         FOR UPDATE`,
+        [tenantId, projectId || null],
+      );
+      if (existing.rows[0]) {
+        await client.query(
+          `UPDATE usage_daily
+           SET searches_performed = searches_performed + 1
+           WHERE id = $1`,
+          [existing.rows[0].id],
+        );
+      } else {
+        await client.query(
+          `INSERT INTO usage_daily
+             (id, tenant_id, project_id, date, searches_performed)
+           VALUES (gen_random_uuid(), $1, $2, CURRENT_DATE, 1)`,
+          [tenantId, projectId || null],
+        );
+      }
+
       await client.query('COMMIT');
     } catch (error) {
       try { await client.query('ROLLBACK'); } catch {}
@@ -1039,21 +1310,29 @@ export class MemoryDatabase {
   }
 
   // Context Methods
-  async listContexts(projectId: string, category?: string): Promise<Context[]> {
+  async listContexts(projectId: string, tenantId: string, category?: string, limit: number = 50): Promise<Context[]> {
     const client = await this.readDbPool.connect();
     try {
+      await client.query('BEGIN');
+      await this.setTenantContext(client, tenantId);
       let query = 'SELECT * FROM contexts WHERE project_id = $1';
       const params: any[] = [projectId];
+      const boundedLimit = Number.isInteger(limit) ? Math.min(100, Math.max(1, limit)) : 50;
       
       if (category !== undefined && category !== null) {
         query += ' AND category = $2';
         params.push(category);
       }
       
-      query += ' ORDER BY created_at DESC';
+      params.push(boundedLimit);
+      query += ` ORDER BY created_at DESC, id DESC LIMIT $${params.length}`;
       
       const result = await client.query(query, params);
+      await client.query('COMMIT');
       return result.rows;
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
     } finally {
       client.release();
     }
@@ -1065,6 +1344,8 @@ export class MemoryDatabase {
       // contexts table doesn't have tenant_id — scoped via project_id → projects.tenant_id
       let result;
       if (tenantId) {
+        await client.query('BEGIN');
+        await this.setTenantContext(client, tenantId);
         result = await client.query(
           `SELECT c.* FROM contexts c
            JOIN projects p ON c.project_id = p.id
@@ -1077,15 +1358,23 @@ export class MemoryDatabase {
           [contextId]
         );
       }
+      if (tenantId) await client.query('COMMIT');
       return result.rows[0] || null;
+    } catch (error) {
+      if (tenantId) {
+        try { await client.query('ROLLBACK'); } catch {}
+      }
+      throw error;
     } finally {
       client.release();
     }
   }
 
-  async createContext(context: Context): Promise<void> {
+  async createContext(context: Context, tenantId: string): Promise<void> {
     const client = await this.pool.connect();
     try {
+      await client.query('BEGIN');
+      await this.setTenantContext(client, tenantId);
       await client.query(
         `INSERT INTO contexts (id, project_id, name, description, category, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -1099,28 +1388,40 @@ export class MemoryDatabase {
           context.updated_at
         ]
       );
+      await client.query('COMMIT');
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
     } finally {
       client.release();
     }
   }
 
   // Context Summary Methods
-  async getContextSummary(contextId: string): Promise<ContextSummary | null> {
+  async getContextSummary(contextId: string, tenantId: string): Promise<ContextSummary | null> {
     const client = await this.readDbPool.connect();
     try {
+      await client.query('BEGIN');
+      await this.setTenantContext(client, tenantId);
       const result = await client.query(
         'SELECT * FROM context_summaries WHERE context_id = $1',
         [contextId]
       );
+      await client.query('COMMIT');
       return result.rows[0] || null;
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
     } finally {
       client.release();
     }
   }
 
-  async saveContextSummary(summary: ContextSummary): Promise<void> {
+  async saveContextSummary(summary: ContextSummary, tenantId: string): Promise<void> {
     const client = await this.pool.connect();
     try {
+      await client.query('BEGIN');
+      await this.setTenantContext(client, tenantId);
       await client.query(
         `INSERT INTO context_summaries (context_id, summary_text, memory_count, generated_at)
          VALUES ($1, $2, $3, $4)
@@ -1136,24 +1437,75 @@ export class MemoryDatabase {
           summary.generated_at
         ]
       );
+      await client.query('COMMIT');
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
     } finally {
       client.release();
     }
   }
 
   // Context Memory Methods
-  async getContextMemories(contextId: string, tenantId: string): Promise<Memory[]> {
+  async getContextMemories(
+    contextId: string,
+    tenantId: string,
+    projectId?: string,
+    userId?: string,
+    limit: number = 500,
+    contentCharacterLimit: number = 100_000,
+    includeMetadata: boolean = true,
+  ): Promise<Memory[]> {
+    const safeLimit = Number.isSafeInteger(limit) ? Math.min(Math.max(limit, 1), 500) : 500;
+    const safeContentLimit = Number.isSafeInteger(contentCharacterLimit)
+      ? Math.min(Math.max(contentCharacterLimit, 1), 100_000)
+      : 100_000;
     const client = await this.readDbPool.connect();
     try {
+      await client.query('BEGIN');
+      await this.setTenantContext(client, tenantId);
       // Explicit tenant filter to enforce RLS
-      const query = `SELECT m.* 
+      const query = `SELECT m.id, m.tenant_id, m.project_id, m.user_id,
+                            LEFT(m.content, $6::integer) AS content,
+                            m.category,
+                            CASE WHEN $7::boolean THEN m.metadata ELSE '{}'::jsonb END AS metadata,
+                            m.created_at, m.updated_at, m.relevance_score,
+                            m.visibility, m.pii_detected, m.pii_types,
+                            m.pii_confidence, m.pii_scanned_at,
+                            COUNT(*) OVER()::integer AS total_count
          FROM memories m
          INNER JOIN memory_contexts mc ON m.id = mc.memory_id
+         INNER JOIN contexts c ON c.id = mc.context_id
+         INNER JOIN projects p ON p.id = c.project_id AND p.tenant_id = m.tenant_id
          WHERE mc.context_id = $1 AND m.tenant_id = $2
-         ORDER BY mc.added_at DESC`;
-      const params = [contextId, tenantId];
+           AND m.project_id = c.project_id
+           AND ($3::uuid IS NULL OR c.project_id = $3::uuid)
+           AND (
+             (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+             OR (
+               COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+               AND (p.is_personal = false OR p.owner_id = $4::uuid
+                    OR EXISTS (SELECT 1 FROM project_members pm
+                               WHERE pm.project_id = p.id AND pm.user_id = $4::uuid))
+             )
+           )
+         ORDER BY mc.added_at DESC, m.id DESC
+         LIMIT $5::integer`;
+      const params = [
+        contextId,
+        tenantId,
+        projectId || null,
+        userId || null,
+        safeLimit,
+        safeContentLimit,
+        includeMetadata,
+      ];
       const result = await client.query(query, params);
+      await client.query('COMMIT');
       return result.rows;
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
     } finally {
       client.release();
     }
@@ -1163,10 +1515,15 @@ export class MemoryDatabase {
     contextId: string,
     query: string,
     limit: number,
-    minSimilarity: number
+    minSimilarity: number,
+    tenantId: string,
+    projectId?: string,
+    userId?: string,
   ): Promise<any[]> {
     const client = await this.readDbPool.connect();
     try {
+      await client.query('BEGIN');
+      await this.setTenantContext(client, tenantId);
       // This assumes you have embedding for the query - you'll need to generate it first
       // For now, doing text-based search within the context
       const result = await client.query(
@@ -1174,32 +1531,91 @@ export class MemoryDatabase {
                 similarity(m.content, $1) as text_similarity
          FROM memories m
          INNER JOIN memory_contexts mc ON m.id = mc.memory_id
+         INNER JOIN contexts c ON c.id = mc.context_id
+         INNER JOIN projects p ON p.id = c.project_id AND p.tenant_id = m.tenant_id
          WHERE mc.context_id = $2 
+           AND m.project_id = c.project_id
            AND similarity(m.content, $1) >= $3
+           AND m.tenant_id = $5
+           AND ($6::uuid IS NULL OR c.project_id = $6::uuid)
+           AND (
+             (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $7::uuid)
+             OR (
+               COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+               AND (p.is_personal = false OR p.owner_id = $7::uuid
+                    OR EXISTS (SELECT 1 FROM project_members pm
+                               WHERE pm.project_id = p.id AND pm.user_id = $7::uuid))
+             )
+           )
          ORDER BY text_similarity DESC
          LIMIT $4`,
-        [query, contextId, minSimilarity, limit]
+        [query, contextId, minSimilarity, limit, tenantId, projectId || null, userId || null]
       );
+      await client.query('COMMIT');
       return result.rows;
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
     } finally {
       client.release();
     }
   }
 
-  async addMemoryToContext(contextMemory: ContextMemory): Promise<void> {
+  async addMemoryToContext(
+    contextMemory: ContextMemory,
+    tenantId: string,
+    projectId?: string,
+    userId?: string,
+  ): Promise<void> {
     const client = await this.pool.connect();
     try {
-      await client.query(
+      await client.query('BEGIN');
+      await this.setTenantContext(client, tenantId);
+      const result = await client.query(
         `INSERT INTO memory_contexts (id, context_id, memory_id, relevance_score, added_at)
-         VALUES (gen_random_uuid(), $1, $2, $3, $4)
+         SELECT gen_random_uuid(), c.id, m.id, $3, $4
+         FROM contexts c
+         JOIN projects p ON p.id = c.project_id AND p.tenant_id = $5
+         JOIN memories m ON m.id = $2 AND m.tenant_id = $5 AND m.project_id = c.project_id
+         WHERE c.id = $1
+           AND ($6::uuid IS NULL OR c.project_id = $6::uuid)
+           AND (p.is_personal = false OR p.owner_id = $7::uuid
+                OR EXISTS (SELECT 1 FROM project_members pm
+                           WHERE pm.project_id = p.id AND pm.user_id = $7::uuid))
+           AND (
+             (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $7::uuid)
+             OR COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+           )
          ON CONFLICT (memory_id, context_id) DO NOTHING`,
         [
           contextMemory.context_id,
           contextMemory.memory_id,
           contextMemory.relevance_score,
-          contextMemory.added_at
+          contextMemory.added_at,
+          tenantId,
+          projectId || null,
+          userId || null,
         ]
       );
+      if (result.rowCount === 0) {
+        // A duplicate is harmless, but a missing/inaccessible source must not
+        // be reported as successfully linked. Check the existing exact link.
+        const existing = await client.query(
+          `SELECT 1 FROM memory_contexts mc
+           JOIN contexts c ON c.id = mc.context_id
+           JOIN memories m ON m.id = mc.memory_id
+           WHERE mc.context_id = $1 AND mc.memory_id = $2
+             AND m.tenant_id = $3 AND m.project_id = c.project_id`,
+          [contextMemory.context_id, contextMemory.memory_id, tenantId],
+        );
+        if (existing.rows.length === 0) {
+          throw new Error('Context or memory not found or access denied');
+        }
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
     } finally {
       client.release();
     }
@@ -1208,27 +1624,29 @@ export class MemoryDatabase {
   async getMemoryById(
     memoryId: string,
     tenantId: string,
-    projectId?: string
+    projectId?: string,
+    userId?: string,
   ): Promise<Memory | null> {
     const client = await this.readDbPool.connect();
     try {
       await client.query('BEGIN');
       await this.setTenantContext(client, tenantId);
       
-      if (projectId !== undefined && projectId !== null) {
-        const scopedResult = await client.query(
-          'SELECT * FROM memories WHERE id = $1 AND tenant_id = $2 AND project_id = $3',
-          [memoryId, tenantId, projectId]
-        );
-        if (scopedResult.rows[0]) {
-          await client.query('COMMIT');
-          return scopedResult.rows[0];
-        }
-      }
-
       const result = await client.query(
-        'SELECT * FROM memories WHERE id = $1 AND tenant_id = $2',
-        [memoryId, tenantId]
+        `SELECT m.* FROM memories m
+         LEFT JOIN projects p ON p.id = m.project_id
+         WHERE m.id = $1 AND m.tenant_id = $2
+           AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+           AND (
+             (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+             OR (
+               COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+               AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $4::uuid
+                    OR EXISTS (SELECT 1 FROM project_members pm
+                               WHERE pm.project_id = p.id AND pm.user_id = $4::uuid))
+             )
+           )`,
+        [memoryId, tenantId, projectId || null, userId || null]
       );
       await client.query('COMMIT');
       return result.rows[0] || null;
@@ -1260,21 +1678,16 @@ export class MemoryDatabase {
       }
       
       const row = result.rows[0];
-      console.log('Raw embedding from DB:', row.embedding, 'type:', typeof row.embedding);
       // Parse pgvector embedding format to number array
       let embedding: number[];
       if (typeof row.embedding === 'string') {
         // pgvector returns format like "[1,2,3]"
-        console.log('Parsing string embedding:', row.embedding);
         embedding = JSON.parse(row.embedding);
       } else if (Array.isArray(row.embedding)) {
-        console.log('Using array embedding directly');
         embedding = row.embedding;
       } else {
         throw new Error(`Invalid embedding format: ${typeof row.embedding}`);
       }
-      console.log('Parsed embedding array length:', embedding.length);
-      
       const embeddingResult = {
         memory_id: row.memory_id,
         embedding,

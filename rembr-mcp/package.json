@@ -14,7 +14,6 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:ui": "vitest --ui",
-    "postinstall": "patch-package || true",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
     "test:e2e:headless": "xvfb-run --auto-servernum --server-args='-screen 0 1920x1080x24' playwright test",
@@ -52,10 +51,10 @@
     "@playwright/test": "1.58.2",
     "@types/jsonwebtoken": "^9.0.7",
     "@types/node": "^24.2.0",
-    "@vitest/coverage-v8": "^1.6.0",
-    "@vitest/ui": "^1.6.0",
+    "@vitest/coverage-v8": "^3.2.6",
+    "@vitest/ui": "^3.2.6",
     "typescript": "^5.9.3",
-    "vitest": "^1.6.1"
+    "vitest": "^3.2.6"
   },
   "overrides": {
     "fast-xml-parser": ">=5.3.5"

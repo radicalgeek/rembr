@@ -29,6 +29,11 @@ header {
   border-bottom: 1px solid var(--border);
 }
 
+.auth { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.auth label { color: var(--muted); font-size: 13px; }
+.auth input { width: 220px; }
+.auth .status { min-width: 120px; text-align: right; }
+
 h1 { font-size: 18px; margin: 0; }
 h1 span { color: var(--accent); font-weight: 400; }
 h2 { font-size: 14px; color: var(--muted); margin: 22px 0 8px; text-transform: uppercase; letter-spacing: 0.04em; }
@@ -109,6 +114,7 @@ button {
 
 button:hover { filter: brightness(1.1); }
 button.danger { background: var(--danger); }
+button.secondary { background: var(--panel); border: 1px solid var(--border); color: var(--text); }
 
 .toolbar button { background: var(--panel); border: 1px solid var(--border); color: var(--text); }
 
@@ -120,3 +126,11 @@ footer {
 }
 
 footer a { color: var(--accent); text-decoration: none; }
+
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+@media (max-width: 760px) {
+  header { align-items: flex-start; gap: 12px; }
+  .auth { justify-content: flex-start; }
+  .auth .status { width: 100%; text-align: left; }
+}

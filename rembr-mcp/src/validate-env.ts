@@ -51,8 +51,11 @@ const OPTIONAL_ENV_VARS: EnvVar[] = [
   { name: 'PORT', required: false, description: 'HTTP server port (default: 3000)', sensitive: false },
   { name: 'NODE_ENV', required: false, description: 'Node environment (development|production)', sensitive: false },
   { name: 'PUBLIC_URL', required: false, description: 'Public-facing URL of the service', sensitive: false },
-  { name: 'UI_BASE_URL', required: false, description: 'URL of the rembr-ui service', sensitive: false },
-  { name: 'ENABLE_OPTIMIZATION', required: false, description: 'Enable auto-optimization (default: true)', sensitive: false },
+  { name: 'OAUTH_EXPECTED_ISSUER', required: false, description: 'Exact OAuth issuer URL', sensitive: false },
+  { name: 'OAUTH_EXPECTED_AUDIENCE', required: false, description: 'Exact RFC 8707 protected resource URL (origin + /mcp)', sensitive: false },
+  { name: 'UI_BASE_URL', required: false, description: 'URL of the UI or self-hosted console', sensitive: false },
+  { name: 'ENABLE_OPTIMIZATION', required: false, description: 'Reserved; unsafe tenant-wide auto-optimization remains disabled (default: false)', sensitive: false },
+  { name: 'INITIALIZE_SCHEMA', required: false, description: 'Development-only owner schema initialisation (default: false)', sensitive: false },
   { name: 'CORS_ORIGIN', required: false, description: 'Allowed CORS origins (comma-separated)', sensitive: false },
   // RAD-62: Contradiction detection tuning
   { name: 'CONTRADICTION_DETECTION_TIMEOUT_MS', required: false, description: 'Per-LLM-call timeout for contradiction analysis (default: 8000ms)', sensitive: false },
@@ -77,6 +80,56 @@ export function validateEnvironment(): void {
     errors.push('  ✗ DATABASE connection: MISSING — Set DATABASE_URL or DB_HOST+DB_NAME+DB_USER+DB_PASSWORD');
   }
 
+  if (process.env.NODE_ENV === 'production') {
+    if (process.env.INITIALIZE_SCHEMA === 'true' || process.env.ALLOW_STARTUP_SCHEMA_INIT === 'true') {
+      errors.push('  ✗ Startup schema initialisation is forbidden in production; use owner migrations');
+    }
+    const secretNames = ['JWT_SECRET', 'ADMIN_API_KEY', 'API_KEY_SECRET', 'METRICS_SECRET'] as const;
+    const placeholder = /(?:change[-_ ]?me|replace[-_ ]?me|your[-_ ]|example|default|password|secret[-_ ]?here|test[-_ ])/i;
+    const configuredSecrets: Array<[string, string]> = [];
+
+    for (const name of secretNames) {
+      const value = process.env[name] || '';
+      if (!value) {
+        errors.push(`  ✗ ${name}: MISSING — required in production`);
+        continue;
+      }
+      const distinctCharacters = new Set(value).size;
+      if (value.length < 32 || distinctCharacters < 10 || placeholder.test(value)) {
+        errors.push(`  ✗ ${name}: WEAK OR PLACEHOLDER — use at least 32 random characters`);
+        continue;
+      }
+      configuredSecrets.push([name, value]);
+    }
+
+    for (let i = 0; i < configuredSecrets.length; i++) {
+      for (let j = i + 1; j < configuredSecrets.length; j++) {
+        if (configuredSecrets[i][1] === configuredSecrets[j][1]) {
+          errors.push(`  ✗ ${configuredSecrets[i][0]} and ${configuredSecrets[j][0]} must use distinct secrets`);
+        }
+      }
+    }
+
+    const issuer = process.env.OAUTH_EXPECTED_ISSUER;
+    if (!issuer) {
+      errors.push('  ✗ OAUTH_EXPECTED_ISSUER: MISSING — required in production');
+    }
+    const resource = process.env.OAUTH_EXPECTED_AUDIENCE;
+    if (!resource) {
+      errors.push('  ✗ OAUTH_EXPECTED_AUDIENCE: MISSING — exact origin + /mcp is required in production');
+    } else {
+      try {
+        const url = new URL(resource);
+        if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password ||
+            url.search || url.hash || url.pathname !== '/mcp' || resource !== `${url.origin}/mcp`) {
+          errors.push('  ✗ OAUTH_EXPECTED_AUDIENCE: INVALID — must be the exact origin + /mcp URL');
+        }
+      } catch {
+        errors.push('  ✗ OAUTH_EXPECTED_AUDIENCE: INVALID — must be the exact origin + /mcp URL');
+      }
+    }
+  }
+
   if (errors.length > 0) {
     console.error('\n╔══════════════════════════════════════════════╗');
     console.error('║      STARTUP FAILED: Missing required env     ║');
@@ -88,29 +141,10 @@ export function validateEnvironment(): void {
     process.exit(1);
   }
 
-  // Warn about JWT_SECRET length
+  // Non-production warning; production weakness is fatal above.
   const jwtSecret = process.env.JWT_SECRET || '';
-  if (jwtSecret.length < 32) {
+  if (process.env.NODE_ENV !== 'production' && jwtSecret.length < 32) {
     console.warn(`⚠️  WARNING: JWT_SECRET is shorter than 32 characters (current: ${jwtSecret.length}). Use: openssl rand -base64 32`);
-  }
-
-  // REM-28 / RAD-45: Production security checks
-  if (process.env.NODE_ENV === 'production') {
-    // ADMIN_API_KEY is now a hard-required var (validated above), so this is belt-and-suspenders.
-    if (!process.env.ADMIN_API_KEY) {
-      console.error('🔴 SECURITY: ADMIN_API_KEY is not set — server should have exited above.');
-    }
-    if (!process.env.METRICS_SECRET) {
-      console.error('🔴 SECURITY: METRICS_SECRET is not set — /metrics endpoint will return 403 in production.');
-      console.error('   Generate: openssl rand -hex 32');
-    }
-    if (jwtSecret === 'your-jwt-secret-here' || jwtSecret.includes('change-me')) {
-      console.error('\n╔══════════════════════════════════════════════╗');
-      console.error('║   STARTUP FAILED: Default secret detected     ║');
-      console.error('╚══════════════════════════════════════════════╝');
-      console.error('JWT_SECRET appears to be a placeholder. Never use example secrets in production.');
-      process.exit(1);
-    }
   }
 
   // Log what's configured (without values)

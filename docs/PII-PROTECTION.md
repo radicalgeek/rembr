@@ -187,5 +187,6 @@ Use `get_pii_analytics` to track:
 
 - PII scans are logged in the audit trail (tamper-resistant, hash-chained)
 - Redacted text is never stored — only the redaction metadata
-- All PII operations are tenant-isolated via RLS
+- PII operations enforce tenant/project/user authorisation; selected tables add
+  FORCE RLS as a database boundary
 - For GDPR "right to erasure": combine `pii scan_memory` + `memory delete` to identify and remove sensitive memories

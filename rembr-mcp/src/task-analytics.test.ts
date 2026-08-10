@@ -97,21 +97,19 @@ describe('TaskAnalyticsService', () => {
     });
 
     it('should detect increasing trend', async () => {
-      const now = new Date();
-      
       // Previous returned week bucket: 1 task
       await pool.query(
         `INSERT INTO tasks (tenant_id, project_id, title, state, completed_at, created_by)
-         VALUES ($1, $2, 'Task 1', 'done', $3, $4)`,
-        [TEST_TENANT_ID, TEST_PROJECT_ID, new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000), TEST_AGENT_ID_1]
+         VALUES ($1, $2, 'Task 1', 'done', DATE_TRUNC('week', CURRENT_TIMESTAMP) - INTERVAL '1 day', $3)`,
+        [TEST_TENANT_ID, TEST_PROJECT_ID, TEST_AGENT_ID_1]
       );
 
       // Current returned week bucket: 5 tasks
       for (let i = 0; i < 5; i++) {
         await pool.query(
           `INSERT INTO tasks (tenant_id, project_id, title, state, completed_at, created_by)
-           VALUES ($1, $2, $3, 'done', $4, $5)`,
-          [TEST_TENANT_ID, TEST_PROJECT_ID, `Task ${i + 2}`, now, TEST_AGENT_ID_1]
+           VALUES ($1, $2, $3, 'done', CURRENT_TIMESTAMP, $4)`,
+          [TEST_TENANT_ID, TEST_PROJECT_ID, `Task ${i + 2}`, TEST_AGENT_ID_1]
         );
       }
 

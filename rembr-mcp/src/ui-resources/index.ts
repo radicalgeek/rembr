@@ -35,6 +35,27 @@ export interface TemplateOptions {
   extraScripts?: string;
 }
 
+/** Escape text before inserting it into trusted renderer markup. */
+export function escapeHtml(value: unknown): string {
+  return String(value ?? '').replace(/[&<>"']/g, character => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#039;',
+  })[character]!);
+}
+
+/** Serialise data without allowing a stored `</script>` to end its element. */
+export function safeJsonForHtml(value: unknown): string {
+  return JSON.stringify(value, null, 2)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
 /**
  * Load and render the base HTML template with provided content
  */
@@ -43,12 +64,17 @@ export function renderTemplate(options: TemplateOptions): string {
   let template = readFileSync(templatePath, 'utf-8');
 
   // Replace template variables
-  template = template.replace('{{title}}', options.title);
-  template = template.replace('{{subtitle}}', options.subtitle || 'Interactive Memory Exploration');
+  template = template.replace('{{title}}', escapeHtml(options.title));
+  template = template.replace('{{subtitle}}', escapeHtml(options.subtitle || 'Interactive Memory Exploration'));
   template = template.replace('{{content}}', options.content);
   template = template.replace('{{extra_head}}', options.extraHead || '');
   template = template.replace('{{header_actions}}', options.headerActions || '');
   template = template.replace('{{extra_scripts}}', options.extraScripts || '');
+
+  // Release boundary: MCP raw HTML is static. Remove every executable script
+  // and inline event handler even if a client ignores the document CSP.
+  template = template.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
+  template = template.replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
 
   return template;
 }
@@ -57,35 +83,18 @@ export function renderTemplate(options: TemplateOptions): string {
  * Common script includes for interactive UIs
  */
 export const SCRIPT_INCLUDES = {
-  // D3.js for force-directed graphs
-  d3: '<script src="https://d3js.org/d3.v7.min.js"></script>',
-  
-  // Chart.js for analytics dashboards
-  chartjs: '<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>',
-  
-  // Diff library for comparison views
-  diff: '<script src="https://cdn.jsdelivr.net/npm/diff@5.1.0/dist/diff.min.js"></script>',
-  
-  // All common libraries
-  all: [
-    '<script src="https://d3js.org/d3.v7.min.js"></script>',
-    '<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>',
-    '<script src="https://cdn.jsdelivr.net/npm/diff@5.1.0/dist/diff.min.js"></script>',
-  ].join('\n'),
+  d3: '',
+  chartjs: '',
+  diff: '',
+  all: '',
 };
 
 /**
  * Common style includes for interactive UIs
  */
 export const STYLE_INCLUDES = {
-  // Highlight.js for code syntax highlighting
-  highlightjs: `
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-  `,
-  
-  // Font Awesome icons
-  fontawesome: '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">',
+  highlightjs: '',
+  fontawesome: '',
 };
 
 /**
@@ -118,8 +127,9 @@ export function createUIResourceMetadata(
  * Helper to create error UI
  */
 export function renderError(error: Error | string): string {
-  const errorMessage = typeof error === 'string' ? error : error.message;
-  const errorStack = typeof error === 'object' && error.stack ? error.stack : '';
+  const errorMessage = process.env.NODE_ENV === 'production'
+    ? 'The interface could not be rendered.'
+    : typeof error === 'string' ? error : error.message;
 
   return renderTemplate({
     title: 'Error',
@@ -134,8 +144,7 @@ export function renderError(error: Error | string): string {
           An error occurred while rendering this interface:
         </p>
         <pre style="background: var(--rembr-bg); padding: 1rem; border-radius: 6px; overflow-x: auto; color: var(--rembr-error);">
-${errorMessage}
-${errorStack ? '\n\nStack trace:\n' + errorStack : ''}
+${escapeHtml(errorMessage)}
         </pre>
       </div>
     `,
@@ -152,7 +161,7 @@ export function renderLoading(message: string = 'Loading...'): string {
     content: `
       <div class="rembr-card" style="text-align: center; padding: 3rem;">
         <div class="rembr-loading" style="width: 40px; height: 40px; margin: 0 auto 1rem;"></div>
-        <p style="color: var(--rembr-text-secondary);">${message}</p>
+        <p style="color: var(--rembr-text-secondary);">${escapeHtml(message)}</p>
       </div>
     `,
   });

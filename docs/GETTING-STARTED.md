@@ -97,9 +97,11 @@ Then add Rembr as an MCP server in your VS Code settings or `.vscode/mcp.json`:
 
 ```bash
 # The server is stateless — no initialize handshake or session header needed.
+# Supply an untracked mode-0600 curl config containing the scoped x-api-key
+# header; do not place the credential in shell history or process arguments.
 # Store a memory in a single call:
 curl -X POST https://rembr.ai/mcp \
-  -H "x-api-key: mb_live_YOUR_KEY" \
+  --config /run/secrets/rembr-curl.config \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"store_memory","arguments":{"content":"Hello from Rembr!","category":"facts"}},"id":1}'
@@ -143,7 +145,7 @@ Visit [rembr.ai/dashboard](https://rembr.ai/dashboard) to:
 | **Snapshot** | An immutable point-in-time capture of memories, used for agent handoffs and temporal debugging |
 | **Hybrid search** | Default search mode — combines semantic similarity (70%) + keyword matching (30%) for best results |
 | **PII detection** | Built-in NLP engine that detects 21 types of personal information and can auto-redact |
-| **File attachments** | Upload files to memories via MinIO-backed storage |
+| **File attachments** | Implemented but release-gated pending a verified production object store |
 | **RLM session** | Recursive Language Model session — decomposition, iteration tracking, and stuck detection for autonomous agents |
 
 ---
@@ -160,13 +162,18 @@ Yes. Same API key works everywhere. Store in Claude, retrieve in Cursor. The mem
 By default, `search_memory` uses hybrid mode: 70% semantic (embedding similarity) + 30% keyword (full-text). You can override with `search_mode=text`, `semantic`, or `phrase`.
 
 **Q: Is my data secure?**  
-All memories are isolated per tenant using Row-Level Security at the database layer. See [security docs →](/docs/security).
+Memory access is authorised by tenant, project and user. PostgreSQL FORCE RLS
+adds a database boundary for memories and selected MCP tables. Production
+traffic uses TLS; verify at-rest encryption in the storage class/operator
+configuration for your deployment. See [security docs →](/docs/security).
 
 **Q: What's the rate limit?**  
 All plans: 60 requests/minute per tenant (Redis-backed). You'll receive a `429` with `X-RateLimit-*` headers when limits are hit. Transport-layer rate limiting also applies to the `/mcp` endpoint.
 
 **Q: Can I attach files to memories?**  
-Yes. Use `upload_attachment` to attach files (up to your plan's storage quota). Files are stored in MinIO with signed download URLs.
+The attachment implementation is currently omitted from discovery and denied at
+dispatch. It will be enabled only after the production object store, credentials,
+network policy and recovery path have been configured and exercised together.
 
 **Q: How does PII detection work?**  
 Rembr has a built-in NLP engine that detects 21 types of personal information (email, phone, SSN, NINO, NHS numbers, etc.). Use `pii_nlp_detect` to scan content or `pii_nlp_redact` to automatically mask/remove PII.

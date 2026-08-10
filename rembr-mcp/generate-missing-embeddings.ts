@@ -9,7 +9,7 @@ import { OllamaEmbeddingProvider } from './src/ollama-provider.js';
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const DB_HOST = process.env.DB_HOST || 'localhost';
 const DB_PORT = parseInt(process.env.DB_PORT || '5432');
-const DB_NAME = process.env.DB_NAME || 'rembr_production';
+const DB_NAME = process.env.DB_NAME || 'rembr';
 const DB_USER = process.env.DB_USER || 'rembr';
 const DB_PASSWORD = process.env.DB_PASSWORD || '';
 

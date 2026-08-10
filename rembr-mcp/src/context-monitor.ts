@@ -77,10 +77,27 @@ export async function monitorContext(
   tenantId: string,
   request: MonitorRequest
 ): Promise<ContextMonitorResult> {
-  const maxTokens = request.max_tokens || 200000;
-  const thresholds = request.thresholds || [70, 85, 95];
-  const topN = request.top_n || 5;
-  const trendWindowHours = request.trend_window_hours || 24;
+  const maxTokens = request.max_tokens ?? 200000;
+  const thresholds = request.thresholds ?? [70, 85, 95];
+  const topN = request.top_n ?? 5;
+  const trendWindowHours = request.trend_window_hours ?? 24;
+  if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 2_000_000) {
+    throw new Error('max_tokens must be an integer between 1 and 2000000');
+  }
+  if (!Number.isSafeInteger(topN) || topN < 1 || topN > 20) {
+    throw new Error('top_n must be an integer between 1 and 20');
+  }
+  if (!Number.isSafeInteger(trendWindowHours) || trendWindowHours < 1 || trendWindowHours > 720) {
+    throw new Error('trend_window_hours must be an integer between 1 and 720');
+  }
+  if (thresholds.length > 10 || thresholds.some(value => !Number.isFinite(value) || value < 0 || value > 100)) {
+    throw new Error('thresholds must contain at most 10 values between 0 and 100');
+  }
+  const usageEntries = Object.entries(request.current_usage || {});
+  if (usageEntries.length > 100 || usageEntries.some(([key, value]) =>
+    key.length > 100 || !Number.isSafeInteger(value) || value < 0 || value > maxTokens)) {
+    throw new Error('current_usage exceeds category or token bounds');
+  }
   
   // Calculate total usage
   const totalTokensUsed = Object.values(request.current_usage).reduce((sum, val) => sum + val, 0);
@@ -287,6 +304,9 @@ async function getUsageTrend(
   sessionId: string,
   windowHours: number
 ): Promise<UsageTrend[]> {
+  if (!Number.isSafeInteger(windowHours) || windowHours < 1 || windowHours > 720) {
+    throw new Error('trend_window_hours must be an integer between 1 and 720');
+  }
   const query = `
     SELECT 
       created_at as timestamp,
@@ -296,12 +316,12 @@ async function getUsageTrend(
     WHERE tenant_id = $1
       AND session_id = $2
       AND event_type = 'usage_snapshot'
-      AND created_at >= NOW() - INTERVAL '${windowHours} hours'
+      AND created_at >= NOW() - ($3::int * INTERVAL '1 hour')
     ORDER BY created_at ASC
     LIMIT 100
   `;
   
-  const result = await pool.query(query, [tenantId, sessionId]);
+  const result = await pool.query(query, [tenantId, sessionId, windowHours]);
   
   return result.rows.map(row => ({
     timestamp: row.timestamp,

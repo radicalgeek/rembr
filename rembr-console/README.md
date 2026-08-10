@@ -23,7 +23,10 @@ Two consequences:
 ## Run
 
 ```bash
-REMBR_URL=http://localhost:3000/mcp REMBR_API_KEY=mb_live_... node server.mjs
+REMBR_URL=http://localhost:3000/mcp \
+REMBR_API_KEY=your-scoped-upstream-key \
+REMBR_CONSOLE_AUTH_TOKEN="$(openssl rand -hex 32)" \
+node server.mjs
 # → http://localhost:8080
 ```
 
@@ -33,11 +36,18 @@ Or via Docker / the repo's `docker-compose.yml` (see [SELF-HOSTING.md](../SELF-H
 |---|---|---|
 | `REMBR_URL` | `http://localhost:3000/mcp` | Rembr engine MCP endpoint |
 | `REMBR_API_KEY` | — | API key (see the bootstrap script in SELF-HOSTING.md) |
+| `REMBR_CONSOLE_AUTH_TOKEN` | — | Required, distinct browser-to-console bearer token (32+ bytes) |
+| `REMBR_CONSOLE_MODE` | `read-only` | Set to `read-write` to permit memory create/delete |
+| `HOST` | `127.0.0.1` | Listen address; retain loopback unless a protected proxy is in front |
 | `PORT` | `8080` | Console listen port |
 | `REMBR_TIMEOUT_MS` | `30000` | Upstream request timeout |
+| `REMBR_CONSOLE_ALLOWED_ORIGINS` | same origin | Comma-separated origins for a trusted reverse proxy |
 
-The console is intended for trusted networks (localhost or behind your own reverse proxy /
-auth). It deliberately ships no login system — it's single-tenant by design.
+The console binds loopback, requires a dedicated bearer token, validates browser origins,
+caps requests and exposes only the operations used by this UI. It defaults to read-only.
+If it is placed behind a reverse proxy, keep the bearer check enabled, terminate TLS there
+and set an explicit origin allowlist. Use an upstream key scoped to this tenant and console;
+never reuse an administrative or autonomous-bootstrap credential.
 
 ## Development
 

@@ -10,7 +10,7 @@
  * - Export to PNG/SVG
  */
 
-import { renderTemplate, SCRIPT_INCLUDES } from './index.js';
+import { renderTemplate, SCRIPT_INCLUDES, safeJsonForHtml } from './index.js';
 
 export interface GraphData {
   nodes: Array<{
@@ -51,7 +51,7 @@ export interface GraphData {
  * Render the memory graph UI
  */
 export function renderMemoryGraph(graphData: GraphData): string {
-  const graphDataJson = JSON.stringify(graphData, null, 2);
+  const graphDataJson = safeJsonForHtml(graphData);
   
   return renderTemplate({
     title: 'Memory Graph',
@@ -156,6 +156,12 @@ export function renderMemoryGraph(graphData: GraphData): string {
     extraScripts: `
       <script>
         const graphData = ${graphDataJson};
+
+        function escapeHtml(value) {
+          return String(value ?? '').replace(/[&<>"']/g, character => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+          })[character]);
+        }
         
         // Setup graph container
         const container = d3.select('#graph-container');
@@ -275,12 +281,12 @@ export function renderMemoryGraph(graphData: GraphData): string {
             .style('left', (event.pageX + 10) + 'px')
             .style('top', (event.pageY - 10) + 'px')
             .html(\`
-              <div style="font-weight: 600; margin-bottom: 0.5rem;">\${d.label}</div>
+              <div style="font-weight: 600; margin-bottom: 0.5rem;">\${escapeHtml(d.label)}</div>
               <div style="font-size: 0.75rem; color: var(--rembr-text-secondary); margin-bottom: 0.5rem;">
-                <span class="rembr-badge rembr-badge-primary" style="font-size: 0.65rem;">\${d.category}</span>
+                <span class="rembr-badge rembr-badge-primary" style="font-size: 0.65rem;">\${escapeHtml(d.category)}</span>
               </div>
               <div style="font-size: 0.875rem; color: var(--rembr-text-secondary);">
-                \${d.content.substring(0, 150)}\${d.content.length > 150 ? '...' : ''}
+                \${escapeHtml(d.content.substring(0, 150))}\${d.content.length > 150 ? '...' : ''}
               </div>
               <div style="margin-top: 0.5rem; font-size: 0.75rem; color: var(--rembr-text-secondary);">
                 Click for full details
@@ -301,8 +307,8 @@ export function renderMemoryGraph(graphData: GraphData): string {
           detailsContent.innerHTML = \`
             <div style="margin-bottom: 1rem;">
               <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
-                <div style="font-size: 1.125rem; font-weight: 600;">\${d.label}</div>
-                <span class="rembr-badge rembr-badge-primary">\${d.category}</span>
+                <div style="font-size: 1.125rem; font-weight: 600;">\${escapeHtml(d.label)}</div>
+                <span class="rembr-badge rembr-badge-primary">\${escapeHtml(d.category)}</span>
               </div>
               <div style="font-size: 0.75rem; color: var(--rembr-text-secondary);">
                 Created: \${new Date(d.created_at).toLocaleString()}
@@ -311,12 +317,12 @@ export function renderMemoryGraph(graphData: GraphData): string {
             
             <div style="background: var(--rembr-bg); padding: 1rem; border-radius: 6px; margin-bottom: 1rem;">
               <div style="font-weight: 600; margin-bottom: 0.5rem; font-size: 0.875rem;">Content</div>
-              <div style="white-space: pre-wrap; color: var(--rembr-text-secondary); font-size: 0.875rem;">\${d.content}</div>
+              <div style="white-space: pre-wrap; color: var(--rembr-text-secondary); font-size: 0.875rem;">\${escapeHtml(d.content)}</div>
             </div>
 
             <div style="background: var(--rembr-bg); padding: 1rem; border-radius: 6px;">
               <div style="font-weight: 600; margin-bottom: 0.5rem; font-size: 0.875rem;">Metadata</div>
-              <pre style="margin: 0; color: var(--rembr-text-secondary); font-size: 0.75rem; overflow-x: auto;">\${JSON.stringify(d.metadata, null, 2)}</pre>
+              <pre style="margin: 0; color: var(--rembr-text-secondary); font-size: 0.75rem; overflow-x: auto;">\${escapeHtml(JSON.stringify(d.metadata, null, 2))}</pre>
             </div>
           \`;
           

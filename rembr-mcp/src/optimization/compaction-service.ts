@@ -344,7 +344,7 @@ async function mergeMemoryGroup(
   logger.info(`[Compaction] Merging ${group.length} memories in category: ${category}`);
 
   // Generate merged content using LLM
-  const mergedContent = await generateMergedContent(group);
+  const mergedContent = await generateMergedContent(group, tenantId);
 
   if (dryRun) {
     return {
@@ -397,7 +397,7 @@ async function mergeMemoryGroup(
 /**
  * Generate merged content using LLM
  */
-async function generateMergedContent(group: CompactionCandidate[]): Promise<string> {
+async function generateMergedContent(group: CompactionCandidate[], tenantId: string): Promise<string> {
   const ollamaClient = OllamaClient.getInstance();
 
   const prompt = `You are a memory compression assistant. Merge the following ${group.length} related memories into a single concise summary that preserves all important information.
@@ -418,6 +418,7 @@ Consolidated memory:`;
     const response = await ollamaClient.generateText(prompt, undefined, {
       maxTokens: 500,
       temperature: 0.3, // Low temperature for factual consolidation
+      tenantId,
     });
 
     return response.trim();

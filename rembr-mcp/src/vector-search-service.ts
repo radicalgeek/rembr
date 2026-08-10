@@ -145,21 +145,37 @@ export class VectorSearchService {
       await client.query('BEGIN');
 
       // Set RLS context
-      await client.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [tenantId]);
+      await client.query(`SELECT set_config('app.current_tenant', $1, true)`, [tenantId]);
 
       // Count indexed memories for this tenant
       const countRes = await client.query<{ cnt: string }>(
         `SELECT COUNT(*) AS cnt
          FROM memory_embeddings e
          JOIN memories m ON m.id = e.memory_id
-         WHERE m.tenant_id = $1`,
-        [tenantId],
+         LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+         WHERE m.tenant_id = $1
+           AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+           AND (
+             (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+             OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND (
+               p.id IS NULL OR p.is_personal = false OR p.owner_id = $3::uuid
+               OR EXISTS (SELECT 1 FROM project_members pm
+                          WHERE pm.project_id = p.id AND pm.user_id = $3::uuid)
+             ))
+           )`,
+        [tenantId, projectId || null, userId || null],
       );
       const memoryCount = parseInt(countRes.rows[0]?.cnt ?? '0', 10);
 
       // Pick ef_search
       const efSearch = efSearchOverride ?? efSearchForCount(memoryCount);
-      await client.query(`SET LOCAL hnsw.ef_search = ${efSearch}`);
+      if (!Number.isSafeInteger(efSearch) || efSearch < 1 || efSearch > 1_000) {
+        throw new Error('efSearch must be an integer between 1 and 1000');
+      }
+      await client.query(
+        `SELECT set_config('hnsw.ef_search', $1, true)`,
+        [String(efSearch)],
+      );
 
       // Build search query
       const embeddingStr = `[${queryEmbedding.join(',')}]`;
@@ -170,12 +186,15 @@ export class VectorSearchService {
           1 - (e.embedding <=> $1::vector) AS similarity
         FROM memories m
         JOIN memory_embeddings e ON m.id = e.memory_id
-        LEFT JOIN projects p ON m.project_id = p.id
+        LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
         WHERE m.tenant_id = $2
           AND (
-            p.is_personal = false
-            OR p.is_personal IS NULL
-            OR (p.is_personal = true AND p.owner_id = $3)
+            (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+            OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND (
+              p.id IS NULL OR p.is_personal = false OR p.owner_id = $3::uuid
+              OR EXISTS (SELECT 1 FROM project_members pm
+                         WHERE pm.project_id = p.id AND pm.user_id = $3::uuid)
+            ))
           )
       `;
       const params: unknown[] = [embeddingStr, tenantId, userId ?? null];
@@ -192,10 +211,8 @@ export class VectorSearchService {
       }
 
       if (metadataFilter && Object.keys(metadataFilter).length > 0) {
-        for (const [key, value] of Object.entries(metadataFilter)) {
-          sql += ` AND m.metadata->>'${key.replace(/'/g, "''")}' = $${pi++}`;
-          params.push(String(value));
-        }
+        sql += ` AND m.metadata @> $${pi++}::jsonb`;
+        params.push(JSON.stringify(metadataFilter));
       }
 
       sql += ` ORDER BY e.embedding <=> $1::vector LIMIT $${pi}`;

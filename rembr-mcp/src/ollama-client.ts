@@ -2,6 +2,17 @@ import { Ollama } from 'ollama';
 import { createHash } from 'node:crypto';
 import { trackEmbeddingGeneration } from './metrics.js';
 import { EmbeddingCache } from './embedding-cache.js';
+import { cancelResponseBody, fetchWithDeadline, readBoundedJson } from './security/bounded-fetch.js';
+import { modelConcurrencyLimiter, type ModelConcurrencyOptions } from './security/model-concurrency.js';
+
+const EMBEDDING_DIMENSIONS = 768;
+const MAX_TEXT_RESPONSE_BYTES = 1024 * 1024;
+const MAX_GENERATED_TEXT_CHARS = 1024 * 1024;
+const MAX_PROMPT_CHARS = 512 * 1024;
+const MAX_SYSTEM_PROMPT_CHARS = 128 * 1024;
+const MAX_STOP_SEQUENCES = 16;
+const MAX_STOP_SEQUENCE_CHARS = 256;
+const MAX_TEXT_TOKENS = 16_384;
 
 /**
  * OllamaClient - Singleton client for Ollama embedding and text generation
@@ -33,12 +44,12 @@ import { EmbeddingCache } from './embedding-cache.js';
  *    called before batch operations to gate work that requires embeddings.
  *
  * ## Environment Variables
- * - `OLLAMA_HOST`              — Ollama base URL for embeddings (default: http://localhost:11434)
+ * - `OLLAMA_HOST`              — Ollama base URL for embeddings (default: cluster-local service)
  * - `OLLAMA_TEXT_HOST`         — Optional Ollama base URL for text generation
  * - `TEXT_GENERATION_PROVIDER` — "ollama" or "openai-compatible" (also accepts "lmstudio")
- * - `LM_STUDIO_BASE_URL`       — OpenAI-compatible base URL, e.g. http://localhost:4000/v1
- * - `LM_STUDIO_MODEL`          — OpenAI-compatible model id for text generation
- * - `LM_STUDIO_API_KEY`        — Optional bearer token (defaults to a non-empty local token)
+ * - `LM_STUDIO_BASE_URL`       — LM Studio/OpenAI-compatible base URL, e.g. http://host:1234/v1
+ * - `LM_STUDIO_MODEL`          — LM Studio model id for text generation
+ * - `LM_STUDIO_API_KEY`        — Optional LM Studio bearer token (defaults to a non-empty local token)
  * - `OLLAMA_EMBEDDING_MODEL`   — embedding model name (default: nomic-embed-text)
  * - `OLLAMA_TEXT_MODEL`        — text-gen model name (default: llama3.1:8b)
  * - `TEXT_GENERATION_TIMEOUT_MS` — text generation timeout override in milliseconds
@@ -99,7 +110,7 @@ export class OllamaClient {
       defaultTextTimeout
     );
 
-    console.log(`OllamaClient initialized: host=${this.host}, textHost=${this.textHost}, textProvider=${this.textProvider}, embedding=${this.embeddingModel}, text=${this.textModel}, textTimeoutMs=${this.TEXT_GENERATION_TIMEOUT_MS}, maxRetries=${this.MAX_RETRIES}, fallback=${this.FALLBACK_MODE}`);
+    console.log(`OllamaClient initialized: textProvider=${this.textProvider}, embedding=${this.embeddingModel}, text=${this.textModel}, textTimeoutMs=${this.TEXT_GENERATION_TIMEOUT_MS}, maxRetries=${this.MAX_RETRIES}, fallback=${this.FALLBACK_MODE}`);
   }
 
   /**
@@ -127,12 +138,12 @@ export class OllamaClient {
    * @param text Text to embed
    * @returns 768-dimensional embedding vector
    */
-  async generateEmbedding(text: string): Promise<number[]> {
+  async generateEmbedding(text: string, context: ModelConcurrencyOptions = {}): Promise<number[]> {
     const MAX_CHARS = 6000;  // Safe per-chunk limit for nomic-embed-text
     const CHUNK_OVERLAP = 500; // Overlap to preserve sentence boundary context
 
     if (text.length <= MAX_CHARS) {
-      return this.generateSingleEmbedding(text);
+      return modelConcurrencyLimiter.withPermit(context, () => this.generateSingleEmbedding(text));
     }
 
     // Long content: chunk-and-average instead of silent truncation
@@ -144,7 +155,7 @@ export class OllamaClient {
     );
 
     const chunkEmbeddings = await Promise.all(
-      chunks.map(chunk => this.generateSingleEmbedding(chunk))
+      chunks.map(chunk => modelConcurrencyLimiter.withPermit(context, () => this.generateSingleEmbedding(chunk)))
     );
     return this.averageEmbeddings(chunkEmbeddings);
   }
@@ -166,7 +177,7 @@ export class OllamaClient {
       const msg = `Ollama circuit breaker is open (${this.consecutiveFailures} consecutive failures). Waiting for reset.`;
       if (this.FALLBACK_MODE === 'zero') {
         console.warn(`[OllamaClient] ${msg} Returning zero vector.`);
-        return new Array(768).fill(0);
+        return new Array(EMBEDDING_DIMENSIONS).fill(0);
       }
       throw new Error(msg);
     }
@@ -182,19 +193,16 @@ export class OllamaClient {
       }
 
       try {
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          setTimeout(() => reject(new Error('Embedding generation timeout after 30 seconds')), 30000);
-        });
-
-        const embeddingPromise = this.client.embeddings({
+        const response = await this.withOllamaDeadline(this.client.embeddings({
           model: this.embeddingModel,
           prompt: text
-        });
+        }), this.client, 30_000, 'Embedding generation timeout after 30 seconds');
 
-        const response = await Promise.race([embeddingPromise, timeoutPromise]);
-
-        if (!response.embedding || response.embedding.length !== 768) {
-          throw new Error(`Invalid embedding dimensions: expected 768, got ${response.embedding?.length}`);
+        if (!Array.isArray(response.embedding) || response.embedding.length !== EMBEDDING_DIMENSIONS) {
+          throw new Error(`Invalid embedding dimensions: expected ${EMBEDDING_DIMENSIONS}, got ${response.embedding?.length}`);
+        }
+        if (!response.embedding.every(value => typeof value === 'number' && Number.isFinite(value))) {
+          throw new Error('Embedding response contained invalid numeric values');
         }
 
         // Success: reset circuit breaker
@@ -206,14 +214,14 @@ export class OllamaClient {
         trackEmbeddingGeneration('ollama', this.embeddingModel, durationSeconds);
 
         // Cache the embedding (async, don't wait)
-        this.embeddingCache.set(text, response.embedding).catch(err =>
-          console.warn('Failed to cache embedding:', err.message)
+        this.embeddingCache.set(text, response.embedding).catch(() =>
+          console.warn('Failed to cache embedding')
         );
 
         return response.embedding;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
-        console.error(`[OllamaClient] Embedding attempt ${attempt + 1} failed:`, lastError.message);
+        console.error(`[OllamaClient] Embedding attempt ${attempt + 1} failed`);
       }
     }
 
@@ -226,8 +234,8 @@ export class OllamaClient {
 
     // Graceful degradation
     if (this.FALLBACK_MODE === 'zero') {
-      console.warn(`[OllamaClient] All retries failed. Returning zero vector (fallback mode). Last error: ${lastError.message}`);
-      return new Array(768).fill(0);
+      console.warn('[OllamaClient] All embedding retries failed. Returning zero vector (fallback mode).');
+      return new Array(EMBEDDING_DIMENSIONS).fill(0);
     }
 
     throw lastError;
@@ -315,19 +323,17 @@ export class OllamaClient {
       temperature?: number;
       maxTokens?: number;
       stopSequences?: string[];
+      tenantId?: string;
+      signal?: AbortSignal;
     }
   ): Promise<string> {
-    try {
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        setTimeout(
-          () => reject(new Error(`Text generation timeout after ${this.TEXT_GENERATION_TIMEOUT_MS}ms`)),
-          this.TEXT_GENERATION_TIMEOUT_MS
-        );
-      });
-
-      const generatePromise = this.textProvider === 'openai-compatible'
-        ? this.generateOpenAICompatibleText(prompt, systemPrompt, options)
-        : this.textClient.generate({
+    this.validateTextGenerationInput(prompt, systemPrompt, options);
+    return modelConcurrencyLimiter.withPermit({ tenantId: options?.tenantId, signal: options?.signal }, async () => {
+      try {
+      if (this.textProvider === 'openai-compatible') {
+        return await this.generateOpenAICompatibleText(prompt, systemPrompt, options);
+      }
+      const response = await this.withOllamaDeadline(this.textClient.generate({
             model: this.textModel,
             prompt,
             system: systemPrompt,
@@ -337,13 +343,17 @@ export class OllamaClient {
               num_predict: options?.maxTokens ?? 500,
               stop: options?.stopSequences
             }
-          }).then(response => response.response);
-
-      return await Promise.race([generatePromise, timeoutPromise]);
-    } catch (error) {
-      console.error('Text generation failed:', error);
-      throw error;
-    }
+          }), this.textClient, this.TEXT_GENERATION_TIMEOUT_MS,
+          `Text generation timeout after ${this.TEXT_GENERATION_TIMEOUT_MS}ms`);
+      if (typeof response.response !== 'string' || !response.response || response.response.length > MAX_GENERATED_TEXT_CHARS) {
+        throw new Error('Text generation returned invalid or oversized content');
+      }
+      return response.response;
+      } catch (error) {
+        console.error('Text generation failed');
+        throw error;
+      }
+    });
   }
 
   private async generateOpenAICompatibleText(
@@ -353,11 +363,18 @@ export class OllamaClient {
       temperature?: number;
       maxTokens?: number;
       stopSequences?: string[];
+      tenantId?: string;
+      signal?: AbortSignal;
     }
   ): Promise<string> {
     const baseUrl = this.normalizedOpenAICompatibleBaseUrl();
     const disableThinking = process.env.OPENAI_COMPATIBLE_DISABLE_THINKING !== 'false';
-    const defaultMaxTokens = Number(process.env.OPENAI_COMPATIBLE_MAX_TOKENS ?? 4096);
+    const defaultMaxTokens = this.parseBoundedInt(
+      process.env.OPENAI_COMPATIBLE_MAX_TOKENS,
+      4096,
+      1,
+      MAX_TEXT_TOKENS,
+    );
     const messages = [
       ...(systemPrompt ? [{ role: 'system', content: disableThinking ? `/no_think\n${systemPrompt}` : systemPrompt }] : []),
       { role: 'user', content: prompt }
@@ -367,7 +384,7 @@ export class OllamaClient {
       messages[0].content = `/no_think\n${messages[0].content}`;
     }
 
-    const response = await fetch(`${baseUrl}/chat/completions`, {
+    const response = await fetchWithDeadline(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -382,28 +399,27 @@ export class OllamaClient {
         stop: options?.stopSequences,
         ...(disableThinking ? { chat_template_kwargs: { enable_thinking: false } } : {})
       })
-    });
+    }, this.TEXT_GENERATION_TIMEOUT_MS);
 
     if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      throw new Error(`OpenAI-compatible text generation failed (${response.status}): ${body.slice(0, 500)}`);
+      await cancelResponseBody(response);
+      throw new Error(`OpenAI-compatible text generation failed with status ${response.status}`);
     }
 
-    const data = await response.json() as {
+    const data = await readBoundedJson<{
       choices?: Array<{ message?: { content?: string; reasoning_content?: string }; text?: string; finish_reason?: string }>;
       error?: { message?: string };
       usage?: unknown;
-    };
+    }>(response, MAX_TEXT_RESPONSE_BYTES);
+
+    if (!data || typeof data !== 'object' || !Array.isArray(data.choices) || data.choices.length < 1 || data.choices.length > 16) {
+      throw new Error('OpenAI-compatible text generation returned an invalid response shape');
+    }
 
     const choice = data.choices?.[0];
     const text = choice?.message?.content ?? choice?.text;
-    if (!text) {
-      const reasoningLength = choice?.message?.reasoning_content?.length ?? 0;
-      const finishReason = choice?.finish_reason ?? 'unknown';
-      throw new Error(
-        data.error?.message ||
-        `OpenAI-compatible text generation returned no content (finish_reason=${finishReason}, reasoning_content_chars=${reasoningLength})`
-      );
+    if (typeof text !== 'string' || !text || text.length > MAX_GENERATED_TEXT_CHARS) {
+      throw new Error('OpenAI-compatible text generation returned invalid or oversized content');
     }
 
     return text;
@@ -434,17 +450,88 @@ export class OllamaClient {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
   }
 
+  private parseBoundedInt(value: string | undefined, fallback: number, minimum: number, maximum: number): number {
+    if (!value) return fallback;
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+  }
+
+  private validateTextGenerationInput(
+    prompt: string,
+    systemPrompt: string | undefined,
+    options: {
+      temperature?: number;
+      maxTokens?: number;
+      stopSequences?: string[];
+      tenantId?: string;
+      signal?: AbortSignal;
+    } | undefined,
+  ): void {
+    if (typeof prompt !== 'string' || prompt.length < 1 || prompt.length > MAX_PROMPT_CHARS || prompt.includes('\0')) {
+      throw new Error('Text generation prompt is invalid or too large');
+    }
+    if (systemPrompt !== undefined && (
+      typeof systemPrompt !== 'string'
+      || systemPrompt.length > MAX_SYSTEM_PROMPT_CHARS
+      || systemPrompt.includes('\0')
+    )) {
+      throw new Error('Text generation system prompt is invalid or too large');
+    }
+    const temperature = options?.temperature ?? 0.7;
+    if (typeof temperature !== 'number' || !Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
+      throw new Error('Text generation temperature must be between 0 and 2');
+    }
+    const maxTokens = options?.maxTokens ?? 500;
+    if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > MAX_TEXT_TOKENS) {
+      throw new Error(`Text generation maxTokens must be between 1 and ${MAX_TEXT_TOKENS}`);
+    }
+    if (options?.stopSequences !== undefined && (
+      !Array.isArray(options.stopSequences)
+      || options.stopSequences.length > MAX_STOP_SEQUENCES
+      || options.stopSequences.some(stop => typeof stop !== 'string' || stop.length > MAX_STOP_SEQUENCE_CHARS || stop.includes('\0'))
+    )) {
+      throw new Error('Text generation stop sequences are invalid or too large');
+    }
+  }
+
+  private async withOllamaDeadline<T>(
+    operation: Promise<T>,
+    client: Ollama,
+    timeoutMs: number,
+    timeoutMessage: string,
+  ): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        try {
+          client.abort();
+        } catch {
+          // The timeout remains authoritative even if the SDK abort hook fails.
+        }
+        reject(new Error(timeoutMessage));
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([operation, deadline]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   /**
    * Check if Ollama service is available.
    * Returns false immediately when the circuit is open.
    */
   async isAvailable(): Promise<boolean> {
     if (this.isCircuitOpen()) return false;
+    let response: Response | undefined;
     try {
-      await this.client.list();
-      return true;
+      response = await fetchWithDeadline(`${this.host.replace(/\/+$/, '')}/api/tags`, { method: 'GET' }, 3_000);
+      return response.ok;
     } catch {
       return false;
+    } finally {
+      if (response) await cancelResponseBody(response);
     }
   }
 

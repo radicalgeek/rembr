@@ -100,7 +100,8 @@ export async function getUsagePatterns(
       AND event_type = 'usage_snapshot'
       ${periodStart ? 'AND created_at >= $3' : ''}
       ${periodEnd ? `AND created_at <= $${periodStart ? '4' : '3'}` : ''}
-    ORDER BY created_at ASC
+    ORDER BY created_at DESC
+    LIMIT 1000
   `;
   
   const params: unknown[] = [tenantId, sessionId];
@@ -109,12 +110,12 @@ export async function getUsagePatterns(
   
   const result = await pool.query(query, params);
   
-  return result.rows.map(row => ({
+  return result.rows.slice(0, 1000).map(row => ({
     timestamp: row.timestamp,
     token_count: parseInt(row.token_count, 10),
     category: row.category || 'unknown',
     session_id: row.session_id,
-  }));
+  })).reverse();
 }
 
 /**
@@ -139,7 +140,8 @@ export async function getCompressionEvents(
       AND event_type = 'compression_completed'
       ${periodStart ? 'AND created_at >= $3' : ''}
       ${periodEnd ? `AND created_at <= $${periodStart ? '4' : '3'}` : ''}
-    ORDER BY created_at ASC
+    ORDER BY created_at DESC
+    LIMIT 1000
   `;
   
   const params: unknown[] = [tenantId, sessionId];
@@ -148,7 +150,7 @@ export async function getCompressionEvents(
   
   const result = await pool.query(query, params);
   
-  return result.rows.map(row => {
+  return result.rows.slice(0, 1000).map(row => {
     const tokensBefore = parseInt(row.tokens_before, 10);
     const tokensAfter = parseInt(row.tokens_after, 10);
     const tokensSaved = tokensBefore - tokensAfter;
@@ -162,7 +164,7 @@ export async function getCompressionEvents(
       compression_ratio: compressionRatio,
       strategy: row.strategy || 'unknown',
     };
-  });
+  }).reverse();
 }
 
 /**
@@ -372,6 +374,12 @@ export async function getContextAnalytics(
 ): Promise<ContextAnalytics> {
   const start = periodStart || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // Default: last 7 days
   const end = periodEnd || new Date();
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || start > end) {
+    throw new Error('Invalid context analytics period');
+  }
+  if (end.getTime() - start.getTime() > 31 * 24 * 60 * 60 * 1000) {
+    throw new Error('Context analytics period cannot exceed 31 days');
+  }
   
   // Fetch usage patterns
   const usageTimeline = await getUsagePatterns(pool, tenantId, sessionId, start, end);

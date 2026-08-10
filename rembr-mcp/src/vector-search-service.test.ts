@@ -110,8 +110,10 @@ describe('VectorSearchService.search', () => {
 
     await service.search({ tenantId: TENANT_ID, queryEmbedding: QUERY_EMBEDDING });
 
-    const calls: string[] = pool._client.query.mock.calls.map((c: unknown[]) => String(c[0]));
-    expect(calls.some((q) => q.includes('hnsw.ef_search = 40'))).toBe(true);
+    expect(pool._client.query.mock.calls[3]).toEqual([
+      expect.stringContaining("set_config('hnsw.ef_search'"),
+      ['40'],
+    ]);
   });
 
   it('uses ef_search = 64 for a mid-size tenant (10k–100k memories)', async () => {
@@ -119,8 +121,7 @@ describe('VectorSearchService.search', () => {
 
     await service.search({ tenantId: TENANT_ID, queryEmbedding: QUERY_EMBEDDING });
 
-    const calls: string[] = pool._client.query.mock.calls.map((c: unknown[]) => String(c[0]));
-    expect(calls.some((q) => q.includes('hnsw.ef_search = 64'))).toBe(true);
+    expect(pool._client.query.mock.calls[3][1]).toEqual(['64']);
   });
 
   it('uses ef_search = 100 for a large tenant (100k–500k memories)', async () => {
@@ -128,8 +129,7 @@ describe('VectorSearchService.search', () => {
 
     await service.search({ tenantId: TENANT_ID, queryEmbedding: QUERY_EMBEDDING });
 
-    const calls: string[] = pool._client.query.mock.calls.map((c: unknown[]) => String(c[0]));
-    expect(calls.some((q) => q.includes('hnsw.ef_search = 100'))).toBe(true);
+    expect(pool._client.query.mock.calls[3][1]).toEqual(['100']);
   });
 
   it('uses ef_search = 128 for a very large tenant (> 500k memories)', async () => {
@@ -137,8 +137,7 @@ describe('VectorSearchService.search', () => {
 
     await service.search({ tenantId: TENANT_ID, queryEmbedding: QUERY_EMBEDDING });
 
-    const calls: string[] = pool._client.query.mock.calls.map((c: unknown[]) => String(c[0]));
-    expect(calls.some((q) => q.includes('hnsw.ef_search = 128'))).toBe(true);
+    expect(pool._client.query.mock.calls[3][1]).toEqual(['128']);
   });
 
   it('respects efSearch override from caller', async () => {
@@ -146,10 +145,24 @@ describe('VectorSearchService.search', () => {
 
     await service.search({ tenantId: TENANT_ID, queryEmbedding: QUERY_EMBEDDING, efSearch: 200 });
 
-    const calls: string[] = pool._client.query.mock.calls.map((c: unknown[]) => String(c[0]));
-    expect(calls.some((q) => q.includes('hnsw.ef_search = 200'))).toBe(true);
-    // Should NOT pick the automatic tier value (40 for 5 000)
-    expect(calls.some((q) => q.includes('hnsw.ef_search = 40'))).toBe(false);
+    expect(pool._client.query.mock.calls[3][1]).toEqual(['200']);
+  });
+
+  it.each([
+    Number.NaN,
+    0,
+    1_001,
+    1.5,
+    '1); SELECT pg_sleep(10); --' as unknown as number,
+  ])('rejects an unsafe efSearch override before building SQL: %s', async unsafeValue => {
+    mockQueries(pool._client, 5_000);
+    await expect(service.search({
+      tenantId: TENANT_ID,
+      queryEmbedding: QUERY_EMBEDDING,
+      efSearch: unsafeValue,
+    })).rejects.toThrow(/efSearch/);
+    const queryText = pool._client.query.mock.calls.map(call => String(call[0])).join('\n');
+    expect(queryText).not.toContain(String(unsafeValue));
   });
 
   it('returns results and stats', async () => {

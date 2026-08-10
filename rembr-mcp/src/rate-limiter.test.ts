@@ -3,8 +3,8 @@
  * REM-272 / REM-48
  */
 
-import { describe, it, expect } from 'vitest';
-import { PLAN_LIMITS, DAILY_PLAN_LIMITS, createRateLimitMiddleware } from './rate-limiter.js';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { PLAN_LIMITS, DAILY_PLAN_LIMITS, createRateLimitMiddleware, __rateLimiterTesting } from './rate-limiter.js';
 
 describe('PLAN_LIMITS', () => {
   it('free limit is lower than pro', () => {
@@ -26,8 +26,8 @@ describe('PLAN_LIMITS', () => {
 });
 
 describe('DAILY_PLAN_LIMITS (REM-48)', () => {
-  it('free plan: 1,000 requests/day', () => {
-    expect(DAILY_PLAN_LIMITS.free).toBe(1000);
+  it('free plan: 10,000 transport calls/day', () => {
+    expect(DAILY_PLAN_LIMITS.free).toBe(10000);
   });
 
   it('pro plan: 100,000 requests/day', () => {
@@ -87,7 +87,7 @@ describe('createRateLimitMiddleware', () => {
     expect(nextCalled).toBe(true);
   });
 
-  it('sets X-RateLimit-* headers and passes through when Redis unavailable (fail-open)', async () => {
+  it('sets X-RateLimit-* headers and enforces the local fallback when Redis is unavailable', async () => {
     const mw = createRateLimitMiddleware('pro');
     const headers: Record<string, string | number> = {};
     let nextCalled = false;
@@ -101,10 +101,41 @@ describe('createRateLimitMiddleware', () => {
 
     await mw(req, res, next);
 
-    // Fail-open: should pass through when Redis is unavailable in test env
+    // The first locally-accounted request is within the configured limit.
     expect(nextCalled).toBe(true);
     expect(headers['X-RateLimit-Limit']).toBeDefined();
     expect(headers['X-RateLimit-Remaining']).toBeDefined();
     expect(headers['X-RateLimit-Window']).toBe('60s');
+  });
+});
+
+describe('atomic Redis rate-limit accounting', () => {
+  afterEach(() => __rateLimiterTesting.reset());
+
+  it('increments and repairs a missing TTL in one Lua operation', async () => {
+    const evalMock = vi.fn().mockResolvedValue([7, 120]);
+    __rateLimiterTesting.setRedisClient({ eval: evalMock } as any);
+
+    const result = await __rateLimiterTesting.check('key:test', 10, 60, 123);
+
+    expect(result).toMatchObject({ allowed: true, count: 7, limit: 10 });
+    expect(evalMock).toHaveBeenCalledWith(
+      expect.stringContaining("if ttl < 0 then"),
+      1,
+      'ratelimit:key:test:123',
+      120,
+    );
+    expect(__rateLimiterTesting.script).toContain("redis.call('INCR', KEYS[1])");
+    expect(__rateLimiterTesting.script).toContain("redis.call('EXPIRE', KEYS[1], ARGV[1])");
+  });
+
+  it('continues from the mirrored Redis count after a Redis failure', async () => {
+    const evalMock = vi.fn()
+      .mockResolvedValueOnce([4, 120])
+      .mockRejectedValueOnce(new Error('network split'));
+    __rateLimiterTesting.setRedisClient({ eval: evalMock } as any);
+
+    await expect(__rateLimiterTesting.check('key:test', 4, 60, 123)).resolves.toMatchObject({ count: 4, allowed: true });
+    await expect(__rateLimiterTesting.check('key:test', 4, 60, 123)).resolves.toMatchObject({ count: 5, allowed: false });
   });
 });

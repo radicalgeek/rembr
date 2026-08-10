@@ -15,7 +15,7 @@ function toolResult(text) {
   )
 }
 
-const ENV = { REMBR_API_KEY: "test-key", REMBR_URL: "https://rembr.test/mcp" }
+const ENV = { REMBR_API_KEY: "mb_live_test", REMBR_URL: "https://rembr.test/mcp" }
 
 beforeEach(() => {
   vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(toolResult("ok"))))

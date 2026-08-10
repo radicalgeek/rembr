@@ -4,6 +4,8 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express, { Request, Response, NextFunction } from 'express';
 import { randomUUID } from 'node:crypto';
+import type { Server as HttpServer } from 'node:http';
+import type { Socket } from 'node:net';
 
 import {
   CallToolRequestSchema,
@@ -21,6 +23,17 @@ import { createCheckpoint, getLatestCheckpoint, getCheckpointHistory } from './c
 import { monitorContext, getSessionState } from './context-monitor.js';
 import { authenticateRequest, type AuthOutcome, type AuthMethod } from './unified-auth-middleware.js';
 import {
+  authorizeToolCall,
+  CONSOLIDATED_OPERATION_TARGETS,
+  DISABLED_PENDING_ISOLATION,
+  BOOTSTRAP_ONLY_TENANT_STATE_TOOLS,
+  canReadTenantAggregates,
+  canUseBootstrapOnlyTenantState,
+  isToolDisabledForDiscovery,
+  pruneToolForDiscovery,
+  resolveToolForAuthorization,
+} from './authorization.js';
+import {
   setBudget,
   getBudget,
   listBudgets,
@@ -28,7 +41,7 @@ import {
   applyBudgetTemplate,
   BUDGET_TEMPLATES,
 } from './budget-management.js';
-import { AdvancedAnalyticsService, type ContradictionResult } from './advanced-analytics-service.js';
+import { AdvancedAnalyticsService } from './advanced-analytics-service.js';
 import { RalphRLMService, type RLMSessionStatus, type IterationOutcome, type ACStatus } from './ralph-rlm.js';
 import { AnalyticsReportingService, type CustomReportConfig, type Granularity, type ReportFormat } from './analytics-reporting.js';
 import { EnhancedSearchService, type AdvancedFilter, type ExportFormat as SearchExportFormat } from './enhanced-search.js';
@@ -56,10 +69,24 @@ import { GDPRComplianceService } from './gdpr-compliance.js';
 import { handleManageTask, handleTaskState, handleTaskDependencies, handleTaskSearch, handleManageAcceptanceCriteria, acceptanceCriteriaToolDefinition } from './task-mcp-tools.js';
 import { PIIDetectorService } from './pii-detector.js';
 import { compressContent, previewCompression } from './smart-compression.js';
-import { checkDailyTenantQuota, checkTransportRateLimit } from './rate-limiter.js';
+import { evaluateAuthenticatedQuotas } from './security/transport-quota.js';
+import { fitJsonResponse, fitMcpToolResult } from './security/response-budget.js';
 import { createAdminRouter } from './routes/admin.js';
 import { adminAuthMiddleware } from './middleware/admin-auth.js';
 import { mcpHeaderValidationMiddleware } from './middleware/mcp-header-validation.js';
+import { constantTimeSecretEqual, singleHeaderValue } from './security/secret-comparison.js';
+import { createMcpPreParserBoundary } from './security/preauth-boundary.js';
+import {
+  exploreAccessibleRelationshipGraph,
+  MAX_RELATIONSHIP_GRAPH_NODES,
+} from './relationship-graph-service.js';
+import {
+  resolveShutdownDrainMs,
+  SHUTDOWN_COMPONENT_STOP_MS,
+  SHUTDOWN_DB_CLOSE_MS,
+  waitForDrain,
+} from './security/shutdown.js';
+import { cancelResponseBody, fetchWithDeadline, readBoundedJson } from './security/bounded-fetch.js';
 import { extractMcpMeta } from './middleware/mcp-meta.js';
 import { z } from 'zod';
 import { validateMemoryInput, validateContent, validateCategory, validateMetadata, validateRelevanceScore } from './validation/memory-input.js';
@@ -87,19 +114,11 @@ interface AuthContext {
   userId?: string;
 }
 
-type ContradictionSource = 'precomputed' | 'live' | 'precomputed+live';
+type ContradictionSource = 'precomputed';
 
 interface FormattedContradiction {
-  memory_a: {
-    id: string;
-    content: string;
-    category: string;
-  };
-  memory_b: {
-    id: string;
-    content: string;
-    category: string;
-  };
+  memory_a: { id: string; content: string; category: string };
+  memory_b: { id: string; content: string; category: string };
   confidence: number;
   evidence: unknown;
 }
@@ -115,9 +134,6 @@ const ServerDiscoverRequestSchema = z.object({
   params: z.record(z.string(), z.unknown()).optional(),
 });
 
-// UUID regex for validation
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 /**
  * Sanitize a string parameter that should be a UUID.
  * Strips ALL surrounding quote layers (single/double) and whitespace.
@@ -127,7 +143,7 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 // REM-28: UUID format regex — only allow valid UUID v4 format to prevent injection
 
 function sanitizeUUID(value: unknown): string {
-  if (typeof value !== 'string') return '';
+  if (typeof value !== 'string') return String(value ?? '');
   // RAD-7: Strip whitespace and ALL surrounding quote layers (loop handles double/triple quoting)
   let cleaned = value.trim();
   let prev: string;
@@ -138,10 +154,9 @@ function sanitizeUUID(value: unknown): string {
       cleaned = cleaned.slice(1, -1).trim();
     }
   } while (cleaned !== prev);
-  // REM-28: Validate UUID format — reject anything that doesn't match
-  if (cleaned && !UUID_REGEX.test(cleaned)) {
-    return ''; // reject non-UUID to prevent injection via UUID fields
-  }
+  // Keep an invalid supplied value present so the audited Zod schema rejects
+  // it. Converting it to an empty string made optional filters behave as if the
+  // caller had omitted them and could silently broaden a query.
   return cleaned;
 }
 
@@ -194,9 +209,7 @@ function normalizeJsonRpcBody(body: unknown): Record<string, any> | null {
     }
   }
 
-  if (Array.isArray(parsed)) {
-    parsed = parsed[0];
-  }
+  if (Array.isArray(parsed)) return null;
 
   return parsed && typeof parsed === 'object' ? parsed as Record<string, any> : null;
 }
@@ -296,28 +309,59 @@ class RembrServer {
   private intervalHandles: Array<ReturnType<typeof setInterval>> = [];
   private closing = false;
   private closed = false;
+  private httpServer?: HttpServer;
+  private readonly httpSockets = new Set<Socket>();
+  private activeHttpRequests = 0;
+  private closePromise?: Promise<void>;
+  private readonly shutdownDrainMs = resolveShutdownDrainMs();
 
   constructor(port: number = 3000, serverType: ServerType = 'all') {
     this.port = port;
     this.serverType = serverType;
     this.app = express();
-    this.app.use(express.json());
-    
-    // Disable request timeout for streaming connections
-    this.app.set('request timeout', 0); // No timeout
+    this.app.set('trust proxy', false);
+
+    // Reject missing, malformed, duplicate, or ambiguous credentials before
+    // allocating a JSON body. Unknown-length/chunked and large bodies also
+    // consume a much smaller global byte/large-body budget at this boundary.
+    this.app.use(createMcpPreParserBoundary());
+
+    // Track accepted requests so shutdown can stop admission first and then
+    // drain the complete HTTP/MCP lifecycle before closing database pools.
+    this.app.use((_req, res, next) => {
+      this.activeHttpRequests++;
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        this.activeHttpRequests = Math.max(0, this.activeHttpRequests - 1);
+      };
+      res.once('finish', finish);
+      res.once('close', finish);
+      next();
+    });
+
+    // Parse one bounded JSON body. Duplicate parsers previously left the first
+    // default (~100 KiB) limit in force while also advertising an unauthenticated
+    // 50 MiB allocation surface.
+    this.app.use(express.json({ limit: '2mb', strict: true }));
+    this.app.use((error: any, _req: Request, res: Response, next: NextFunction) => {
+      if (error?.type === 'entity.too.large' || error?.status === 413) {
+        res.status(413).json({ error: 'Request body is too large' });
+        return;
+      }
+      next(error);
+    });
+    this.app.set('request timeout', 120_000);
     
     // Enable keepalive and configure timeouts for better connection stability
     this.app.disable('x-powered-by');
     this.app.set('etag', false);
     
-    // Increase payload size limit for large memory operations
-    this.app.use(express.json({ limit: '50mb' }));
-    this.app.use(express.urlencoded({ limit: '50mb', extended: true }));
-    
-    // Add keep-alive headers for all responses with extended timeout
+    // Add bounded keep-alive headers for all responses.
     this.app.use((req, res, next) => {
       res.setHeader('Connection', 'keep-alive');
-      res.setHeader('Keep-Alive', 'timeout=3600, max=1000');  // 1 hour timeout, 1000 requests
+      res.setHeader('Keep-Alive', 'timeout=65, max=1000');
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       next();
     });
@@ -334,17 +378,16 @@ class RembrServer {
     // Initialize embedding provider
     this.embeddingInitPromise = this.initializeEmbeddings();
 
-    // Initialize optimization scheduler if enabled
+    // Tenant-wide optimisation can merge/archive another user's personal
+    // memories and is disabled until every optimiser carries an explicit
+    // audience. Admin routes also see no scheduler and therefore fail closed.
     if (process.env.ENABLE_OPTIMIZATION === 'true') {
-      this.initializeOptimizationScheduler();
+      console.warn('Auto-optimization requested but disabled: audience-safe optimisation is not available');
     }
 
     // MCP 2026-07-28 (SEP-2575): the protocol is stateless — no Mcp-Session-Id,
     // no session map, no Redis session store, no periodic session sweep.
     // Tenant scoping rides on the credential (API key / OAuth) on every request.
-
-    // Ensure default structure for all tenants
-    this.ensureDefaults();
 
     // Request logging — production-safe: no credentials, no body content.
     // Full verbose logging is dev-only (NODE_ENV=development).
@@ -376,8 +419,8 @@ class RembrServer {
 
     // Logging middleware
     this.app.use((req, res, next) => {
-      if (req.path !== '/health' && req.path !== '/metrics') {
-        console.log(`${new Date().toISOString()} ${req.method} ${req.path} from ${req.ip}`);
+      if (process.env.NODE_ENV === 'development' && req.path !== '/health' && req.path !== '/metrics') {
+        console.log(`${new Date().toISOString()} ${req.method} request`);
       }
       next();
     });
@@ -387,9 +430,14 @@ class RembrServer {
       // REM-28: Require METRICS_SECRET in production to avoid leaking internal metrics
       const metricsSecret = process.env.METRICS_SECRET;
       if (metricsSecret) {
-        const authHeader = req.headers['authorization'] ?? '';
-        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : req.headers['x-metrics-token'];
-        if (!token || token !== metricsSecret) {
+        const authHeader = singleHeaderValue(req.headers.authorization);
+        const metricsHeader = singleHeaderValue(req.headers['x-metrics-token']);
+        if ((authHeader && metricsHeader) || (authHeader && !authHeader.startsWith('Bearer '))) {
+          res.status(401).json({ error: 'Unauthorized: Bearer token required for /metrics' });
+          return;
+        }
+        const token = authHeader ? authHeader.slice(7) : metricsHeader;
+        if (!token || !constantTimeSecretEqual(metricsSecret, token)) {
           res.status(401).json({ error: 'Unauthorized: Bearer token required for /metrics' });
           return;
         }
@@ -409,8 +457,60 @@ class RembrServer {
       }
     });
 
-    // Health check endpoint — RAD-39: rich health data for system health dashboard
-    this.app.get('/health', async (req, res) => {
+    // Public liveness reveals no deployment, tenant, queue, model, or process
+    // details. Rich diagnostics require the same operational secret as metrics.
+    this.app.get('/health', (_req, res) => {
+      res.json({ status: 'ok' });
+    });
+
+    // Internal readiness is intentionally terse: callers learn only whether
+    // the request-serving process can reach its mandatory database boundary.
+    // The route is not exposed by the public ingress.
+    this.app.get('/ready', async (_req, res) => {
+      if (this.closing || this.closed) {
+        res.status(503).json({ ready: false });
+        return;
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const deadline = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('readiness deadline')), 2_000);
+        });
+        await Promise.race([
+          this.pool.query({ text: 'SELECT 1', query_timeout: 1_500 } as any),
+          deadline,
+        ]);
+        res.status(200).json({ ready: true });
+      } catch {
+        res.status(503).json({ ready: false });
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    });
+
+    const requireDiagnosticsAuth = (req: Request, res: Response, next: NextFunction): void => {
+      const configured = process.env.METRICS_SECRET || process.env.ADMIN_API_KEY;
+      if (!configured) {
+        res.status(403).json({ error: 'Diagnostics endpoint is disabled' });
+        return;
+      }
+      const authHeader = singleHeaderValue(req.headers.authorization);
+      const metricsHeader = singleHeaderValue(req.headers['x-metrics-token']);
+      if ((authHeader && metricsHeader) ||
+          (authHeader && !authHeader.startsWith('Bearer '))) {
+        res.status(401).json({ error: 'Unauthorized' });
+        return;
+      }
+      const supplied = authHeader ? authHeader.slice(7) : metricsHeader;
+      if (!supplied || !constantTimeSecretEqual(configured, supplied)) {
+        res.status(401).json({ error: 'Unauthorized' });
+        return;
+      }
+      next();
+    };
+
+    // RAD-39: rich health data for the authenticated system health dashboard.
+    this.app.get('/health/details', requireDiagnosticsAuth, async (req, res) => {
       const t0 = Date.now();
       const health: Record<string, unknown> = {
         status: 'ok',
@@ -455,19 +555,28 @@ class RembrServer {
 
         if (embeddingProvider === 'openai-compatible') {
           const embeddingBaseUrl = process.env.EMBEDDING_BASE_URL || process.env.LM_STUDIO_BASE_URL || 'http://localhost:1234/v1';
-          const embeddingRes = await fetch(`${embeddingBaseUrl.replace(/\/$/, '')}/models`, {
-            signal: AbortSignal.timeout(3000)
-          });
+          const embeddingRes = await fetchWithDeadline(
+            `${embeddingBaseUrl.replace(/\/$/, '')}/models`,
+            { method: 'GET' },
+            3_000,
+          );
 
           if (embeddingRes.ok) {
-            const models = await embeddingRes.json() as { data?: Array<{ id?: string }> };
+            const models = await readBoundedJson<{ data?: Array<{ id?: unknown }> }>(embeddingRes, 256 * 1024);
+            if (!models || typeof models !== 'object' || !Array.isArray(models.data)) {
+              throw new Error('Embedding health response shape is invalid');
+            }
             health.embeddings = true;
             health.embedding_latency_ms = Date.now() - embeddingStart;
-            health.embedding_models = (models.data ?? []).map(m => m.id).filter(Boolean);
+            health.embedding_models = models.data
+              .slice(0, 64)
+                .map(model => typeof model?.id === 'string' ? model.id.slice(0, 128) : '')
+                .filter(Boolean);
             health.ollama = null;
             health.ollama_latency_ms = null;
             health.ollama_models = [];
           } else {
+            await cancelResponseBody(embeddingRes);
             health.embeddings = false;
             health.embedding_latency_ms = null;
             health.embedding_models = [];
@@ -477,16 +586,23 @@ class RembrServer {
           }
         } else {
           const ollamaUrl = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_HOST || 'http://ollama:11434';
-          const ollamaRes = await fetch(`${ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(3000) });
+          const ollamaRes = await fetchWithDeadline(`${ollamaUrl}/api/tags`, { method: 'GET' }, 3_000);
           if (ollamaRes.ok) {
-            const tags = await ollamaRes.json() as { models?: Array<{ name: string; size?: number }> };
+            const tags = await readBoundedJson<{ models?: Array<{ name?: unknown }> }>(ollamaRes, 256 * 1024);
+            if (!tags || typeof tags !== 'object' || !Array.isArray(tags.models)) {
+              throw new Error('Ollama health response shape is invalid');
+            }
             health.embeddings = true;
             health.embedding_latency_ms = Date.now() - embeddingStart;
-            health.embedding_models = (tags.models ?? []).map(m => m.name);
+            health.embedding_models = tags.models
+              .slice(0, 64)
+                .map(model => typeof model?.name === 'string' ? model.name.slice(0, 128) : '')
+                .filter(Boolean);
             health.ollama = true;
             health.ollama_latency_ms = health.embedding_latency_ms;
             health.ollama_models = health.embedding_models;
           } else {
+            await cancelResponseBody(ollamaRes);
             health.embeddings = false;
             health.embedding_latency_ms = null;
             health.embedding_models = [];
@@ -543,7 +659,7 @@ class RembrServer {
       res.status(health.status === 'ok' ? 200 : 503).json(health);
     });
 
-    this.app.get('/health/memory', async (req, res) => {
+    this.app.get('/health/memory', requireDiagnosticsAuth, async (req, res) => {
       const t0 = Date.now();
       try {
         const maintenance = new MemoryMaintenanceService(this.db);
@@ -568,7 +684,7 @@ class RembrServer {
           service: 'rembr-mcp',
           component: 'memory-maintenance',
           timestamp: new Date().toISOString(),
-          error: error instanceof Error ? error.message : String(error),
+          error: 'Memory maintenance diagnostics unavailable',
           check_duration_ms: Date.now() - t0
         });
       }
@@ -613,6 +729,18 @@ class RembrServer {
       const startTime = Date.now();
       const rpcBody = normalizeJsonRpcBody(req.body);
 
+      // MCP Streamable HTTP accepts one JSON-RPC request per POST. Treat a
+      // batch as an ambiguous protocol request instead of inspecting only its
+      // first entry and dispatching the rest under that entry's auth/quota
+      // decision.
+      if (Array.isArray(req.body)) {
+        return res.status(400).json({
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32600, message: 'Invalid Request: JSON-RPC batch requests are not supported' },
+        });
+      }
+
       // SEP-2575/SEP-414: client metadata + W3C trace context ride on _meta.
       const mcpMeta = extractMcpMeta(rpcBody || req.body);
 
@@ -650,19 +778,133 @@ class RembrServer {
           if (process.env.PUBLIC_URL) {
             res.setHeader('WWW-Authenticate', `Bearer resource_metadata="${process.env.PUBLIC_URL}/.well-known/oauth-protected-resource", scope="mcp:full"`);
           }
-          return res.status(401).json({ error: authResult.error || 'Unauthorized' });
+          return res.status(401).json({ error: 'Authentication failed' });
         }
 
-        // Auth success — log at info level but only log tenant/project (not credentials)
         if (process.env.NODE_ENV !== 'production') console.log(`✅ Authenticated:`, {
           requestId,
-          tenant: authResult.tenantId,
-          project: authResult.projectId,
+          method: authResult.authMethod,
           timestamp: new Date().toISOString()
         });
 
+        // Every tool call crosses the same boundary before either a latency
+        // fast path or the SDK dispatcher can run: capability resolution,
+        // audited input validation, authenticated transport quota, daily
+        // tenant quota, then bounded audit context.
+        let validatedTransportArgs: Record<string, unknown> | undefined;
+        if (rpcBody?.method === 'tools/call') {
+          const toolName = rpcBody?.params?.name;
+          if (typeof toolName !== 'string' || !toolName) {
+            return res.status(400).json({
+              jsonrpc: '2.0',
+              id: rpcBody.id ?? null,
+              error: { code: -32602, message: 'Invalid params: tool name is required' },
+            });
+          }
+
+          const rawArgs = sanitizeArgs(rpcBody?.params?.arguments as Record<string, unknown> | undefined);
+          const operation = typeof rawArgs?.operation === 'string' ? rawArgs.operation : undefined;
+          const resolvedTool = resolveToolForAuthorization(toolName, operation);
+          const permission = authorizeToolCall(authResult.capabilities, toolName, operation);
+          if (!permission.allowed) {
+            const unavailable = DISABLED_PENDING_ISOLATION.has(
+              resolvedTool || toolName,
+            );
+            return res.status(unavailable ? 503 : 403).json({
+              jsonrpc: '2.0',
+              id: rpcBody.id ?? null,
+              error: {
+                code: unavailable ? -32004 : -32003,
+                message: unavailable
+                  ? 'Capability unavailable in security boundary version 2026-08-08'
+                  : 'Insufficient scope',
+                data: unavailable
+                  ? { capability_version: '2026-08-08', tool: toolName }
+                  : { required_capability: permission.requiredCapability },
+              },
+            });
+          }
+
+          if (BOOTSTRAP_ONLY_TENANT_STATE_TOOLS.has(resolvedTool || toolName) &&
+              !canUseBootstrapOnlyTenantState(authResult.purpose, authResult.userId)) {
+            return res.status(503).json({
+              jsonrpc: '2.0',
+              id: rpcBody.id ?? null,
+              error: {
+                code: -32004,
+                message: 'Capability unavailable until project and principal audience migration',
+                data: { capability_version: '2026-08-08', tool: toolName },
+              },
+            });
+          }
+
+          const validation = validateToolInput(toolName, rawArgs);
+          if (!validation.success) {
+            return res.status(400).json({
+              jsonrpc: '2.0',
+              id: rpcBody.id ?? null,
+              error: {
+                code: -32602,
+                message: 'Invalid tool input',
+                data: { details: validation.details },
+              },
+            });
+          }
+          validatedTransportArgs = validation.data as Record<string, unknown>;
+        }
+
+        if (authResult.tenantId) {
+          const tenantPlanInfo = await this.db.getTenantPlan(authResult.tenantId);
+          const tenantPlan = tenantPlanInfo?.plan || 'free';
+          const quotaDecision = await evaluateAuthenticatedQuotas(
+            req,
+            authResult.tenantId,
+            tenantPlan,
+          );
+          const transportQuota = quotaDecision.transport;
+
+          res.setHeader('X-RateLimit-Limit', transportQuota.limit);
+          res.setHeader('X-RateLimit-Remaining', Math.max(0, transportQuota.limit - transportQuota.count));
+          res.setHeader('X-RateLimit-Window', '60s');
+
+          if (quotaDecision.deniedBy === 'transport') {
+            res.setHeader('Retry-After', transportQuota.retryAfterSeconds);
+            return res.status(429).json({
+              error: 'Too Many Requests',
+              message: `Rate limit exceeded. Maximum ${transportQuota.limit} requests per 60 seconds.`,
+              retry_after: transportQuota.retryAfterSeconds,
+              plan: tenantPlan,
+            });
+          }
+
+          const dailyQuota = quotaDecision.daily!;
+          res.setHeader('X-RateLimit-Daily-Limit', dailyQuota.limit);
+          res.setHeader('X-RateLimit-Daily-Remaining', Math.max(0, dailyQuota.limit - dailyQuota.count));
+
+          if (quotaDecision.deniedBy === 'daily') {
+            res.setHeader('Retry-After', dailyQuota.retryAfterSeconds);
+            return res.status(429).json({
+              error: 'Daily Quota Exceeded',
+              message: `Daily request quota exceeded for plan '${tenantPlan}'. Limit: ${dailyQuota.limit.toLocaleString()} requests/day.`,
+              retry_after: dailyQuota.retryAfterSeconds,
+              plan: tenantPlan,
+              daily_limit: dailyQuota.limit,
+            });
+          }
+        }
+
+        const auditUserAgent = singleHeaderValue(req.headers['user-agent'])?.slice(0, 512) || 'unknown';
+        const requestAuditLogger = this.auditLogger.withContext({
+          tenantId: authResult.tenantId,
+          userId: authResult.userId,
+          apiKeyId: authResult.apiKeyId,
+          ipAddress: (req.socket.remoteAddress || req.ip || 'unknown').slice(0, 128),
+          userAgent: auditUserAgent,
+          requestId,
+        });
+
         if (rpcBody?.method === 'tools/call' && rpcBody?.params?.name === 'store_memory') {
-          const args = sanitizeArgs(rpcBody.params.arguments as Record<string, unknown> | undefined);
+          const args = validatedTransportArgs;
           const jsonRpcId = rpcBody.id ?? null;
           const toolStart = Date.now();
           const correlationId = randomUUID();
@@ -696,7 +938,7 @@ class RembrServer {
               authResult.userId
             );
             const memory = await memoryService.storeMemory({
-              content: (args?.content as string).trim(),
+              content: args?.content as string,
               category: args?.category as string,
               metadata: args?.metadata as Record<string, any>,
               relevance_score: args?.relevance_score as number
@@ -712,6 +954,15 @@ class RembrServer {
               category: args?.category as string,
               transport: 'jsonrpc-auth-fast-path'
             }, duration * 1000);
+            await requestAuditLogger.log({
+              tenantId: authResult.tenantId,
+              eventType: 'memory.create',
+              resourceType: 'memory',
+              resourceId: memory.id,
+              actionResult: 'success',
+              requestId,
+              metadata: { transport: 'jsonrpc-auth-fast-path' },
+            });
 
             return res.json({
               jsonrpc: '2.0',
@@ -719,7 +970,7 @@ class RembrServer {
               result: {
                 content: [{
                   type: 'text',
-                  text: JSON.stringify({
+                  text: JSON.stringify(fitJsonResponse({
                     success: true,
                     memory: {
                       id: memory.id,
@@ -728,7 +979,7 @@ class RembrServer {
                       metadata: memory.metadata,
                       created_at: memory.created_at
                     }
-                  }, null, 2)
+                  }), null, 2)
                 }]
               }
             });
@@ -753,7 +1004,7 @@ class RembrServer {
                   type: 'text',
                   text: JSON.stringify({
                     success: false,
-                    error: err.message,
+                    error: 'Operation failed',
                     correlation_id: correlationId
                   }, null, 2)
                 }],
@@ -764,7 +1015,7 @@ class RembrServer {
         }
 
         if (rpcBody?.method === 'tools/call' && rpcBody?.params?.name === 'search_memory') {
-          const args = sanitizeArgs(rpcBody.params.arguments as Record<string, unknown> | undefined);
+          const args = validatedTransportArgs;
           const jsonRpcId = rpcBody.id ?? null;
           const toolStart = Date.now();
           const correlationId = randomUUID();
@@ -801,18 +1052,34 @@ class RembrServer {
               resultCount: results.length,
               transport: 'jsonrpc-auth-fast-path'
             }, duration * 1000);
+            await requestAuditLogger.log({
+              tenantId: authResult.tenantId,
+              eventType: 'memory.search',
+              resourceType: 'memory',
+              actionResult: 'success',
+              requestId,
+              metadata: { search_mode: searchMode, result_count: results.length },
+            });
 
-            const resultsFormatted = results.map((r) => ({
-              id: r.id,
-              content: r.content,
-              category: r.category,
-              metadata: r.metadata,
-              score: r.score,
-              semantic_similarity: r.semantic_similarity,
-              text_match: r.text_match,
-              created_at: r.created_at,
-              token_estimate: Math.ceil(r.content.length / 4),
-            }));
+            const maxTokens = args?.max_tokens as number | undefined;
+            let usedTokens = 0;
+            const resultsFormatted = [] as Array<Record<string, unknown>>;
+            for (const result of results) {
+              const tokenEstimate = Math.ceil(result.content.length / 4);
+              if (maxTokens && usedTokens + tokenEstimate > maxTokens) break;
+              usedTokens += tokenEstimate;
+              resultsFormatted.push({
+                id: result.id,
+                content: result.content,
+                category: result.category,
+                metadata: result.metadata,
+                score: result.score,
+                semantic_similarity: result.semantic_similarity,
+                text_match: result.text_match,
+                created_at: result.created_at,
+                token_estimate: tokenEstimate,
+              });
+            }
 
             const finalResponse: Record<string, unknown> = {
               ...addPaginationToResponse({
@@ -826,6 +1093,13 @@ class RembrServer {
                 ] : undefined
               }),
               search_mode: searchMode,
+              ...(maxTokens ? {
+                token_budget: {
+                  max_tokens: maxTokens,
+                  used_tokens: usedTokens,
+                  results_dropped: results.length - resultsFormatted.length,
+                },
+              } : {}),
             };
 
             const searchMetadata = results.search_metadata;
@@ -833,32 +1107,20 @@ class RembrServer {
               finalResponse.semantic_status = searchMetadata.semantic_status;
               finalResponse.fallback_used = searchMetadata.fallback_used;
               finalResponse.min_similarity = searchMetadata.min_similarity;
-              if (searchMetadata.semantic_error) {
-                finalResponse.semantic_error = searchMetadata.semantic_error;
-              }
+              if (searchMetadata.semantic_error) finalResponse.semantic_error = searchMetadata.semantic_error;
               if (searchMetadata.embedding_coverage !== null) {
                 finalResponse.embedding_coverage = `${Math.round(searchMetadata.embedding_coverage * 100)}%`;
               }
               if (searchMetadata.embedding_pending !== null) {
                 finalResponse.embedding_pending = searchMetadata.embedding_pending;
+                finalResponse.embedding_status = searchMetadata.embedding_pending > 0 ? 'partial' : 'ready';
               }
               if (searchMetadata.embedding_total !== null) {
                 finalResponse.embedding_total = searchMetadata.embedding_total;
               }
-              if (searchMetadata.embedding_pending !== null) {
-                finalResponse.embedding_status = searchMetadata.embedding_pending > 0 ? 'partial' : 'ready';
-              }
               if (searchMetadata.embedding_pending && results.length === 0) {
                 finalResponse.search_note = `${searchMetadata.embedding_pending} memories are still being indexed. Results may be incomplete — retry in a few seconds.`;
               }
-            } else try {
-              const embeddingStatus = await memoryService.getPendingEmbeddingCount();
-              finalResponse.embedding_status = embeddingStatus.pending > 0 ? 'partial' : 'ready';
-              if (embeddingStatus.pending > 0) {
-                finalResponse.embedding_pending = embeddingStatus.pending;
-              }
-            } catch {
-              // Non-fatal: omit embedding status.
             }
 
             return res.json({
@@ -867,7 +1129,7 @@ class RembrServer {
               result: {
                 content: [{
                   type: 'text',
-                  text: JSON.stringify(finalResponse, null, 2)
+                  text: JSON.stringify(fitJsonResponse(finalResponse), null, 2)
                 }]
               }
             });
@@ -892,7 +1154,7 @@ class RembrServer {
                   type: 'text',
                   text: JSON.stringify({
                     success: false,
-                    error: err.message,
+                    error: 'Operation failed',
                     correlation_id: correlationId
                   }, null, 2)
                 }],
@@ -903,7 +1165,7 @@ class RembrServer {
         }
 
         if (rpcBody?.method === 'tools/call' && rpcBody?.params?.name === 'detect_memory_contradictions') {
-          const args = sanitizeArgs(rpcBody.params.arguments as Record<string, unknown> | undefined);
+          const args = validatedTransportArgs;
           const jsonRpcId = rpcBody.id ?? null;
           const toolStart = Date.now();
           const correlationId = randomUUID();
@@ -915,16 +1177,28 @@ class RembrServer {
             const {
               contradictions,
               source,
-              live_analysis
-            } = await this.getContradictionsWithLiveFallback(
+              live_analysis,
+              background_analysis,
+            } = await this.getContradictionsWithBackgroundEnqueue(
               authResult.tenantId!,
               minConfidence,
               contextId,
-              liveAnalysis
+              liveAnalysis,
+              authResult.projectId,
+              authResult.userId,
             );
 
             const duration = (Date.now() - toolStart) / 1000;
             trackMcpToolCall('detect_memory_contradictions', 'success', authResult.tenantId!, duration);
+            await requestAuditLogger.log({
+              tenantId: authResult.tenantId,
+              eventType: 'memory.contradictions.read',
+              resourceType: contextId ? 'context' : 'memory',
+              resourceId: contextId,
+              actionResult: 'success',
+              requestId,
+              metadata: { result_count: contradictions.length },
+            });
 
             return res.json({
               jsonrpc: '2.0',
@@ -932,7 +1206,7 @@ class RembrServer {
               result: {
                 content: [{
                   type: 'text',
-                  text: JSON.stringify({
+                  text: JSON.stringify(fitJsonResponse({
                     success: true,
                     context_id: contextId || null,
                     min_confidence: minConfidence,
@@ -940,11 +1214,10 @@ class RembrServer {
                     contradictions,
                     source,
                     live_analysis,
-                    note: source === 'precomputed'
-                      ? 'Returned stored contradiction relationships.'
-                      : 'Returned live contradiction analysis; detected relationships are stored for future calls when possible.',
+                    background_analysis,
+                    note: 'Returned stored contradiction relationships only. Any requested analysis runs in the background.',
                     correlation_id: correlationId
-                  }, null, 2)
+                  }), null, 2)
                 }]
               }
             });
@@ -962,162 +1235,7 @@ class RembrServer {
                   type: 'text',
                   text: JSON.stringify({
                     success: false,
-                    error: err.message,
-                    correlation_id: correlationId
-                  }, null, 2)
-                }],
-                isError: true
-              }
-            });
-          }
-        }
-
-        // Per-tenant daily quota check (REM-48)
-        // Runs after auth so we have tenantId + plan available.
-        if (authResult.tenantId) {
-          const tenantPlanInfo = await this.db.getTenantPlan(authResult.tenantId);
-          const tenantPlan = tenantPlanInfo?.plan || 'free';
-          const transportQuota = await checkTransportRateLimit(req, tenantPlan);
-
-          res.setHeader('X-RateLimit-Limit', transportQuota.limit);
-          res.setHeader('X-RateLimit-Remaining', Math.max(0, transportQuota.limit - transportQuota.count));
-          res.setHeader('X-RateLimit-Window', '60s');
-
-          if (!transportQuota.allowed) {
-            res.setHeader('Retry-After', transportQuota.retryAfterSeconds);
-            return res.status(429).json({
-              error: 'Too Many Requests',
-              message: `Rate limit exceeded. Maximum ${transportQuota.limit} requests per 60 seconds.`,
-              retry_after: transportQuota.retryAfterSeconds,
-              plan: tenantPlan,
-            });
-          }
-
-          const dailyQuota = await checkDailyTenantQuota(authResult.tenantId, tenantPlan);
-
-          // Set daily quota headers on every response
-          res.setHeader('X-RateLimit-Daily-Limit', dailyQuota.limit);
-          res.setHeader('X-RateLimit-Daily-Remaining', Math.max(0, dailyQuota.limit - dailyQuota.count));
-
-          if (!dailyQuota.allowed) {
-            res.setHeader('Retry-After', dailyQuota.retryAfterSeconds);
-            return res.status(429).json({
-              error: 'Daily Quota Exceeded',
-              message: `Daily request quota exceeded for plan '${tenantPlan}'. Limit: ${dailyQuota.limit.toLocaleString()} requests/day.`,
-              retry_after: dailyQuota.retryAfterSeconds,
-              plan: tenantPlan,
-              daily_limit: dailyQuota.limit,
-            });
-          }
-        }
-
-        // Set request context for audit logging
-        const ipAddress = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.ip || 'unknown';
-        const userAgent = req.headers['user-agent'] || 'unknown';
-        this.auditLogger.setRequestContext({
-          userId: authResult.userId,
-          apiKeyId: authResult.apiKeyId,
-          ipAddress,
-          userAgent
-        });
-
-        // Fast path for stateless JSON-RPC store_memory calls. Some
-        // Streamable HTTP clients wait indefinitely for the SDK transport to
-        // close even after the write succeeds; memory writes should return a
-        // plain JSON-RPC response as soon as the durable insert is complete.
-        if (rpcBody?.method === 'tools/call' && rpcBody?.params?.name === 'store_memory') {
-          const args = sanitizeArgs(rpcBody.params.arguments as Record<string, unknown> | undefined);
-          const requestId = rpcBody.id ?? null;
-          const toolStart = Date.now();
-          const correlationId = randomUUID();
-
-          try {
-            const storeValidation = validateMemoryInput(args || {});
-            if (!storeValidation.valid) {
-              return res.json({
-                jsonrpc: '2.0',
-                id: requestId,
-                result: {
-                  content: [{
-                    type: 'text',
-                    text: JSON.stringify({
-                      success: false,
-                      error: 'Invalid input',
-                      details: storeValidation.errors,
-                      correlation_id: correlationId
-                    })
-                  }],
-                  isError: true
-                }
-              });
-            }
-
-            const memoryService = new MemoryService(
-              authResult.tenantId!,
-              authResult.projectId,
-              this.db,
-              this.embeddingProvider,
-              authResult.userId
-            );
-            const memory = await memoryService.storeMemory({
-              content: (args?.content as string).trim(),
-              category: args?.category as string,
-              metadata: args?.metadata as Record<string, any>,
-              relevance_score: args?.relevance_score as number
-            });
-
-            const duration = (Date.now() - toolStart) / 1000;
-            trackMcpToolCall('store_memory', 'success', authResult.tenantId!, duration);
-            trackMemoryOperation('store', 'success', authResult.tenantId!);
-            logger.mcpTool('store_memory', 'success', {
-              tenantId: authResult.tenantId,
-              projectId: authResult.projectId,
-              correlationId,
-              category: args?.category as string,
-              transport: 'jsonrpc-fast-path'
-            }, duration * 1000);
-
-            return res.json({
-              jsonrpc: '2.0',
-              id: requestId,
-              result: {
-                content: [{
-                  type: 'text',
-                  text: JSON.stringify({
-                    success: true,
-                    memory: {
-                      id: memory.id,
-                      content: memory.content,
-                      category: memory.category,
-                      metadata: memory.metadata,
-                      created_at: memory.created_at
-                    }
-                  }, null, 2)
-                }]
-              }
-            });
-          } catch (error) {
-            const duration = (Date.now() - toolStart) / 1000;
-            const err = error as Error;
-            trackMcpToolCall('store_memory', 'error', authResult.tenantId!, duration);
-            trackMcpToolError('store_memory', 'unknown', authResult.tenantId!);
-            trackMemoryOperation('store', 'error', authResult.tenantId!);
-            logger.mcpTool('store_memory', 'error', {
-              tenantId: authResult.tenantId,
-              projectId: authResult.projectId,
-              correlationId,
-              transport: 'jsonrpc-fast-path'
-            }, duration * 1000, err);
-
-            return res.json({
-              jsonrpc: '2.0',
-              id: requestId,
-              result: {
-                content: [{
-                  type: 'text',
-                  text: JSON.stringify({
-                    success: false,
-                    error: err.message,
+                    error: 'Operation failed',
                     correlation_id: correlationId
                   }, null, 2)
                 }],
@@ -1134,7 +1252,15 @@ class RembrServer {
         // 2025-xx clients are still answered by the SDK but create no state;
         // 2026-07-28 clients use `server/discover` (registered in
         // createMCPServer) and per-request _meta instead.
-        const mcpServer = this.createMCPServer(authResult.tenantId!, authResult.projectId, authResult.userId);
+        const mcpServer = this.createMCPServer(
+          authResult.tenantId!,
+          authResult.projectId,
+          authResult.userId,
+          authResult.capabilities,
+          authResult.apiKeyId,
+          authResult.purpose,
+          requestAuditLogger,
+        );
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined,
           enableJsonResponse: true
@@ -1157,17 +1283,12 @@ class RembrServer {
       } catch (error) {
         console.error('❌ MCP POST request error:', {
           requestId,
-          error: error instanceof Error ? error.message : String(error),
           code: (error as any)?.code,
-          stack: error instanceof Error ? error.stack?.split('\\n').slice(0, 3).join('\\n') : undefined,
           timestamp: new Date().toISOString(),
           duration: Date.now() - startTime
         });
         if (!res.headersSent) {
-          res.status(500).json({ 
-            error: 'Internal server error', 
-            details: error instanceof Error ? error.message : String(error)
-          });
+          res.status(500).json({ error: 'Internal server error' });
         }
       }
     });
@@ -1193,7 +1314,7 @@ class RembrServer {
 
     // Schema changes are owned by migrations. Keep this dev-only to avoid
     // production app-role DDL attempts and noisy permission errors.
-    if (process.env.NODE_ENV !== 'production' || process.env.ALLOW_STARTUP_SCHEMA_INIT === 'true') {
+    if (process.env.NODE_ENV !== 'production' && process.env.INITIALIZE_SCHEMA === 'true') {
       this.initializeDatabase();
     }
 
@@ -1201,11 +1322,6 @@ class RembrServer {
   }
 
   private async initializeDatabase() {
-    if (process.env.INITIALIZE_SCHEMA === 'false') {
-      console.log('Database schema initialization skipped (INITIALIZE_SCHEMA=false)');
-      return;
-    }
-
     try {
       await this.db.initializeSchema();
       console.log('Database schema initialized');
@@ -1234,65 +1350,44 @@ class RembrServer {
       memory_a: {
         id: row.source_memory_id,
         content: row.source_content,
-        category: row.source_category
+        category: row.source_category,
       },
       memory_b: {
         id: row.target_memory_id,
         content: row.target_content,
-        category: row.target_category
+        category: row.target_category,
       },
       confidence: Number(row.confidence),
-      evidence: this.parseContradictionEvidence(row.evidence)
+      evidence: this.parseContradictionEvidence(row.evidence),
     }));
-  }
-
-  private formatLiveContradictions(results: ContradictionResult[]): FormattedContradiction[] {
-    return results.map((result) => ({
-      memory_a: {
-        id: result.memory_a.id,
-        content: result.memory_a.content,
-        category: result.memory_a.category
-      },
-      memory_b: {
-        id: result.memory_b.id,
-        content: result.memory_b.content,
-        category: result.memory_b.category
-      },
-      confidence: result.confidence,
-      evidence: {
-        type: result.contradiction_type,
-        severity: result.severity,
-        explanation: result.explanation,
-        suggestions: result.resolution_suggestions,
-        detected_by: 'live_analysis'
-      }
-    }));
-  }
-
-  private mergeContradictions(
-    precomputed: FormattedContradiction[],
-    live: FormattedContradiction[]
-  ): FormattedContradiction[] {
-    const byPair = new Map<string, FormattedContradiction>();
-
-    for (const contradiction of [...precomputed, ...live]) {
-      const pairKey = [contradiction.memory_a.id, contradiction.memory_b.id].sort().join(':');
-      const existing = byPair.get(pairKey);
-      if (!existing || contradiction.confidence > existing.confidence) {
-        byPair.set(pairKey, contradiction);
-      }
-    }
-
-    return [...byPair.values()].sort((a, b) => b.confidence - a.confidence);
   }
 
   private async getPrecomputedContradictions(
     tenantId: string,
     minConfidence: number,
-    contextId?: string
+    contextId?: string,
+    projectId?: string,
+    userId?: string,
   ): Promise<FormattedContradiction[]> {
     const client = await this.pool.connect();
     let contradictionResult: any;
+
+    const visibilityPredicate = `
+      AND ($4::uuid IS NULL OR (ms.project_id = $4::uuid AND mt.project_id = $4::uuid))
+      AND (
+        (COALESCE(ms.visibility, 'shared') = 'personal' AND ms.user_id = $5::uuid)
+        OR (COALESCE(ms.visibility, 'shared') IN ('shared', 'project')
+            AND (ps.id IS NULL OR ps.is_personal = false OR ps.owner_id = $5::uuid
+                 OR EXISTS (SELECT 1 FROM project_members pm
+                            WHERE pm.project_id = ps.id AND pm.user_id = $5::uuid)))
+      )
+      AND (
+        (COALESCE(mt.visibility, 'shared') = 'personal' AND mt.user_id = $5::uuid)
+        OR (COALESCE(mt.visibility, 'shared') IN ('shared', 'project')
+            AND (pt.id IS NULL OR pt.is_personal = false OR pt.owner_id = $5::uuid
+                 OR EXISTS (SELECT 1 FROM project_members pm
+                            WHERE pm.project_id = pt.id AND pm.user_id = $5::uuid)))
+      )`;
 
     try {
       await client.query('BEGIN');
@@ -1300,39 +1395,50 @@ class RembrServer {
 
       if (contextId) {
         contradictionResult = await client.query(`
-          SELECT mr.source_memory_id, mr.target_memory_id, mr.confidence, mr.evidence,
-                 ms.content as source_content, mt.content as target_content,
-                 ms.category as source_category, mt.category as target_category
+          SELECT DISTINCT mr.source_memory_id, mr.target_memory_id, mr.confidence, mr.evidence,
+                 ms.content AS source_content, mt.content AS target_content,
+                 ms.category AS source_category, mt.category AS target_category
           FROM memory_relationships mr
           JOIN memories ms ON mr.source_memory_id = ms.id
           JOIN memories mt ON mr.target_memory_id = mt.id
+          LEFT JOIN projects ps ON ps.id = ms.project_id
+          LEFT JOIN projects pt ON pt.id = mt.project_id
           JOIN memory_contexts cm ON (cm.memory_id = mr.source_memory_id OR cm.memory_id = mr.target_memory_id)
+          JOIN contexts c ON c.id = cm.context_id
           WHERE mr.relationship_type = 'contradicts'
             AND mr.confidence >= $1
-            AND cm.context_id = $2
-            AND ms.tenant_id = $3
-            AND mt.tenant_id = $3
-            AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains opposing terms:%')
-            AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains contradictory information or opposing statements. Semantic similarity:%')
-          ORDER BY mr.confidence DESC
-        `, [minConfidence, contextId, tenantId]);
-      } else {
-        contradictionResult = await client.query(`
-          SELECT mr.source_memory_id, mr.target_memory_id, mr.confidence, mr.evidence,
-                 ms.content as source_content, mt.content as target_content,
-                 ms.category as source_category, mt.category as target_category
-          FROM memory_relationships mr
-          JOIN memories ms ON mr.source_memory_id = ms.id
-          JOIN memories mt ON mr.target_memory_id = mt.id
-          WHERE mr.relationship_type = 'contradicts'
-            AND mr.confidence >= $1
-            AND ms.tenant_id = $2
-            AND mt.tenant_id = $2
+            AND cm.context_id = $2::uuid
+            AND c.tenant_id = $3::uuid
+            AND ($4::uuid IS NULL OR c.project_id = $4::uuid)
+            AND ms.tenant_id = $3::uuid
+            AND mt.tenant_id = $3::uuid
+            ${visibilityPredicate}
             AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains opposing terms:%')
             AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains contradictory information or opposing statements. Semantic similarity:%')
           ORDER BY mr.confidence DESC
           LIMIT 50
-        `, [minConfidence, tenantId]);
+        `, [minConfidence, contextId, tenantId, projectId || null, userId || null]);
+      } else {
+        contradictionResult = await client.query(`
+          SELECT mr.source_memory_id, mr.target_memory_id, mr.confidence, mr.evidence,
+                 ms.content AS source_content, mt.content AS target_content,
+                 ms.category AS source_category, mt.category AS target_category
+          FROM memory_relationships mr
+          JOIN memories ms ON mr.source_memory_id = ms.id
+          JOIN memories mt ON mr.target_memory_id = mt.id
+          LEFT JOIN projects ps ON ps.id = ms.project_id
+          LEFT JOIN projects pt ON pt.id = mt.project_id
+          WHERE mr.relationship_type = 'contradicts'
+            AND mr.confidence >= $1
+            AND $2::uuid IS NULL
+            AND ms.tenant_id = $3::uuid
+            AND mt.tenant_id = $3::uuid
+            ${visibilityPredicate}
+            AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains opposing terms:%')
+            AND (mr.evidence IS NULL OR mr.evidence NOT LIKE 'Contains contradictory information or opposing statements. Semantic similarity:%')
+          ORDER BY mr.confidence DESC
+          LIMIT 50
+        `, [minConfidence, null, tenantId, projectId || null, userId || null]);
       }
 
       await client.query('COMMIT');
@@ -1346,54 +1452,61 @@ class RembrServer {
     return this.formatPrecomputedContradictions(contradictionResult.rows);
   }
 
-  private async getContradictionsWithLiveFallback(
+  private async getContradictionsWithBackgroundEnqueue(
     tenantId: string,
     minConfidence: number,
     contextId?: string,
-    liveAnalysis: 'auto' | 'always' | 'never' = 'auto'
+    liveAnalysis: 'auto' | 'always' | 'never' = 'auto',
+    projectId?: string,
+    userId?: string,
   ): Promise<{
     contradictions: FormattedContradiction[];
     source: ContradictionSource;
-    live_analysis: {
-      requested: boolean;
-      attempted: boolean;
-      reason: string;
-      error: string | null;
-    };
+    live_analysis: { requested: boolean; attempted: boolean; reason: string; error: string | null };
+    background_analysis: { queued: boolean; jobs_created: number; reason: string; error: string | null };
   }> {
-    const precomputed = await this.getPrecomputedContradictions(tenantId, minConfidence, contextId);
-    const shouldRunLive = liveAnalysis === 'always' || (liveAnalysis === 'auto' && precomputed.length === 0);
-    let live: FormattedContradiction[] = [];
-    let liveError: string | null = null;
+    const precomputed = await this.getPrecomputedContradictions(
+      tenantId,
+      minConfidence,
+      contextId,
+      projectId,
+      userId,
+    );
+    const shouldEnqueueBackground = liveAnalysis === 'always' || (liveAnalysis === 'auto' && precomputed.length === 0);
+    let jobsCreated = 0;
+    let enqueueError: string | null = null;
 
-    if (shouldRunLive) {
+    if (shouldEnqueueBackground) {
       try {
-        const analyticsService = new AdvancedAnalyticsService(this.db, this.embeddingProvider);
-        const liveResults = await analyticsService.detectContradictions(tenantId, contextId, minConfidence);
-        live = this.formatLiveContradictions(liveResults);
+        const maintenance = new MemoryMaintenanceService(this.db);
+        const result = await maintenance.enqueueContradictionDetectionJobs(
+          tenantId,
+          500,
+          { projectId, userId },
+        );
+        jobsCreated = result.created;
       } catch (error) {
-        liveError = (error as Error).message;
+        enqueueError = (error as Error).message;
       }
     }
 
-    const contradictions = this.mergeContradictions(precomputed, live);
-    const source: ContradictionSource = precomputed.length > 0 && live.length > 0
-      ? 'precomputed+live'
-      : live.length > 0
-        ? 'live'
-        : 'precomputed';
-
     return {
-      contradictions,
-      source,
+      contradictions: precomputed,
+      source: 'precomputed',
       live_analysis: {
         requested: liveAnalysis !== 'never',
-        attempted: shouldRunLive,
-        reason: shouldRunLive
-          ? (liveAnalysis === 'always' ? 'requested' : 'no_precomputed_results')
+        attempted: false,
+        reason: 'client_request_paths_never_run_llm_analysis',
+        error: null,
+      },
+      background_analysis: {
+        queued: shouldEnqueueBackground && !enqueueError,
+        jobs_created: jobsCreated,
+        reason: shouldEnqueueBackground
+          ? (liveAnalysis === 'always' ? 'requested_refresh' : 'no_precomputed_results')
           : (liveAnalysis === 'never' ? 'disabled' : 'precomputed_results_available'),
-        error: liveError
-      }
+        error: enqueueError,
+      },
     };
   }
 
@@ -1405,11 +1518,11 @@ class RembrServer {
 
       if (provider === 'openai-compatible') {
         const baseUrl = process.env.EMBEDDING_BASE_URL || process.env.LM_STUDIO_BASE_URL || 'http://localhost:1234/v1';
-        console.log(`🔮 Initializing OpenAI-compatible embedding provider: ${baseUrl} (${model})`);
+        console.log(`🔮 Initializing OpenAI-compatible embedding provider (${model})`);
         this.embeddingProvider = new OpenAICompatibleEmbeddingProvider(baseUrl, model, dimensions);
       } else {
         const ollamaHost = process.env.OLLAMA_HOST || 'http://localhost:11434';
-        console.log(`🔮 Initializing Ollama embedding provider with host: ${ollamaHost}`);
+        console.log('🔮 Initializing Ollama embedding provider');
         this.embeddingProvider = OllamaEmbeddingProvider.createDefault(ollamaHost);
       }
 
@@ -1467,7 +1580,7 @@ class RembrServer {
 
       for (const row of result.rows) {
         const tenantId = row.tenant_id;
-        console.log(`Creating defaults for tenant ${tenantId}`);
+        if (process.env.NODE_ENV !== 'production') console.log('Creating tenant defaults');
         
         // Create default project
         const projectId = randomUUID();
@@ -1515,11 +1628,31 @@ class RembrServer {
       success: true,
       tenantId: outcome.tenantId,
       projectId: outcome.projectId,
-      userId: outcome.userId
+      userId: outcome.userId,
+      apiKeyId: outcome.apiKeyId,
+      authMethod: outcome.authMethod,
+      capabilities: outcome.capabilities,
+      authVersion: typeof outcome.metadata?.authVersion === 'number'
+        ? outcome.metadata.authVersion
+        : undefined,
+      clientId: typeof outcome.metadata?.clientId === 'string'
+        ? outcome.metadata.clientId
+        : undefined,
+      purpose: typeof outcome.metadata?.purpose === 'string'
+        ? outcome.metadata.purpose
+        : undefined,
     };
   }
 
-  private createMCPServer(tenantId: string, projectId?: string, userId?: string): Server {
+  private createMCPServer(
+    tenantId: string,
+    projectId?: string,
+    userId?: string,
+    capabilities: string[] = [],
+    apiKeyId?: string,
+    credentialPurpose?: string,
+    requestAuditLogger: AuditLogger = this.auditLogger,
+  ): Server {
     const server = new Server(
       {
         name: 'rembr-server',
@@ -1554,7 +1687,8 @@ class RembrServer {
     const contextService = new ContextService(
       tenantId,
       projectId,
-      this.db
+      this.db,
+      userId,
     );
 
     // Create snapshot service for this tenant
@@ -1677,11 +1811,8 @@ class RembrServer {
             max_tokens: {
               type: 'number',
               description: 'Maximum total tokens to return across all results (RAD-88 budget-aware search). Results are ranked by relevance and truncated to fit. ~4 chars per token.',
-              minimum: 100
-            },
-            token_budget_category: {
-              type: 'string',
-              description: 'Budget category name to check against active context_budgets allocation (RAD-88). If set, enforces the category token limit instead of max_tokens.'
+              minimum: 100,
+              maximum: 250000
             }
           },
           required: ['query']
@@ -1826,7 +1957,14 @@ class RembrServer {
               type: 'string',
               enum: [...MEMORY_CATEGORIES],
               description: 'Optional: filter by memory category'
-            }
+            },
+            limit: {
+              type: 'number',
+              minimum: 1,
+              maximum: 100,
+              default: 50,
+              description: 'Maximum contexts to return'
+            },
           }
         }
       },
@@ -2151,7 +2289,7 @@ class RembrServer {
             live_analysis: {
               type: 'string',
               enum: ['auto', 'always', 'never'],
-              description: 'Run live contradiction analysis when precomputed relationships are missing (default: auto). Use always to refresh on demand, never for stored results only.'
+              description: 'Compatibility flag. Requests return stored results only; auto/always may enqueue scoped background analysis.'
             }
           }
         }
@@ -2721,7 +2859,7 @@ class RembrServer {
       },
       {
         name: 'get_storage_usage',
-        description: 'Get storage usage statistics for the current tenant (used bytes, file count, quota)',
+        description: 'Get storage usage statistics for attachments accessible to the current credential (used bytes, file count, tenant quota)',
         inputSchema: {
           type: 'object',
           properties: {},
@@ -3219,7 +3357,14 @@ class RembrServer {
     ];
 
     // Combine: consolidated tools first (preferred), then legacy (deprecated), plus pii
-    const tools: Tool[] = [...consolidatedTools, ...legacyTools];
+    const tools: Tool[] = [...consolidatedTools, ...legacyTools]
+      .filter(tool => !isToolDisabledForDiscovery(tool.name))
+      .filter(tool =>
+        !BOOTSTRAP_ONLY_TENANT_STATE_TOOLS.has(tool.name) ||
+        canUseBootstrapOnlyTenantState(credentialPurpose, userId),
+      )
+      .map(tool => pruneToolForDiscovery(tool))
+      .filter((tool): tool is Tool => tool !== null);
 
     // Register handlers
 
@@ -3254,6 +3399,37 @@ class RembrServer {
 
       try {
         logger.mcpTool(name, 'start', { tenantId, projectId, correlationId });
+
+        if (DISABLED_PENDING_ISOLATION.has(name)) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: 'Tool unavailable in security boundary 2026-08-08',
+                capability_version: '2026-08-08',
+                correlation_id: correlationId,
+              }),
+            }],
+            isError: true,
+          };
+        }
+
+        if (BOOTSTRAP_ONLY_TENANT_STATE_TOOLS.has(name) &&
+            !canUseBootstrapOnlyTenantState(credentialPurpose, userId)) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: 'Tool unavailable until project and principal audience migration',
+                capability_version: '2026-08-08',
+                correlation_id: correlationId,
+              }),
+            }],
+            isError: true,
+          };
+        }
 
         // ── Zod input validation (RAD-46) ──────────────────────────────
         const validation = validateToolInput(name, args as Record<string, unknown> | undefined);
@@ -3291,72 +3467,7 @@ class RembrServer {
 
         // ── Phase 1: Route consolidated tools to legacy handlers ────────
         // Maps new consolidated tool operations to legacy tool names
-        const CONSOLIDATED_TO_LEGACY: Record<string, Record<string, string>> = {
-          'memory': {
-            'create': 'store_memory',
-            'get': 'get_memory',
-            'update': 'update_memory',
-            'delete': 'delete_memory',
-            'list': 'list_memories',
-            'list_personal': 'list_personal_memories',
-            'set_visibility': 'set_memory_visibility',
-            'ingest': 'ingest_document'
-          },
-          'search': {
-            'query': 'search_memory',
-            'smart': 'enhanced_search',
-            'similar': 'find_similar_memories'
-          },
-          'stats': {
-            'usage': 'get_stats',
-            'embeddings': 'get_embedding_stats',
-            'insights': 'get_memory_insights',
-            'generate_insights': 'generate_memory_insights',
-            'predictions': 'get_predictive_analytics'
-          },
-          'context': {
-            'create': 'create_context',
-            'list': 'list_contexts',
-            'search': 'search_context',
-            'add_memory': 'add_memory_to_context'
-          },
-          'snapshot': {
-            'create': 'create_snapshot',
-            'get': 'get_snapshot',
-            'list': 'list_snapshots',
-            'create_temporal': 'create_temporal_snapshot',
-            'list_temporal': 'list_temporal_snapshots'
-          },
-          'graph': {
-            'get': 'get_memory_graph',
-            'generate': 'generate_context_graph',
-            'insights': 'get_context_insights',
-            'infer': 'infer_memory_relationships',
-            'compare': 'compare_snapshots',
-            'explore': 'explore_relationships'
-          },
-          'contradictions': {
-            'detect': 'detect_memory_contradictions'
-          },
-          'causality': {
-            'infer': 'infer_causality',
-            'trace': 'trace_causality',
-            'get': 'get_causal_links',
-            'validate': 'validate_causal_link'
-          },
-          'temporal': {
-            'search': 'search_at_time',
-            'history': 'get_memory_history'
-          },
-          'audit': {
-            'query': 'query_audit_log',
-            'report': 'generate_compliance_report',
-            'stats': 'get_audit_stats'
-          },
-          'classify': {
-            'intent': 'classify_query_intent'
-          }
-        };
+        const CONSOLIDATED_TO_LEGACY = CONSOLIDATED_OPERATION_TARGETS;
 
         // Route consolidated tools to their legacy implementations
         let effectiveName = name;
@@ -3413,6 +3524,29 @@ class RembrServer {
               isError: true
             };
           }
+        }
+
+        const toolPermission = authorizeToolCall(
+          capabilities,
+          effectiveName,
+          typeof args?.operation === 'string' ? args.operation : undefined,
+        );
+        if (!toolPermission.allowed) {
+          const duration = (Date.now() - startTime) / 1000;
+          trackMcpToolCall(name, 'error', tenantId, duration);
+          trackMcpToolError(name, 'permission', tenantId);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: 'Insufficient scope',
+                required_capability: toolPermission.requiredCapability,
+                correlation_id: correlationId,
+              }, null, 2),
+            }],
+            isError: true,
+          };
         }
 
         // RAD-51: Wrap switch in IIFE so we can post-process the result and inject
@@ -3527,9 +3661,23 @@ class RembrServer {
             }
 
             const chunks = splitIntoChunks(rawContent, chunkSize);
+            const maxChunks = 100;
+            if (chunks.length > maxChunks) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    success: false,
+                    status: 'rejected',
+                    error: `Document exceeds the ${maxChunks}-chunk ingestion limit`,
+                  }),
+                }],
+                isError: true,
+              };
+            }
             const totalChunks = chunks.length;
             const memoryIds: string[] = [];
-            const errors: string[] = [];
+            const errors: Array<{ chunk_index: number; code: 'STORE_FAILED' }> = [];
 
             for (let i = 0; i < chunks.length; i++) {
               try {
@@ -3547,20 +3695,34 @@ class RembrServer {
                   metadata: chunkMeta
                 });
                 memoryIds.push(memory.id);
-              } catch (err) {
-                errors.push(`Chunk ${i + 1}: ${(err as Error).message}`);
+              } catch {
+                // Never expose quota/database/provider detail through a bulk
+                // response.  The stable code and index are sufficient for an
+                // agent to retry or reduce the document.
+                errors.push({ chunk_index: i + 1, code: 'STORE_FAILED' });
               }
             }
 
             const duration = (Date.now() - startTime) / 1000;
-            trackMcpToolCall('ingest_document', 'success', tenantId, duration);
+            const status = errors.length === 0
+              ? 'completed'
+              : memoryIds.length > 0
+                ? 'partial'
+                : 'failed';
+            trackMcpToolCall(
+              'ingest_document',
+              status === 'completed' ? 'success' : 'error',
+              tenantId,
+              duration,
+            );
 
             return {
               content: [
                 {
                   type: 'text',
                   text: JSON.stringify({
-                    success: true,
+                    success: errors.length === 0,
+                    status,
                     document_title: title,
                     total_chunks: totalChunks,
                     stored: memoryIds.length,
@@ -3569,7 +3731,8 @@ class RembrServer {
                     ...(errors.length > 0 ? { errors } : {})
                   }, null, 2)
                 }
-              ]
+              ],
+              ...(memoryIds.length === 0 && errors.length > 0 ? { isError: true } : {}),
             };
           }
 
@@ -3601,24 +3764,7 @@ class RembrServer {
             // RAD-88: Budget-aware token truncation
             const maxTokens = args?.max_tokens as number | undefined;
             let budgetWarning: string | undefined;
-            let effectiveMaxTokens = maxTokens;
-
-            if (args?.token_budget_category && !effectiveMaxTokens) {
-              // Look up budget allocation for this category
-              try {
-                const budgetRow = await this.pool.query(
-                  `SELECT allocations FROM context_budgets WHERE tenant_id = $1 AND is_active = TRUE ORDER BY created_at DESC LIMIT 1`,
-                  [tenantId]
-                );
-                if (budgetRow.rows.length > 0) {
-                  const alloc = budgetRow.rows[0].allocations;
-                  const cat = args.token_budget_category as string;
-                  if (alloc[cat]) effectiveMaxTokens = Number(alloc[cat]);
-                }
-              } catch {
-                // Non-fatal — no budget found, proceed without limit
-              }
-            }
+            const effectiveMaxTokens = maxTokens;
 
             // Format results with pagination metadata (REM-38)
             // Apply token budget: include results until budget exhausted
@@ -3676,16 +3822,12 @@ class RembrServer {
               ...(budgetWarning ? { budget_warning: budgetWarning } : {}),
             };
 
-            // RAD-67: Include embedding_status when memories may not yet be indexed
-            // This prevents agents from concluding "no results exist" when results are pending
             const searchMetadata = results.search_metadata;
             if (searchMetadata) {
               finalResponse.semantic_status = searchMetadata.semantic_status;
               finalResponse.fallback_used = searchMetadata.fallback_used;
               finalResponse.min_similarity = searchMetadata.min_similarity;
-              if (searchMetadata.semantic_error) {
-                finalResponse.semantic_error = searchMetadata.semantic_error;
-              }
+              if (searchMetadata.semantic_error) finalResponse.semantic_error = searchMetadata.semantic_error;
               if (searchMetadata.embedding_coverage !== null) {
                 finalResponse.embedding_coverage = `${Math.round(searchMetadata.embedding_coverage * 100)}%`;
               }
@@ -3699,23 +3841,6 @@ class RembrServer {
               if (searchMetadata.embedding_pending && results.length === 0) {
                 finalResponse.search_note = `${searchMetadata.embedding_pending} memories are still being indexed. Results may be incomplete — retry in a few seconds.`;
               }
-            } else try {
-              const embeddingStatus = await memoryService.getPendingEmbeddingCount();
-              if (embeddingStatus.pending > 0) {
-                const coverage = embeddingStatus.total > 0
-                  ? Math.round((embeddingStatus.total - embeddingStatus.pending) / embeddingStatus.total * 100)
-                  : 100;
-                finalResponse.embedding_status = 'partial';
-                finalResponse.embedding_coverage = `${coverage}%`;
-                finalResponse.embedding_pending = embeddingStatus.pending;
-                if (results.length === 0) {
-                  finalResponse.search_note = `${embeddingStatus.pending} memories are still being indexed. Results may be incomplete — retry in a few seconds.`;
-                }
-              } else {
-                finalResponse.embedding_status = 'ready';
-              }
-            } catch {
-              // Non-fatal: embedding status check failed, omit from response
             }
 
             return {
@@ -3962,7 +4087,13 @@ class RembrServer {
           }
 
           case 'get_stats': {
-            const stats = await memoryService.getStats();
+            const canReadTenantAggregate = canReadTenantAggregates(
+              capabilities,
+              credentialPurpose,
+              userId,
+              projectId,
+            );
+            const stats = await memoryService.getStats(canReadTenantAggregate);
             const duration = (Date.now() - startTime) / 1000;
 
             // Include PII plan capabilities in stats (RAD-35)
@@ -3973,10 +4104,14 @@ class RembrServer {
 
             // Include daily rate limit quota in stats (REM-48)
             const { getDailyTenantUsage } = await import('./rate-limiter.js');
-            const statsQuota = await getDailyTenantUsage(tenantId, statsPlan);
+            const statsQuota = canReadTenantAggregate
+              ? await getDailyTenantUsage(tenantId, statsPlan)
+              : null;
 
             // Include monthly PII scan usage in stats (RAD-35)
-            const piiScanUsage = await getPIIScanUsage(tenantId, statsPlan);
+            const piiScanUsage = canReadTenantAggregate
+              ? await getPIIScanUsage(tenantId, statsPlan)
+              : null;
 
             trackMcpToolCall('get_stats', 'success', tenantId, duration);
 
@@ -3999,17 +4134,23 @@ class RembrServer {
                       pii_scans_per_month: statsPiiCaps.piiScansPerMonth === Infinity ? 'unlimited' : statsPiiCaps.piiScansPerMonth,
                     },
                     pii_scan_quota: {
-                      monthly_limit: piiScanUsage.limit === -1 ? 'unlimited' : piiScanUsage.limit,
-                      monthly_used: piiScanUsage.count,
-                      monthly_remaining: piiScanUsage.remaining === -1 ? 'unlimited' : piiScanUsage.remaining,
-                      resets_at: piiScanUsage.resetsAt,
+                      monthly_limit: statsPiiCaps.piiScansPerMonth === Infinity
+                        ? 'unlimited'
+                        : statsPiiCaps.piiScansPerMonth,
+                      monthly_used: piiScanUsage?.count ?? null,
+                      monthly_remaining: piiScanUsage
+                        ? piiScanUsage.remaining === -1 ? 'unlimited' : piiScanUsage.remaining
+                        : null,
+                      resets_at: piiScanUsage?.resetsAt ?? null,
+                      scope: canReadTenantAggregate ? 'tenant' : 'unavailable_for_scoped_credential',
                     },
                     rate_limits: {
                       plan_tier: statsPlan,
-                      daily_limit: statsQuota.limit,
-                      daily_used: statsQuota.count,
-                      daily_remaining: statsQuota.remaining,
-                      resets_at: statsQuota.resetAt,
+                      daily_limit: statsQuota?.limit ?? null,
+                      daily_used: statsQuota?.count ?? null,
+                      daily_remaining: statsQuota?.remaining ?? null,
+                      resets_at: statsQuota?.resetAt ?? null,
+                      scope: canReadTenantAggregate ? 'tenant' : 'unavailable_for_scoped_credential',
                     }
                   }, null, 2)
                 }
@@ -4038,7 +4179,8 @@ class RembrServer {
 
           case 'list_contexts': {
             const contexts = await contextService.listContexts(
-              args?.category as string
+              args?.category as string,
+              (args?.limit as number) || 50,
             );
             const duration = (Date.now() - startTime) / 1000;
 
@@ -4047,6 +4189,7 @@ class RembrServer {
             // Format with pagination metadata (REM-38)
             const responseData = addPaginationToResponse({
               items: contexts,
+              limit: (args?.limit as number) || 50,
               startTime,
               suggestedFilters: contexts.length > 10 ? ['Add category filter'] : undefined
             });
@@ -4146,7 +4289,7 @@ class RembrServer {
             if (!args?.memory_ids && !args?.context_ids && !args?.query) {
               return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'At least one of memory_ids, context_ids, or query is required to create a snapshot' }) }] };
             }
-            const authContext = { tenant_id: tenantId, project_id: projectId };
+            const authContext = { tenant_id: tenantId, project_id: projectId, user_id: userId };
             const result = await snapshotService.createSnapshot(authContext, {
               name: args?.name as string,
               description: args?.description as string,
@@ -4178,10 +4321,14 @@ class RembrServer {
           }
 
           case 'get_snapshot': {
-            const authContext = { tenant_id: tenantId, project_id: projectId };
+            const authContext = { tenant_id: tenantId, project_id: projectId, user_id: userId };
             const result = await snapshotService.getSnapshot(
               args?.snapshot_id as string,
-              authContext
+              authContext,
+              {
+                offset: args?.offset as number,
+                limit: args?.limit as number,
+              },
             );
             const duration = (Date.now() - startTime) / 1000;
 
@@ -4209,6 +4356,7 @@ class RembrServer {
                   text: JSON.stringify({
                     success: true,
                     snapshot: result.snapshot,
+                    pagination: result.pagination,
                     memories: result.memories.map(m => ({
                       content: m.content,
                       category: m.category,
@@ -4223,7 +4371,7 @@ class RembrServer {
 
           case 'list_snapshots': {
             const limit = args?.limit as number || 10;
-            const authContext = { tenant_id: tenantId, project_id: projectId };
+            const authContext = { tenant_id: tenantId, project_id: projectId, user_id: userId };
             const snapshots = await snapshotService.listSnapshots(
               authContext,
               projectId,
@@ -4270,7 +4418,7 @@ class RembrServer {
 
           // Phase 3: Compilation handlers
           case 'get_memory_graph': {
-            const authContext = { tenant_id: tenantId, project_id: projectId };
+            const authContext = { tenant_id: tenantId, project_id: projectId, user_id: userId };
             const graph = await compilationService.getMemoryGraph(
               args?.context_id as string,
               authContext
@@ -4305,7 +4453,7 @@ class RembrServer {
           }
 
           case 'detect_contradictions': {
-            const authContext = { tenant_id: tenantId, project_id: projectId };
+            const authContext = { tenant_id: tenantId, project_id: projectId, user_id: userId };
             const contradictions = await compilationService.detectContradictions(
               args?.context_id as string,
               authContext
@@ -4784,7 +4932,7 @@ case 'context_analytics': {
           }
 
           case 'get_context_insights': {
-            const authContext = { tenant_id: tenantId, project_id: projectId };
+            const authContext = { tenant_id: tenantId, project_id: projectId, user_id: userId };
             
             // Check if we should regenerate
             const shouldRegenerate = args?.regenerate as boolean;
@@ -4966,8 +5114,7 @@ case 'context_analytics': {
             };
           }
 
-          // REM-271: Traverse the relationship graph starting from a specific memory.
-          // Uses a recursive CTE with cycle detection for safe multi-hop traversal.
+          // REM-271: Traverse only the caller-accessible relationship subgraph.
           case 'explore_relationships': {
             const startMemoryId = args?.memory_id as string;
             if (!startMemoryId) {
@@ -4977,149 +5124,69 @@ case 'context_analytics': {
               };
             }
 
-            const maxDepth = Math.min(Math.max(1, (args?.depth as number) || 2), 3);
-            const minConfidence = (args?.min_confidence as number) ?? 0.5;
-            const filterTypes = args?.relationship_types as string[] | undefined;
-
-            const client = await this.pool.connect();
-            try {
-              await client.query('BEGIN');
-              await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant', tenantId]);
-
-              // Recursive CTE: BFS traversal up to maxDepth hops with cycle detection.
-              // node_id = current node, depth = distance from start, path = visited IDs.
-              const traversalQuery = `
-                WITH RECURSIVE graph_traversal(node_id, depth, path) AS (
-                  -- Base: seed with the starting memory
-                  SELECT $1::uuid, 0, ARRAY[$1::uuid]
-
-                  UNION ALL
-
-                  -- Recursive: follow relationship edges outward
-                  SELECT
-                    CASE
-                      WHEN mr.source_memory_id = gt.node_id THEN mr.target_memory_id
-                      ELSE mr.source_memory_id
-                    END AS node_id,
-                    gt.depth + 1,
-                    gt.path || CASE
-                      WHEN mr.source_memory_id = gt.node_id THEN mr.target_memory_id
-                      ELSE mr.source_memory_id
-                    END
-                  FROM graph_traversal gt
-                  JOIN memory_relationships mr
-                    ON (mr.source_memory_id = gt.node_id OR mr.target_memory_id = gt.node_id)
-                  WHERE gt.depth < $2
-                    -- Cycle detection: don't revisit nodes already in path
-                    AND NOT (
-                      CASE WHEN mr.source_memory_id = gt.node_id
-                           THEN mr.target_memory_id
-                           ELSE mr.source_memory_id
-                      END = ANY(gt.path)
-                    )
-                    AND mr.confidence >= $3
-                    ${filterTypes && filterTypes.length > 0 ? 'AND mr.relationship_type = ANY($5)' : ''}
-                ),
-                -- Deduplicate: keep each node at its minimum depth
-                closest AS (
-                  SELECT node_id, MIN(depth) AS depth
-                  FROM graph_traversal
-                  WHERE depth > 0
-                  GROUP BY node_id
-                )
-                SELECT
-                  m.id,
-                  m.content,
-                  m.category,
-                  m.created_at,
-                  c.depth,
-                  mr.relationship_type,
-                  mr.confidence,
-                  mr.evidence,
-                  CASE WHEN mr.source_memory_id = m.id THEN mr.target_memory_id
-                       ELSE mr.source_memory_id END AS connected_to
-                FROM closest c
-                JOIN memories m ON m.id = c.node_id AND m.tenant_id = $4
-                -- Re-join relationships to get edge details for the closest path
-                LEFT JOIN LATERAL (
-                  SELECT mr2.relationship_type, mr2.confidence, mr2.evidence,
-                         mr2.source_memory_id, mr2.target_memory_id
-                  FROM memory_relationships mr2
-                  WHERE (mr2.source_memory_id = c.node_id OR mr2.target_memory_id = c.node_id)
-                    AND mr2.confidence >= $3
-                    ${filterTypes && filterTypes.length > 0 ? 'AND mr2.relationship_type = ANY($5)' : ''}
-                  ORDER BY mr2.confidence DESC
-                  LIMIT 1
-                ) mr ON true
-                ORDER BY c.depth ASC, mr.confidence DESC
-                LIMIT 200
-              `;
-
-              const queryParams: any[] = [startMemoryId, maxDepth, minConfidence, tenantId];
-              if (filterTypes && filterTypes.length > 0) queryParams.push(filterTypes);
-
-              // Fetch starting memory details
-              const startResult = await client.query(
-                'SELECT id, content, category, created_at FROM memories WHERE id = $1 AND tenant_id = $2',
-                [startMemoryId, tenantId]
-              );
-
-              if (startResult.rows.length === 0) {
-                await client.query('ROLLBACK');
-                return {
-                  content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Starting memory not found or access denied' }) }],
-                  isError: true
-                };
-              }
-
-              const neighborResult = await client.query(traversalQuery, queryParams);
-              await client.query('COMMIT');
-              const duration = (Date.now() - startTime) / 1000;
-
-              trackMcpToolCall('explore_relationships', 'success', tenantId, duration);
-
-              // Group results by depth for easy agent consumption
-              const byDepth: Record<number, any[]> = {};
-              for (const row of neighborResult.rows) {
-                const d = row.depth;
-                if (!byDepth[d]) byDepth[d] = [];
-                byDepth[d].push({
-                  id: row.id,
-                  content: row.content,
-                  category: row.category,
-                  created_at: row.created_at,
-                  relationship_type: row.relationship_type,
-                  confidence: row.confidence ? parseFloat(row.confidence) : null,
-                  evidence: row.evidence
-                });
-              }
-
-              // RAD-52: pagination metadata on relationship traversal
-              const exploreResponse = addPaginationToResponse({
-                items: neighborResult.rows,
-                startTime,
-                relatedTools: ['get_memory_graph', 'infer_memory_relationships']
-              });
+            const graph = await exploreAccessibleRelationshipGraph(
+              this.pool,
+              { tenantId, projectId, userId },
+              {
+                memoryId: startMemoryId,
+                depth: args?.depth as number | undefined,
+                minConfidence: args?.min_confidence as number | undefined,
+                relationshipTypes: args?.relationship_types as string[] | undefined,
+              },
+            );
+            if (!graph) {
               return {
-                content: [
-                  {
-                    type: 'text',
-                    text: JSON.stringify({
-                      ...exploreResponse,
-                      start_memory: startResult.rows[0],
-                      max_depth: maxDepth,
-                      min_confidence: minConfidence,
-                      by_depth: byDepth
-                    }, null, 2)
-                  }
-                ]
+                content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Starting memory not found or access denied' }) }],
+                isError: true
               };
-            } finally {
-              if (client) {
-                try { await client.query('ROLLBACK'); } catch {}
-              }
-              client.release();
             }
+
+            const duration = (Date.now() - startTime) / 1000;
+            trackMcpToolCall('explore_relationships', 'success', tenantId, duration);
+
+            const byDepth: Record<number, any[]> = {};
+            for (const row of graph.neighbors) {
+              const depth = Number(row.depth);
+              if (!byDepth[depth]) byDepth[depth] = [];
+              byDepth[depth].push({
+                id: row.id,
+                content: row.content,
+                category: row.category,
+                created_at: row.created_at,
+                relationship_type: row.relationship_type,
+                confidence: row.confidence === null ? null : Number(row.confidence),
+                evidence: row.evidence,
+                connected_to: row.connected_to,
+              });
+            }
+
+            const exploreResponse = addPaginationToResponse({
+              items: graph.neighbors,
+              totalAvailable: graph.truncated
+                ? MAX_RELATIONSHIP_GRAPH_NODES + 1
+                : graph.neighbors.length,
+              startTime,
+              relatedTools: ['get_memory_graph', 'infer_memory_relationships']
+            });
+            if (graph.truncated) {
+              exploreResponse.pagination = {
+                has_more: true,
+                suggested_filters: ['increase min_confidence', 'filter relationship_types', 'reduce depth'],
+              };
+            }
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  ...exploreResponse,
+                  truncated: graph.truncated,
+                  start_memory: graph.startMemory,
+                  max_depth: graph.maxDepth,
+                  min_confidence: graph.minConfidence,
+                  by_depth: byDepth
+                }, null, 2)
+              }]
+            };
           }
 
           case 'enhanced_search': {
@@ -5197,12 +5264,15 @@ case 'context_analytics': {
             const {
               contradictions,
               source,
-              live_analysis
-            } = await this.getContradictionsWithLiveFallback(
+              live_analysis,
+              background_analysis,
+            } = await this.getContradictionsWithBackgroundEnqueue(
               tenantId,
               minConfidence,
               contextId,
-              liveAnalysis
+              liveAnalysis,
+              projectId,
+              userId,
             );
 
             const duration = (Date.now() - startTime) / 1000;
@@ -5249,9 +5319,8 @@ case 'context_analytics': {
                     contradictions,
                     source,
                     live_analysis,
-                    note: source === 'precomputed'
-                      ? 'Returned stored contradiction relationships.'
-                      : 'Returned live contradiction analysis; detected relationships are stored for future calls when possible.'
+                    background_analysis,
+                    note: 'Returned stored contradiction relationships only. Any requested analysis runs in the background.'
                   }, null, 2)
                 },
                 {
@@ -5269,7 +5338,9 @@ case 'context_analytics': {
             const graph = await analyticsService.generateContextGraph(
               tenantId,
               args?.context_id as string,
-              args?.include_relationships !== false
+              args?.include_relationships !== false,
+              projectId,
+              userId,
             );
 
             return {
@@ -5336,11 +5407,27 @@ case 'context_analytics': {
           case 'set_memory_visibility': {
             const memoryId = args?.memory_id as string;
             const visibility = args?.visibility as string;
+
+            if (!userId) {
+              return {
+                content: [{ type: 'text', text: JSON.stringify({
+                  success: false,
+                  error: 'A user-bound credential is required to change memory visibility'
+                }) }],
+                isError: true
+              };
+            }
             
-            const result = await this.pool.query(`
-              UPDATE memories SET visibility = $1 WHERE id = $2 AND tenant_id = $3
+            const result = await this.db.query(`
+              UPDATE memories m
+              SET visibility = $1,
+                  user_id = CASE WHEN $1 = 'personal' THEN $4::uuid ELSE m.user_id END,
+                  updated_at = NOW()
+              WHERE m.id = $2 AND m.tenant_id = $3
+                AND ($5::uuid IS NULL OR m.project_id = $5::uuid)
+                AND (m.user_id IS NULL OR m.user_id = $4::uuid)
               RETURNING id, content, visibility, user_id
-            `, [visibility, memoryId, tenantId]);
+            `, [visibility, memoryId, tenantId, userId, projectId || null], tenantId);
             const duration = (Date.now() - startTime) / 1000;
             
             if (result.rows.length === 0) {
@@ -5380,27 +5467,42 @@ case 'context_analytics': {
           }
 
           case 'list_personal_memories': {
-            // Note: API key auth doesn't have user context, so we list shared/project memories instead
-            // For true personal memories, use OAuth authentication which provides user_id
             const limit = (args?.limit as number) || 50;
             const category = args?.category as string;
+
+            if (!userId) {
+              return {
+                content: [{ type: 'text', text: JSON.stringify({
+                  items: [],
+                  count: 0,
+                  note: 'A user-bound credential is required for personal memories.'
+                }, null, 2) }]
+              };
+            }
             
             let query = `
-              SELECT id, content, category, metadata, created_at, updated_at
-              FROM memories 
-              WHERE tenant_id = $1 AND visibility IN ('shared', 'project')
+              SELECT m.id, m.content, m.category, m.metadata, m.created_at, m.updated_at
+              FROM memories m
+              WHERE m.tenant_id = $1
+                AND m.visibility = 'personal'
+                AND m.user_id = $2::uuid
             `;
-            let params: (string | number)[] = [tenantId];
+            let params: (string | number | null)[] = [tenantId, userId];
+
+            if (projectId) {
+              query += ` AND m.project_id = $${params.length + 1}::uuid`;
+              params.push(projectId);
+            }
             
             if (category) {
-              query += ` AND category = $2`;
+              query += ` AND m.category = $${params.length + 1}`;
               params.push(category);
             }
             
-            query += ` ORDER BY created_at DESC LIMIT $${params.length + 1}`;
+            query += ` ORDER BY m.created_at DESC LIMIT $${params.length + 1}`;
             params.push(limit);
             
-            const result = await this.pool.query(query, params);
+            const result = await this.db.query(query, params, tenantId);
             const duration = (Date.now() - startTime) / 1000;
             
             trackMcpToolCall('list_personal_memories', 'success', tenantId, duration);
@@ -5413,10 +5515,9 @@ case 'context_analytics': {
               suggestedFilters: result.rows.length === limit ? ['Add category filter'] : undefined
             });
 
-            // Add note about OAuth requirement for personal memories
             const finalResponse = {
               ...responseData,
-              note: 'API key auth shows shared/project memories. Use OAuth for personal memories.'
+              visibility: 'personal'
             };
             
             return {
@@ -5440,7 +5541,8 @@ case 'context_analytics': {
               memoryId,
               direction,
               maxDepth,
-              projectId
+              projectId,
+              userId,
             );
 
             trackMcpToolCall('trace_causality', 'success');
@@ -5467,14 +5569,15 @@ case 'context_analytics': {
               tenantId,
               causeMemoryId,
               effectMemoryId,
-              projectId
+              projectId,
+              userId,
             );
 
             trackMcpToolCall('infer_causality', 'success');
 
             if (link) {
               // Log to audit
-              await this.auditLogger.log({
+              await requestAuditLogger.log({
                 tenantId,
                 eventType: 'causality.inferred',
                 resourceType: 'causal_link',
@@ -5523,7 +5626,8 @@ case 'context_analytics': {
               tenantId,
               memoryId,
               direction,
-              projectId
+              projectId,
+              userId,
             );
 
             trackMcpToolCall('get_causal_links', 'success');
@@ -5546,7 +5650,7 @@ case 'context_analytics': {
             const linkId = args?.link_id as string;
             const isValid = args?.is_valid as boolean;
 
-            await causalService.validateCausalLink(tenantId, linkId, isValid, projectId);
+            await causalService.validateCausalLink(tenantId, linkId, isValid, projectId, userId);
 
             trackMcpToolCall('validate_causal_link', 'success');
 
@@ -5581,7 +5685,7 @@ case 'context_analytics': {
             // Get embedding for query
             let embedding: number[] | undefined;
             if (this.embeddingProvider) {
-              embedding = await this.embeddingProvider.generateEmbedding(query);
+              embedding = await this.embeddingProvider.generateEmbedding(query, { tenantId });
             }
 
             const results = await temporalService.searchAtTime(
@@ -5591,6 +5695,7 @@ case 'context_analytics': {
               {
                 embedding: embedding || [],
                 projectId,
+                userId,
                 category,
                 limit
               }
@@ -5628,7 +5733,8 @@ case 'context_analytics': {
             const history = await temporalService.getMemoryHistory(
               tenantId,
               memoryId,
-              projectId
+              projectId,
+              userId,
             );
 
             trackMcpToolCall('get_memory_history', 'success');
@@ -5641,6 +5747,7 @@ case 'context_analytics': {
                     success: true,
                     memory_id: memoryId,
                     versions: history.length,
+                    history_model: 'current-row lifecycle state (the checked schema stores one row per memory ID)',
                     history
                   }, null, 2)
                 }
@@ -5667,13 +5774,14 @@ case 'context_analytics': {
               tenantId,
               snapshotName,
               asOfTime,
-              projectId
+              projectId,
+              userId,
             );
 
             trackMcpToolCall('create_temporal_snapshot', 'success');
 
             // Log to audit
-            await this.auditLogger.log({
+            await requestAuditLogger.log({
               tenantId,
               eventType: 'snapshot.created',
               resourceType: 'temporal_snapshot',
@@ -5699,7 +5807,7 @@ case 'context_analytics': {
           case 'list_temporal_snapshots': {
             const limit = (args?.limit as number) || 50;
 
-            const snapshots = await temporalService.listSnapshots(tenantId, projectId, limit);
+            const snapshots = await temporalService.listSnapshots(tenantId, projectId, limit, userId);
 
             trackMcpToolCall('list_temporal_snapshots', 'success');
 
@@ -5735,7 +5843,8 @@ case 'context_analytics': {
               tenantId,
               timeA,
               timeB,
-              projectId
+              projectId,
+              userId,
             );
 
             trackMcpToolCall('compare_snapshots', 'success');
@@ -5786,7 +5895,7 @@ case 'context_analytics': {
               limit: auditLimit
             };
 
-            const logs = await this.auditLogger.query(tenantId, filters);
+            const logs = await requestAuditLogger.query(tenantId, filters);
 
             trackMcpToolCall('query_audit_log', 'success');
 
@@ -5819,7 +5928,7 @@ case 'context_analytics': {
               return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Invalid date(s). Use ISO 8601 format.' }) }] };
             }
 
-            const report = await this.auditLogger.generateComplianceReport(
+            const report = await requestAuditLogger.generateComplianceReport(
               tenantId,
               startDate,
               endDate
@@ -5828,7 +5937,7 @@ case 'context_analytics': {
             trackMcpToolCall('generate_compliance_report', 'success');
 
             // Log report generation to audit
-            await this.auditLogger.log({
+            await requestAuditLogger.log({
               tenantId,
               eventType: 'report.generated',
               resourceType: 'compliance_report',
@@ -5857,7 +5966,7 @@ case 'context_analytics': {
             const startDate = args?.start_date ? new Date(args.start_date as string) : undefined;
             const endDate = args?.end_date ? new Date(args.end_date as string) : undefined;
 
-            const stats = await this.auditLogger.getAuditStats(tenantId, startDate, endDate);
+            const stats = await requestAuditLogger.getAuditStats(tenantId, startDate, endDate);
 
             trackMcpToolCall('get_audit_stats', 'success');
 
@@ -6033,9 +6142,10 @@ case 'context_analytics': {
 
               case 'audit': {
                 const memoryId = args?.memory_id as string;
-                const limit = (args?.limit as number) || 100;
+                const limit = Math.min((args?.limit as number) || 100, 100);
                 const client = await this.pool.connect();
                 try {
+                  await client.query('BEGIN');
                   await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant', tenantId]);
                   const result = await client.query(
                     `SELECT * FROM pii_access_logs 
@@ -6045,12 +6155,16 @@ case 'context_analytics': {
                     memoryId ? [tenantId, memoryId, limit] : [tenantId, limit]
                   );
                   trackMcpToolCall('pii', 'success', tenantId, (Date.now() - startTime) / 1000);
+                  await client.query('COMMIT');
                   return {
                     content: [{
                       type: 'text',
                       text: JSON.stringify({ success: true, operation: 'audit', logs: result.rows, count: result.rowCount }, null, 2)
                     }]
                   };
+                } catch (error) {
+                  try { await client.query('ROLLBACK'); } catch {}
+                  throw error;
                 } finally {
                   client.release();
                 }
@@ -6063,6 +6177,7 @@ case 'context_analytics': {
                 const endDateStr = args?.end_date as string;
                 const client = await this.pool.connect();
                 try {
+                  await client.query('BEGIN');
                   await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant', tenantId]);
                   
                   // Get PII statistics
@@ -6090,6 +6205,7 @@ case 'context_analytics': {
                   );
 
                   trackMcpToolCall('pii', 'success', tenantId, (Date.now() - startTime) / 1000);
+                  await client.query('COMMIT');
                   return {
                     content: [{
                       type: 'text',
@@ -6107,6 +6223,9 @@ case 'context_analytics': {
                       }, null, 2)
                     }]
                   };
+                } catch (error) {
+                  try { await client.query('ROLLBACK'); } catch {}
+                  throw error;
                 } finally {
                   client.release();
                 }
@@ -6115,17 +6234,35 @@ case 'context_analytics': {
               case 'batch_scan': {
                 // Gate batch_scan by plan (RAD-35 / REM-51)
                 assertPIIOperationAllowed('batch_scan', tenantPlan);
-                const limit = (args?.limit as number) || 100;
+                const limit = Math.min((args?.limit as number) || 100, 100);
                 const client = await this.pool.connect();
                 try {
+                  await client.query('BEGIN');
                   await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant', tenantId]);
                   
-                  // Get unscanned memories
+                  // Get only unscanned memories in this credential's exact
+                  // project/audience. The write capability does not imply
+                  // tenant-wide compliance authority.
                   const memories = await client.query(
-                    `SELECT id, content FROM memories 
-                     WHERE tenant_id = $1 AND pii_scanned_at IS NULL 
-                     LIMIT $2`,
-                    [tenantId, limit]
+                    `SELECT m.id, m.content
+                     FROM memories m
+                     LEFT JOIN projects p ON p.id = m.project_id
+                     WHERE m.tenant_id = $1
+                       AND m.pii_scanned_at IS NULL
+                       AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+                       AND (
+                         (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+                         OR (
+                           COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+                           AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $3::uuid
+                                OR EXISTS (SELECT 1 FROM project_members pm
+                                           WHERE pm.project_id = p.id AND pm.user_id = $3::uuid))
+                         )
+                       )
+                     ORDER BY m.created_at, m.id
+                     LIMIT $4
+                     FOR UPDATE OF m SKIP LOCKED`,
+                    [tenantId, projectId || null, userId || null, limit]
                   );
 
                   // RAD-35: enforce monthly scan quota for the entire batch upfront
@@ -6158,16 +6295,17 @@ case 'context_analytics': {
                       `UPDATE memories SET 
                          pii_detected = $1, 
                          pii_types = $2, 
-                         pii_confidence = $3, 
-                         pii_scanned_at = NOW() 
-                       WHERE id = $4`,
-                      [result.hasPII, result.types, result.confidence, memory.id]
+                        pii_confidence = $3,
+                        pii_scanned_at = NOW()
+                       WHERE id = $4 AND tenant_id = $5`,
+                      [result.hasPII, result.types, result.confidence, memory.id, tenantId]
                     );
                     scanned++;
                     if (result.hasPII) piiFound++;
                   }
 
                   trackMcpToolCall('pii', 'success', tenantId, (Date.now() - startTime) / 1000);
+                  await client.query('COMMIT');
                   return {
                     content: [{
                       type: 'text',
@@ -6180,6 +6318,9 @@ case 'context_analytics': {
                       }, null, 2)
                     }]
                   };
+                } catch (error) {
+                  try { await client.query('ROLLBACK'); } catch {}
+                  throw error;
                 } finally {
                   client.release();
                 }
@@ -6204,14 +6345,27 @@ case 'context_analytics': {
               metadata?: Record<string, any>;
             };
 
-            // Decode base64 to buffer
+            const attachmentService = getAttachmentService();
+            const maxEncodedLength = Math.ceil(attachmentService.getMaxFileSize() / 3) * 4;
+            if (content_base64.length > maxEncodedLength ||
+                !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(content_base64)) {
+              throw new Error('Invalid or oversized base64 attachment content');
+            }
+
+            // Decode only after the encoded-size and alphabet checks to avoid
+            // allocating attacker-controlled oversized buffers.
             const buffer = Buffer.from(content_base64, 'base64');
+            if (buffer.length === 0 || buffer.length > attachmentService.getMaxFileSize() ||
+                buffer.toString('base64') !== content_base64) {
+              throw new Error('Invalid or oversized base64 attachment content');
+            }
 
             // Upload via AttachmentService
-            const attachment = await getAttachmentService().uploadAttachment({
+            const attachment = await attachmentService.uploadAttachment({
               memoryId: memory_id,
               tenantId,
-              userId: userId || 'system',
+              projectId,
+              userId,
               filename,
               contentType: content_type,
               buffer,
@@ -6244,8 +6398,7 @@ case 'context_analytics': {
 
             const attachments = await getAttachmentService().listAttachments(
               memory_id,
-              tenantId,
-              projectId || undefined
+              { tenantId, projectId, userId },
             );
 
             // Format attachments with pagination metadata (REM-38)
@@ -6282,8 +6435,7 @@ case 'context_analytics': {
 
             const url = await getAttachmentService().getDownloadUrl(
               attachment_id,
-              tenantId,
-              userId || 'system',
+              { tenantId, projectId, userId },
               expires_in_seconds
             );
 
@@ -6306,8 +6458,7 @@ case 'context_analytics': {
 
             await getAttachmentService().deleteAttachment(
               attachment_id,
-              tenantId,
-              userId || 'system'
+              { tenantId, projectId, userId },
             );
 
             return {
@@ -6324,7 +6475,11 @@ case 'context_analytics': {
           case 'get_storage_usage': {
             trackMcpToolCall('get_storage_usage', 'success');
 
-            const usage = await getAttachmentService().getStorageUsage(tenantId);
+            const usage = await getAttachmentService().getStorageUsage({
+              tenantId,
+              projectId,
+              userId,
+            });
 
             return {
               content: [{
@@ -6811,7 +6966,7 @@ case 'context_analytics': {
           // ──────────────────────────────────────────────
 
           case 'get_usage_analytics': {
-            const reportingService = new AnalyticsReportingService(this.pool, tenantId);
+            const reportingService = new AnalyticsReportingService(this.pool, tenantId, projectId, userId);
             const from = new Date((args?.from as string) || new Date(Date.now() - 30 * 86400000).toISOString());
             const to   = new Date((args?.to   as string) || new Date().toISOString());
             const granularity = ((args?.granularity as Granularity) || 'day');
@@ -6838,7 +6993,7 @@ case 'context_analytics': {
           }
 
           case 'get_performance_metrics': {
-            const reportingService = new AnalyticsReportingService(this.pool, tenantId);
+            const reportingService = new AnalyticsReportingService(this.pool, tenantId, projectId, userId);
             const from = new Date((args?.from as string) || new Date(Date.now() - 30 * 86400000).toISOString());
             const to   = new Date((args?.to   as string) || new Date().toISOString());
             const granularity = ((args?.granularity as Granularity) || 'day');
@@ -6857,7 +7012,7 @@ case 'context_analytics': {
           }
 
           case 'get_memory_growth': {
-            const reportingService = new AnalyticsReportingService(this.pool, tenantId);
+            const reportingService = new AnalyticsReportingService(this.pool, tenantId, projectId, userId);
             const from = new Date((args?.from as string) || new Date(Date.now() - 30 * 86400000).toISOString());
             const to   = new Date((args?.to   as string) || new Date().toISOString());
 
@@ -6875,7 +7030,7 @@ case 'context_analytics': {
           }
 
           case 'get_category_breakdown': {
-            const reportingService = new AnalyticsReportingService(this.pool, tenantId);
+            const reportingService = new AnalyticsReportingService(this.pool, tenantId, projectId, userId);
             const data = await reportingService.getCategoryBreakdown();
 
             const duration = (Date.now() - startTime) / 1000;
@@ -6890,7 +7045,7 @@ case 'context_analytics': {
           }
 
           case 'get_pii_analytics': {
-            const reportingService = new AnalyticsReportingService(this.pool, tenantId);
+            const reportingService = new AnalyticsReportingService(this.pool, tenantId, projectId, userId);
             const data = await reportingService.getPIISummary();
 
             const duration = (Date.now() - startTime) / 1000;
@@ -6905,7 +7060,7 @@ case 'context_analytics': {
           }
 
           case 'build_report': {
-            const reportingService = new AnalyticsReportingService(this.pool, tenantId);
+            const reportingService = new AnalyticsReportingService(this.pool, tenantId, projectId, userId);
 
             const config: CustomReportConfig = {
               title:       (args?.title       as string)      || 'Custom Report',
@@ -6933,7 +7088,13 @@ case 'context_analytics': {
           // ──────────────────────────────────────────────
 
           case 'filter_memories': {
-            const searchSvc = new EnhancedSearchService(this.pool, tenantId, projectId);
+            const searchSvc = new EnhancedSearchService(
+              this.pool,
+              tenantId,
+              projectId,
+              userId,
+              userId ? `user:${userId}` : apiKeyId ? `api-key:${apiKeyId}` : `agent-tenant:${tenantId}`,
+            );
             const filter = (args?.filter as AdvancedFilter) ?? (args as AdvancedFilter);
             const result = await searchSvc.filterMemories(filter);
             const duration = (Date.now() - startTime) / 1000;
@@ -6944,7 +7105,13 @@ case 'context_analytics': {
           }
 
           case 'batch_memories': {
-            const searchSvc = new EnhancedSearchService(this.pool, tenantId, projectId);
+            const searchSvc = new EnhancedSearchService(
+              this.pool,
+              tenantId,
+              projectId,
+              userId,
+              userId ? `user:${userId}` : apiKeyId ? `api-key:${apiKeyId}` : `agent-tenant:${tenantId}`,
+            );
             const operation = args?.operation as string;
             const filter    = (args?.filter as AdvancedFilter) ?? {};
             const updates   = args?.updates as { category?: string; metadata_merge?: Record<string, unknown> } | undefined;
@@ -6969,7 +7136,13 @@ case 'context_analytics': {
           }
 
           case 'saved_searches': {
-            const searchSvc = new EnhancedSearchService(this.pool, tenantId, projectId);
+            const searchSvc = new EnhancedSearchService(
+              this.pool,
+              tenantId,
+              projectId,
+              userId,
+              userId ? `user:${userId}` : apiKeyId ? `api-key:${apiKeyId}` : `agent-tenant:${tenantId}`,
+            );
             const operation = args?.operation as string;
 
             let result: unknown;
@@ -7000,7 +7173,13 @@ case 'context_analytics': {
           }
 
           case 'export_memories': {
-            const searchSvc = new EnhancedSearchService(this.pool, tenantId, projectId);
+            const searchSvc = new EnhancedSearchService(
+              this.pool,
+              tenantId,
+              projectId,
+              userId,
+              userId ? `user:${userId}` : apiKeyId ? `api-key:${apiKeyId}` : `agent-tenant:${tenantId}`,
+            );
             const filter    = (args?.filter as AdvancedFilter) ?? {};
             const format    = ((args?.format as SearchExportFormat) ?? 'json');
             const title     = args?.title as string | undefined;
@@ -7560,7 +7739,7 @@ case 'context_analytics': {
               case 'request_forget_me': {
                 const req = await gdprSvc.requestForgetMe(tenantId, {
                   user_id: args?.user_id as string,
-                  requested_by_user_id: tenantId,
+                  requested_by_user_id: userId,
                   request_type: args?.request_type as any,
                   ip_address: args?.ip_address as string,
                 });
@@ -7656,10 +7835,11 @@ case 'context_analytics': {
 
         // RAD-51: Inject deprecation warning when a legacy tool was called directly.
         // This is separate from the consolidated→legacy routing path (isConsolidatedCall).
+        let finalToolResult = toolResult;
         if (isDirectLegacyCall && !isConsolidatedCall && toolResult) {
-          return wrapWithDeprecationWarning(toolResult as any, name);
+          finalToolResult = wrapWithDeprecationWarning(toolResult as any, name);
         }
-        return toolResult;
+        return fitMcpToolResult(finalToolResult as any);
       } catch (error) {
         const duration = (Date.now() - startTime) / 1000;
         const err = error as Error;
@@ -7710,7 +7890,11 @@ case 'context_analytics': {
               type: 'text',
               text: JSON.stringify({
                 success: false,
-                error: err.message,
+                error: errorType === 'validation' ? 'Request validation failed'
+                  : errorType === 'not_found' ? 'Resource not found'
+                  : errorType === 'permission' ? 'Access denied'
+                  : errorType === 'timeout' ? 'Operation timed out'
+                  : 'Operation failed',
                 error_type: errorType,
                 correlation_id: correlationId
               }, null, 2)
@@ -7736,9 +7920,9 @@ case 'context_analytics': {
     console.log(`   - Port: ${this.port}`);
     console.log(`   - Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log(`   - Timestamp: ${new Date().toISOString()}`);
-    console.log(`   - Auto-optimization: ${process.env.ENABLE_OPTIMIZATION === 'true' ? 'ENABLED' : 'DISABLED'}`);
+    console.log('   - Auto-optimization: DISABLED (audience isolation)');
     
-    const httpServer = this.app.listen(this.port, () => {
+    this.httpServer = this.app.listen(this.port, () => {
       console.log('✅ REMBR MCP server listening on port', this.port);
       console.log(`Health check: http://localhost:${this.port}/health`);
       console.log(`MCP endpoint: POST http://localhost:${this.port}/mcp`);
@@ -7752,181 +7936,38 @@ case 'context_analytics': {
       console.log('✅ Auto-optimization scheduler started');
     }
 
-    // Periodic embedding backlog gauge update (every 60s)
-    // Updates Prometheus gauge so alerting can detect growing backlogs
-    this.intervalHandles.push(setInterval(async () => {
-      if (this.closing) return;
-
-      try {
-        const result = await this.db.query(`
-          SELECT m.tenant_id, COUNT(*) - COUNT(e.memory_id) as backlog
-          FROM memories m
-          LEFT JOIN memory_embeddings e ON m.id = e.memory_id
-          GROUP BY m.tenant_id
-          HAVING COUNT(*) - COUNT(e.memory_id) > 0
-        `);
-        for (const row of result.rows) {
-          updateEmbeddingBacklog(row.tenant_id, parseInt(row.backlog));
-        }
-      } catch (error) {
-        console.error('Failed to update embedding backlog gauge:', error);
-      }
-    }, 60_000));
-
-    // Periodic embedding backfill (every 5 minutes)
-    // Catches any orphaned memories from transient failures
-    if (this.embeddingProvider) {
-      this.intervalHandles.push(setInterval(async () => {
-        if (this.closing) return;
-
-        try {
-          const result = await this.db.query(`
-            SELECT m.id, m.content, m.tenant_id
-            FROM memories m
-            LEFT JOIN memory_embeddings me ON m.id = me.memory_id
-            WHERE me.memory_id IS NULL
-            ORDER BY m.created_at DESC
-            LIMIT 10
-          `);
-
-          if (result.rows.length === 0) return;
-
-          console.log(`🔄 Backfill: found ${result.rows.length} memories without embeddings`);
-          let generated = 0;
-          let failed = 0;
-
-          for (const row of result.rows) {
-            try {
-              const embedding = await this.embeddingProvider!.generateEmbedding(row.content);
-              await this.db.storeEmbedding(
-                row.id,
-                row.tenant_id,
-                embedding,
-                this.embeddingProvider!.name,
-                this.embeddingProvider!.model,
-                this.embeddingProvider!.getModelFingerprint()
-              );
-              generated++;
-            } catch (error: any) {
-              failed++;
-              console.error(`❌ Backfill failed for ${row.id}:`, error?.message || error);
-              // Stop on timeout/connection errors — Ollama is likely overloaded
-              if (error?.message?.includes('timeout') || error?.message?.includes('ECONNREFUSED')) {
-                console.warn('⚠️  Backfill: stopping batch due to Ollama unavailability');
-                break;
-              }
-            }
-          }
-
-          if (generated > 0 || failed > 0) {
-            console.log(`📊 Backfill complete: ${generated} generated, ${failed} failed, from ${result.rows.length} attempted`);
-          }
-        } catch (error) {
-          console.error('Backfill job failed:', error);
-        }
-      }, 5 * 60_000)); // Every 5 minutes
-      console.log('✅ Embedding backfill job scheduled (every 5 minutes)');
-    }
+    // Cross-tenant backlog enumeration/backfill does not belong in the
+    // request-serving identity. An owner-operated maintenance worker must
+    // enumerate tenants and establish one transaction-local tenant GUC at a
+    // time; no global background memory reads run here.
 
     console.log('🔧 Configuring HTTP server timeouts...');
     
-    // Disable socket timeouts for streaming connections
-    httpServer.setTimeout(0); // No timeout for individual requests
-    httpServer.keepAliveTimeout = 3600 * 1000; // 1 hour keep-alive timeout for streaming connections
-    httpServer.headersTimeout = 3610 * 1000; // 1 hour + 10 seconds for headers
+    const httpServer = this.httpServer;
+    httpServer.setTimeout(120_000);
+    httpServer.requestTimeout = 120_000;
+    httpServer.keepAliveTimeout = 65_000;
+    httpServer.headersTimeout = 70_000;
     
     console.log('✅ Server timeouts configured:');
-    console.log('  - Socket timeout: disabled (0)');
+    console.log('  - Request/socket timeout: 120s');
     console.log(`  - Keep-alive timeout: ${httpServer.keepAliveTimeout / 1000}s`);
     console.log(`  - Headers timeout: ${httpServer.headersTimeout / 1000}s`);
 
-    // Add connection tracking with detailed logging
+    // Connection errors are logged without client addresses or ports.
     httpServer.on('connection', (socket) => {
-      console.log('🔌 New HTTP connection established:', {
-        remoteAddress: socket.remoteAddress,
-        remotePort: socket.remotePort,
-        localPort: socket.localPort,
-        timestamp: new Date().toISOString()
-      });
-      
-      socket.on('close', () => {
-        console.log('🔌 HTTP connection closed:', {
-          remoteAddress: socket.remoteAddress,
-          remotePort: socket.remotePort,
-          timestamp: new Date().toISOString()
-        });
-      });
-      
+      this.httpSockets.add(socket);
+      socket.once('close', () => this.httpSockets.delete(socket));
       socket.on('error', (err) => {
-        console.error('❌ Socket error:', {
-          code: (err as any).code,
-          message: err.message,
-          syscall: (err as any).syscall,
-          remoteAddress: socket.remoteAddress,
-          remotePort: socket.remotePort,
-          timestamp: new Date().toISOString()
-        });
-      });
-      
-      socket.on('timeout', () => {
-        console.log('⏰ Socket timeout triggered:', {
-          remoteAddress: socket.remoteAddress,
-          remotePort: socket.remotePort,
-          timestamp: new Date().toISOString()
-        });
+        console.error('HTTP socket error', { code: (err as any).code });
       });
     });
 
-    // Handle client errors gracefully with detailed logging
     httpServer.on('clientError', (err: any, socket) => {
-      console.error('❌ Client socket error:', {
-        code: err?.code,
-        message: err?.message,
-        errno: err?.errno,
-        syscall: err?.syscall,
-        address: err?.address,
-        port: err?.port,
-        timestamp: new Date().toISOString()
-      });
+      console.error('HTTP client socket error', { code: err?.code });
       if (socket.writable) {
         socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
       }
-    });
-    
-    // Add connection tracking
-    httpServer.on('connection', (socket) => {
-      console.log('🔌 New HTTP connection established:', {
-        remoteAddress: socket.remoteAddress,
-        remotePort: socket.remotePort,
-        timestamp: new Date().toISOString()
-      });
-      
-      socket.on('close', () => {
-        console.log('🔌 HTTP connection closed:', {
-          remoteAddress: socket.remoteAddress,
-          remotePort: socket.remotePort,
-          timestamp: new Date().toISOString()
-        });
-      });
-      
-      socket.on('error', (err) => {
-        console.error('❌ Socket error:', {
-          code: (err as any).code,
-          message: err.message,
-          syscall: (err as any).syscall,
-          remoteAddress: socket.remoteAddress,
-          remotePort: socket.remotePort,
-          timestamp: new Date().toISOString()
-        });
-      });
-      
-      socket.on('timeout', () => {
-        console.log('⏰ Socket timeout triggered:', {
-          remoteAddress: socket.remoteAddress,
-          remotePort: socket.remotePort,
-          timestamp: new Date().toISOString()
-        });
-      });
     });
 
     // Add periodic server status logging to track connection patterns
@@ -7945,46 +7986,74 @@ case 'context_analytics': {
 
     // Add process-level error handlers
     process.on('uncaughtException', (error) => {
-      console.error('💥 Uncaught Exception:', {
-        error: error.message,
+      console.error('Uncaught exception; terminating for orchestrator restart', {
         code: (error as any).code,
-        stack: error.stack?.split('\n').slice(0, 5).join('\n'),
         timestamp: new Date().toISOString()
       });
+      setImmediate(() => process.exit(1));
     });
 
     process.on('unhandledRejection', (reason) => {
-      console.error('💥 Unhandled Rejection:', {
-        reason: reason instanceof Error ? reason.message : String(reason),
-        stack: reason instanceof Error ? reason.stack?.split('\n').slice(0, 5).join('\n') : undefined,
+      console.error('Unhandled rejection; terminating for orchestrator restart', {
+        code: reason instanceof Error ? (reason as any).code : undefined,
         timestamp: new Date().toISOString()
       });
+      setImmediate(() => process.exit(1));
     });
   }
 
   async close(): Promise<void> {
-    if (this.closed || this.closing) {
-      console.log('✅ Server shutdown already in progress or complete');
-      return;
-    }
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = this.performClose();
+    return this.closePromise;
+  }
 
+  private async performClose(): Promise<void> {
+    if (this.closed) return;
+    // Readiness flips before the listener is closed, preventing new rollout
+    // traffic from arriving during the drain window.
     this.closing = true;
     console.log('🛑 Shutting down REMBR MCP server...');
 
-    for (const interval of this.intervalHandles) {
-      clearInterval(interval);
-    }
+    for (const interval of this.intervalHandles) clearInterval(interval);
     this.intervalHandles = [];
-    
-    // Stop optimization scheduler first
-    if (this.optimizationScheduler) {
-      console.log('🔄 Stopping auto-optimization scheduler...');
-      await this.optimizationScheduler.stop();
-      console.log('✅ Auto-optimization scheduler stopped');
+
+    let listenerClosed: Promise<void> = Promise.resolve();
+    if (this.httpServer?.listening) {
+      listenerClosed = new Promise(resolve => this.httpServer!.close(() => resolve()));
+      this.httpServer.closeIdleConnections?.();
     }
-    
+
+    if (this.optimizationScheduler) {
+      await Promise.race([
+        this.optimizationScheduler.stop(),
+        new Promise<void>(resolve => setTimeout(resolve, SHUTDOWN_COMPONENT_STOP_MS)),
+      ]);
+    }
+
+    const drained = await waitForDrain(
+      () => this.activeHttpRequests > 0 || MemoryService.totalInflight > 0,
+      this.shutdownDrainMs,
+    );
+    if (!drained) {
+      console.warn('HTTP/background drain deadline reached; force-closing remaining connections');
+      this.httpServer?.closeAllConnections?.();
+      for (const socket of this.httpSockets) socket.destroy();
+      this.httpSockets.clear();
+    }
+    await Promise.race([
+      listenerClosed,
+      new Promise<void>(resolve => setTimeout(resolve, 1_000)),
+    ]);
+
     await this.cleanup();
-    await this.db.close();
+    const databaseClosed = await Promise.race([
+      this.db.close().then(() => true),
+      new Promise<boolean>(resolve => setTimeout(() => resolve(false), SHUTDOWN_DB_CLOSE_MS)),
+    ]);
+    if (!databaseClosed) {
+      console.warn('Database close deadline reached; process shutdown will release remaining resources');
+    }
     this.closed = true;
     console.log('✅ Server shutdown complete');
   }
@@ -8011,25 +8080,7 @@ process.on('SIGINT', async () => {
 
 // SIGTERM: sent by Kubernetes on pod termination
 process.on('SIGTERM', async () => {
-  console.log('\n🛑 SIGTERM received — draining background jobs before shutdown...');
-
-  // Wait for in-flight background jobs (embedding, contradiction) to complete
-  // before closing DB connections, to avoid silent data loss on deploy.
-  const DRAIN_TIMEOUT_MS = 30_000; // Max 30s drain (Kubernetes default termination grace period)
-  const POLL_INTERVAL_MS = 500;
-  const deadline = Date.now() + DRAIN_TIMEOUT_MS;
-
-  while (MemoryService.totalInflight > 0 && Date.now() < deadline) {
-    console.log(`⏳ Waiting for ${MemoryService.totalInflight} in-flight background job(s) to finish...`);
-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
-  }
-
-  if (MemoryService.totalInflight > 0) {
-    console.warn(`⚠️  Timed out waiting for background jobs; ${MemoryService.totalInflight} job(s) may be lost.`);
-  } else {
-    console.log('✅ All background jobs drained.');
-  }
-
+  console.log('\n🛑 SIGTERM received — stopping admission and draining requests...');
   await server.close();
   process.exit(0);
 });

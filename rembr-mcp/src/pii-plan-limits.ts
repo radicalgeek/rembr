@@ -170,6 +170,20 @@ export function assertPIIOperationAllowed(
 
 /** Shared Redis client for PII scan quota tracking. Lazily initialised. */
 let _redisClient: Redis | null = null;
+const fallbackUsage = new Map<string, { count: number; expiresAt: number }>();
+const QUOTA_TTL_SECONDS = 62 * 86400;
+
+const RESERVE_SCAN_LUA = `
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local increment = tonumber(ARGV[1])
+local quota = tonumber(ARGV[2])
+if current + increment > quota then
+  return {0, current}
+end
+local next = current + increment
+redis.call('SET', KEYS[1], next, 'EX', ARGV[3])
+return {1, next}
+`;
 
 function getPIIRedis(): Redis | null {
   if (_redisClient) return _redisClient;
@@ -185,12 +199,40 @@ function getPIIRedis(): Redis | null {
           enableOfflineQueue: false,
           lazyConnect: true,
         });
-    _redisClient.on('error', () => { /* fail-open */ });
+    _redisClient.on('error', () => { /* bounded fallback handles outages */ });
     return _redisClient;
   } catch {
     return null;
   }
 }
+
+function reserveFallback(key: string, increment: number, limit: number): { allowed: boolean; count: number } {
+  const now = Date.now();
+  const prior = fallbackUsage.get(key);
+  const current = prior && prior.expiresAt > now ? prior.count : 0;
+  if (current + increment > limit) return { allowed: false, count: current };
+  const count = current + increment;
+  fallbackUsage.set(key, { count, expiresAt: now + QUOTA_TTL_SECONDS * 1000 });
+  return { allowed: true, count };
+}
+
+function mirrorFallback(key: string, count: number): void {
+  const existing = fallbackUsage.get(key);
+  if (!existing || count > existing.count) {
+    fallbackUsage.set(key, { count, expiresAt: Date.now() + QUOTA_TTL_SECONDS * 1000 });
+  }
+}
+
+/** Test seam for deterministic Redis outage/atomicity coverage. */
+export const __piiQuotaTesting = {
+  setRedisClient(client: Redis | null): void {
+    _redisClient = client;
+  },
+  reset(): void {
+    _redisClient = null;
+    fallbackUsage.clear();
+  },
+};
 
 /** Current UTC month bucket for monthly quota tracking (YYYY-MM). */
 function currentUtcMonth(): string {
@@ -224,8 +266,9 @@ export interface PIIScanQuotaResult {
  * Call this before executing detect, redact, or batch_scan operations.
  * - If the quota is exceeded, returns allowed=false (caller must reject with 429).
  * - Enterprise plans are always allowed (unlimited).
- * - On Redis failure the check fails-open (allowed=true) to prevent Redis
- *   downtime from blocking PII scanning entirely.
+ * - Redis reservations are an atomic compare-and-increment.
+ * - During a Redis outage, a bounded in-process counter preserves availability
+ *   without turning scans into an unmetered resource path.
  *
  * Redis key: `pii:scan:monthly:{tenantId}:{YYYY-MM}`
  * TTL: 62 days (ensures key survives across month boundaries for debugging).
@@ -242,6 +285,10 @@ export async function checkPIIScanQuota(
   const planTier = (plan || 'free').toLowerCase();
   const resetAt = nextMonthStart();
 
+  if (!Number.isSafeInteger(increment) || increment < 1 || increment > 1_000) {
+    throw new Error('PII scan quota increment must be an integer between 1 and 1000');
+  }
+
   // Enterprise: unlimited — skip Redis entirely
   if (limit === PII_SCANS_UNLIMITED) {
     return { allowed: true, count: 0, limit: -1, remaining: -1, resetsAt: resetAt, planTier };
@@ -252,33 +299,33 @@ export async function checkPIIScanQuota(
   const key = `pii:scan:monthly:${tenantId}:${month}`;
 
   if (!client) {
-    // Fail-open: Redis unavailable → allow but report 0 count
-    return { allowed: true, count: 0, limit, remaining: limit, resetsAt: resetAt, planTier };
+    const fallback = reserveFallback(key, increment, limit);
+    return {
+      allowed: fallback.allowed,
+      count: fallback.count,
+      limit,
+      remaining: Math.max(0, limit - fallback.count),
+      resetsAt: resetAt,
+      planTier,
+    };
   }
 
   try {
-    // Peek current count before deciding whether to increment
-    const raw = await client.get(key);
-    const current = raw ? parseInt(raw, 10) : 0;
-
-    if (current + increment > limit) {
-      // Over quota — do NOT increment
-      return {
-        allowed: false,
-        count: current,
-        limit,
-        remaining: Math.max(0, limit - current),
-        resetsAt: resetAt,
-        planTier,
-      };
-    }
-
-    // Increment and set TTL (62 days in seconds)
-    const newCount = await client.incrby(key, increment);
-    await client.expire(key, 62 * 86400);
+    const raw = await client.eval(
+      RESERVE_SCAN_LUA,
+      1,
+      key,
+      increment,
+      limit,
+      QUOTA_TTL_SECONDS,
+    ) as [number | string, number | string];
+    const allowed = Number(raw?.[0]) === 1;
+    const newCount = Number(raw?.[1] || 0);
+    if (!Number.isSafeInteger(newCount) || newCount < 0) throw new Error('Invalid quota response');
+    mirrorFallback(key, newCount);
 
     return {
-      allowed: true,
+      allowed,
       count: newCount,
       limit,
       remaining: Math.max(0, limit - newCount),
@@ -286,8 +333,15 @@ export async function checkPIIScanQuota(
       planTier,
     };
   } catch {
-    // Fail-open on Redis error
-    return { allowed: true, count: 0, limit, remaining: limit, resetsAt: resetAt, planTier };
+    const fallback = reserveFallback(key, increment, limit);
+    return {
+      allowed: fallback.allowed,
+      count: fallback.count,
+      limit,
+      remaining: Math.max(0, limit - fallback.count),
+      resetsAt: resetAt,
+      planTier,
+    };
   }
 }
 
@@ -314,12 +368,15 @@ export async function getPIIScanUsage(
   const key = `pii:scan:monthly:${tenantId}:${currentUtcMonth()}`;
 
   if (!client) {
-    return { allowed: true, count: 0, limit, remaining: limit, resetsAt: resetAt, planTier };
+    const fallback = fallbackUsage.get(key);
+    const count = fallback && fallback.expiresAt > Date.now() ? fallback.count : 0;
+    return { allowed: count < limit, count, limit, remaining: Math.max(0, limit - count), resetsAt: resetAt, planTier };
   }
 
   try {
     const raw = await client.get(key);
     const count = raw ? parseInt(raw, 10) : 0;
+    mirrorFallback(key, count);
     return {
       allowed: count < limit,
       count,
@@ -329,6 +386,8 @@ export async function getPIIScanUsage(
       planTier,
     };
   } catch {
-    return { allowed: true, count: 0, limit, remaining: limit, resetsAt: resetAt, planTier };
+    const fallback = fallbackUsage.get(key);
+    const count = fallback && fallback.expiresAt > Date.now() ? fallback.count : 0;
+    return { allowed: count < limit, count, limit, remaining: Math.max(0, limit - count), resetsAt: resetAt, planTier };
   }
 }

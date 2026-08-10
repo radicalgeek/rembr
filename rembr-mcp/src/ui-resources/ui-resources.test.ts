@@ -8,6 +8,7 @@ import { renderMemoryGraph, GraphData } from './memory-graph.js';
 import { renderContradictionDashboard, ContradictionData } from './contradiction-dashboard.js';
 import { renderAnalyticsDashboard, PredictiveAnalyticsData } from './analytics-dashboard.js';
 import { renderSnapshotTimeline, SnapshotTimelineData } from './snapshot-timeline.js';
+import { renderError, renderTemplate, safeJsonForHtml } from './index.js';
 
 // Mock data for testing
 const mockGraphData: GraphData = {
@@ -85,6 +86,76 @@ const mockContradictionData: ContradictionData = {
   ]
 };
 
+describe('Stored active-content hardening', () => {
+  const payload = '</script><script>globalThis.rembrPwned=true</script><img src=x onerror=alert(1)>';
+
+  it('serialises embedded JSON without allowing a script-element breakout', () => {
+    const serialised = safeJsonForHtml({ content: payload });
+
+    expect(serialised).not.toContain('</script>');
+    expect(serialised).not.toContain('<img');
+    expect(serialised).toContain('\\u003c/script\\u003e');
+  });
+
+  it('escapes template titles and subtitles', () => {
+    const html = renderTemplate({ title: payload, subtitle: payload, content: '<p>trusted</p>' });
+
+    expect(html).not.toContain(payload);
+    expect(html).toContain('&lt;/script&gt;');
+  });
+
+  it('keeps stored payloads inert across all primary UI renderers', () => {
+    const graphHtml = renderMemoryGraph({
+      ...mockGraphData,
+      nodes: [{ ...mockGraphData.nodes[0], label: payload, content: payload, metadata: { payload } }],
+    });
+    const contradictionHtml = renderContradictionDashboard({
+      contradictions: [{
+        ...mockContradictionData.contradictions[0],
+        explanation: payload,
+        memory_a: { ...mockContradictionData.contradictions[0].memory_a, content: payload, category: payload },
+        memory_b: { ...mockContradictionData.contradictions[0].memory_b, category: payload },
+        resolution_suggestions: [payload],
+      }],
+    });
+    const analyticsHtml = renderAnalyticsDashboard({
+      ...mockAnalyticsData,
+      category_usage_prediction: { [payload]: 1 },
+      quality_degradation_risk: {
+        ...mockAnalyticsData.quality_degradation_risk,
+        risk_factors: [payload],
+        recommendations: [payload],
+      },
+    });
+    const snapshotHtml = renderSnapshotTimeline({
+      snapshots: [{ ...mockTimelineData.snapshots[0], name: payload, description: payload }],
+    });
+
+    for (const html of [graphHtml, contradictionHtml, analyticsHtml, snapshotHtml]) {
+      expect(html).not.toContain(payload);
+      expect(html).not.toContain('<img src=x onerror=alert(1)>');
+      expect(html).not.toMatch(/<script\b/i);
+      expect(html).not.toMatch(/<[^>]+\son[a-z]+\s*=/i);
+      expect(html).toContain("Content-Security-Policy");
+    }
+  });
+
+  it('does not expose renderer errors or stack details in production', () => {
+    const previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const error = new Error('database host and private schema detail');
+      error.stack = 'PRIVATE STACK TRACE';
+      const html = renderError(error);
+      expect(html).toContain('The interface could not be rendered.');
+      expect(html).not.toContain(error.message);
+      expect(html).not.toContain('PRIVATE STACK TRACE');
+    } finally {
+      process.env.NODE_ENV = previous;
+    }
+  });
+});
+
 const mockAnalyticsData: PredictiveAnalyticsData = {
   memory_growth_prediction: {
     next_30_days: 150,
@@ -149,21 +220,21 @@ describe('Memory Graph UI', () => {
     expect(html).toContain('All Categories');
   });
 
-  it('should include graph data as JSON', () => {
+  it('should not embed executable graph data', () => {
     const html = renderMemoryGraph(mockGraphData);
-    expect(html).toContain('graphData');
-    expect(html).toContain('node-1');
-    expect(html).toContain('node-2');
+    expect(html).not.toContain('<script');
   });
 
-  it('should include D3.js script', () => {
+  it('should not include remote executable dependencies', () => {
     const html = renderMemoryGraph(mockGraphData);
-    expect(html).toContain('d3');
+    expect(html).not.toContain('d3js.org');
+    expect(html).not.toContain('cdn.jsdelivr.net');
   });
 
   it('should include metrics display', () => {
     const html = renderMemoryGraph(mockGraphData);
-    expect(html).toContain('total_nodes');
+    expect(html).toContain('Total Nodes');
+    expect(html).toContain('Total Edges');
   });
 
   it('should include export buttons', () => {
@@ -215,14 +286,16 @@ describe('Analytics Dashboard UI', () => {
     expect(html.length).toBeGreaterThan(0);
   });
 
-  it('should include Chart.js script', () => {
+  it('should remain static without Chart.js or executable scripts', () => {
     const html = renderAnalyticsDashboard(mockAnalyticsData);
-    expect(html).toContain('Chart');
+    expect(html).not.toContain('<script');
+    expect(html).not.toContain('cdn.jsdelivr.net');
   });
 
   it('should show memory growth predictions', () => {
     const html = renderAnalyticsDashboard(mockAnalyticsData);
-    expect(html).toContain('memory_growth');
+    expect(html).toContain('PREDICTED GROWTH');
+    expect(html).toContain('+150');
   });
 
   it('should include quality risk information', () => {
@@ -237,7 +310,8 @@ describe('Analytics Dashboard UI', () => {
 
   it('should include recommendations', () => {
     const html = renderAnalyticsDashboard(mockAnalyticsData);
-    expect(html).toContain('recommendations');
+    expect(html).toContain('Recommendations:');
+    expect(html).toContain('Review old memories');
   });
 });
 
@@ -260,19 +334,21 @@ describe('Snapshot Timeline UI', () => {
     expect(html).toContain('After Updates');
   });
 
-  it('should include D3.js for visualization', () => {
+  it('should not load D3 or any executable script', () => {
     const html = renderSnapshotTimeline(mockTimelineData);
-    expect(html).toContain('d3');
+    expect(html).not.toContain('<script');
+    expect(html).not.toContain('d3js.org');
   });
 
   it('should show memory counts', () => {
     const html = renderSnapshotTimeline(mockTimelineData);
-    expect(html).toContain('memory_count');
+    expect(html).toContain('Total Memories');
+    expect(html).toContain('35');
   });
 
   it('should include compare functionality', () => {
     const html = renderSnapshotTimeline(mockTimelineData);
-    expect(html).toContain('compare');
+    expect(html).toContain('Compare');
   });
 });
 
@@ -325,7 +401,8 @@ describe('UI Rendering Edge Cases', () => {
     expect(html).toBeDefined();
     // Should render without errors
     expect(html.length).toBeGreaterThan(0);
-    // The JSON should contain the escaped quotes
-    expect(html).toContain('\\"quotes\\"');
+    // Static release resources do not embed stored graph content or JSON.
+    expect(html).not.toContain('<script');
+    expect(html).not.toContain('Test with "quotes"');
   });
 });

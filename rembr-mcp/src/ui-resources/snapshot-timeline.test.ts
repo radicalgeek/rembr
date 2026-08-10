@@ -42,10 +42,11 @@ describe('snapshot-timeline', () => {
     expect(html).toContain('Snapshot Timeline');
   });
 
-  it('should include D3.js script', () => {
+  it('should omit remote executable timeline dependencies', () => {
     const html = renderSnapshotTimeline(mockData);
-    
-    expect(html).toContain('d3js.org');
+
+    expect(html).not.toContain('d3js.org');
+    expect(html).toContain("script-src 'none'");
   });
 
   it('should display snapshot count', () => {

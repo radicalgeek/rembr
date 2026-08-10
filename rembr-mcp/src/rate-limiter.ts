@@ -44,13 +44,23 @@ const WINDOW_SECONDS = 60;
 const BYPASS_PATHS = new Set(['/health', '/metrics', '/ping']);
 
 /** Per-plan limits (requests per window). Overridable via env. */
+function configuredLimit(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1 || value > 100_000_000) {
+    throw new Error(`${name} must be an integer between 1 and 100000000`);
+  }
+  return value;
+}
+
 export const PLAN_LIMITS: Record<string, number> = {
-  free: parseInt(process.env.RATE_LIMIT_FREE || '60', 10),
-  pro: parseInt(process.env.RATE_LIMIT_PRO || '300', 10),
-  team: parseInt(process.env.RATE_LIMIT_TEAM || '1000', 10),
-  business: parseInt(process.env.RATE_LIMIT_TEAM || '1000', 10),
-  enterprise: parseInt(process.env.RATE_LIMIT_ENTERPRISE || '1000000', 10),
-  default: parseInt(process.env.RATE_LIMIT_DEFAULT || '60', 10),
+  free: configuredLimit('RATE_LIMIT_FREE', 60),
+  pro: configuredLimit('RATE_LIMIT_PRO', 300),
+  team: configuredLimit('RATE_LIMIT_TEAM', 1_000),
+  business: configuredLimit('RATE_LIMIT_TEAM', 1_000),
+  enterprise: configuredLimit('RATE_LIMIT_ENTERPRISE', 1_000_000),
+  default: configuredLimit('RATE_LIMIT_DEFAULT', 60),
 };
 
 // ---------------------------------------------------------------------------
@@ -60,14 +70,18 @@ export const PLAN_LIMITS: Record<string, number> = {
 /** Window size in seconds for daily quota (24 hours). */
 const DAY_SECONDS = 86400;
 
-/** Per-plan daily request quotas. Overridable via env vars. */
+/**
+ * Per-plan daily transport-call quotas. This is distinct from the database
+ * `search_limit_daily`, but must never undercut the advertised search quota or
+ * valid searches would be throttled before reaching search accounting.
+ */
 export const DAILY_PLAN_LIMITS: Record<string, number> = {
-  free:       parseInt(process.env.DAILY_LIMIT_FREE       || '1000',     10),
-  pro:        parseInt(process.env.DAILY_LIMIT_PRO        || '100000',   10),
-  team:       parseInt(process.env.DAILY_LIMIT_TEAM       || '1000000',  10),
-  business:   parseInt(process.env.DAILY_LIMIT_BUSINESS   || '1000000',  10),
-  enterprise: parseInt(process.env.DAILY_LIMIT_ENTERPRISE || '10000000', 10),
-  default:    parseInt(process.env.DAILY_LIMIT_DEFAULT    || '1000',     10),
+  free:       configuredLimit('DAILY_LIMIT_FREE', 10_000),
+  pro:        configuredLimit('DAILY_LIMIT_PRO', 100_000),
+  team:       configuredLimit('DAILY_LIMIT_TEAM', 1_000_000),
+  business:   configuredLimit('DAILY_LIMIT_BUSINESS', 1_000_000),
+  enterprise: configuredLimit('DAILY_LIMIT_ENTERPRISE', 10_000_000),
+  default:    configuredLimit('DAILY_LIMIT_DEFAULT', 10_000),
 };
 
 // ---------------------------------------------------------------------------
@@ -94,7 +108,7 @@ function getRedis(): Redis | null {
     }
     redis.on('error', (err) => {
       // Log but don't crash — fall back to in-process store
-      console.error('[RateLimit] Redis error:', err.message);
+      console.error('[RateLimit] Redis connection error');
     });
     return redis;
   } catch {
@@ -147,6 +161,24 @@ function fallbackIncr(key: string, windowSeconds: number): number {
   entry.count += 1;
   return entry.count;
 }
+
+function mirrorFallbackCount(key: string, count: number, windowSeconds: number): void {
+  const existing = fallbackStore.get(key);
+  fallbackStore.set(key, {
+    count: Math.max(count, existing?.count || 0),
+    expiresAtMs: Math.max(existing?.expiresAtMs || 0, Date.now() + windowSeconds * 2 * 1000),
+  });
+}
+
+const RATE_LIMIT_LUA = `
+local count = redis.call('INCR', KEYS[1])
+local ttl = redis.call('TTL', KEYS[1])
+if ttl < 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+  ttl = tonumber(ARGV[1])
+end
+return {count, ttl}
+`;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -227,15 +259,20 @@ async function checkRateLimit(
   if (client) {
     // --- Redis path ---
     try {
-      const count = await client.incr(redisKey);
-      if (count === 1) {
-        await client.expire(redisKey, windowSeconds * 2);
+      const result = await client.eval(RATE_LIMIT_LUA, 1, redisKey, windowSeconds * 2) as [number | string, number | string];
+      const count = Number(result?.[0]);
+      const ttl = Number(result?.[1]);
+      if (!Number.isSafeInteger(count) || count < 1 || !Number.isFinite(ttl) || ttl < 0) {
+        throw new Error('Invalid Redis rate-limit response');
       }
+      // If Redis fails on the next request, the fail-closed local path resumes
+      // at least from the last distributed count rather than starting at one.
+      mirrorFallbackCount(redisKey, count, windowSeconds);
       return { allowed: count <= limit, count, limit, retryAfterSeconds };
     } catch (err) {
       // Redis error mid-request — fall through to in-process store rather
       // than silently allowing the request.
-      console.error('[RateLimit] Redis check failed, using in-process fallback:', (err as Error).message);
+      console.error('[RateLimit] Redis check failed; using the bounded in-process fallback');
     }
   } else {
     console.warn('[RateLimit] Redis unavailable — enforcing limits via in-process fallback store (per-pod).');
@@ -370,3 +407,22 @@ export function createRateLimitMiddleware(plan?: string) {
 
 /** Pre-built default middleware (free-tier limits, no plan context required). */
 export const defaultRateLimitMiddleware = createRateLimitMiddleware();
+
+export const __rateLimiterTesting = {
+  setRedisClient(client: Redis | null): void {
+    redis = client;
+  },
+  reset(): void {
+    redis = null;
+    fallbackStore.clear();
+  },
+  check(
+    identityKey: string,
+    limit: number,
+    windowSeconds: number,
+    windowKey: string | number,
+  ): Promise<RateLimitResult> {
+    return checkRateLimit(identityKey, limit, windowSeconds, windowKey);
+  },
+  script: RATE_LIMIT_LUA,
+};

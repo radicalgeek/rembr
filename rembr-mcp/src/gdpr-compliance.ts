@@ -90,53 +90,9 @@ export class GDPRComplianceService {
   // ── Schema ──────────────────────────────────────────────────────────────────
 
   async ensureSchema(): Promise<void> {
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS gdpr_deletion_requests (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        tenant_id UUID NOT NULL,
-        user_id UUID,
-        requested_by_user_id UUID,
-        request_type VARCHAR(50) NOT NULL DEFAULT 'full',
-        status VARCHAR(50) NOT NULL DEFAULT 'pending',
-        memories_deleted INTEGER DEFAULT 0,
-        contexts_deleted INTEGER DEFAULT 0,
-        snapshots_deleted INTEGER DEFAULT 0,
-        error_message TEXT,
-        completed_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS gdpr_consent_events (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        tenant_id UUID NOT NULL,
-        user_id UUID,
-        event_type VARCHAR(100) NOT NULL,
-        resource_type VARCHAR(50),
-        resource_id UUID,
-        previous_value JSONB,
-        new_value JSONB,
-        ip_address INET,
-        user_agent TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-
-      DO $$ BEGIN
-        ALTER TABLE memories ADD COLUMN IF NOT EXISTS pii_detected BOOLEAN DEFAULT FALSE;
-        ALTER TABLE memories ADD COLUMN IF NOT EXISTS pii_types TEXT[] DEFAULT '{}';
-        ALTER TABLE memories ADD COLUMN IF NOT EXISTS pii_confidence FLOAT;
-        ALTER TABLE memories ADD COLUMN IF NOT EXISTS pii_scanned_at TIMESTAMPTZ;
-        ALTER TABLE memories ADD COLUMN IF NOT EXISTS retention_policy VARCHAR(50) DEFAULT 'standard';
-        ALTER TABLE memories ADD COLUMN IF NOT EXISTS retention_expires_at TIMESTAMPTZ;
-      EXCEPTION WHEN duplicate_column THEN NULL;
-      END $$;
-
-      CREATE INDEX IF NOT EXISTS idx_gdpr_deletion_tenant ON gdpr_deletion_requests(tenant_id);
-      CREATE INDEX IF NOT EXISTS idx_gdpr_deletion_status ON gdpr_deletion_requests(status);
-      CREATE INDEX IF NOT EXISTS idx_gdpr_consent_tenant ON gdpr_consent_events(tenant_id, created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_memories_retention ON memories(retention_expires_at) WHERE retention_expires_at IS NOT NULL;
-      CREATE INDEX IF NOT EXISTS idx_memories_pii ON memories(tenant_id) WHERE pii_detected = TRUE;
-    `);
+    // Schema changes are deployment migrations. The production runtime role is
+    // deliberately not allowed to create or alter shared compliance tables.
+    return;
   }
 
   // ── Right to Erasure ────────────────────────────────────────────────────────
@@ -182,6 +138,11 @@ export class GDPRComplianceService {
    * Leaves the tenant record intact (billing/audit purposes) but marks memories as gdpr_deleted.
    */
   async processForgetMe(requestId: string, tenantId: string): Promise<DeletionRequest> {
+    void requestId;
+    void tenantId;
+    throw new Error('GDPR erasure processing is unavailable pending subject-scoped transactional implementation');
+
+    /* c8 ignore start -- retained below as design history until replaced
     await this.ensureSchema();
 
     // Mark as processing
@@ -313,6 +274,7 @@ export class GDPRComplianceService {
     } finally {
       client.release();
     }
+    c8 ignore stop */
   }
 
   getDeletionRequest(requestId: string, tenantId: string): Promise<DeletionRequest | null> {
@@ -341,6 +303,13 @@ export class GDPRComplianceService {
     policy: RetentionPolicy,
     opts: { user_id?: string; ip_address?: string } = {}
   ): Promise<void> {
+    void tenantId;
+    void memoryId;
+    void policy;
+    void opts;
+    throw new Error('Retention-policy mutation is unavailable pending audience-safe authorisation');
+
+    /* c8 ignore start -- retained below as design history until replaced
     await this.ensureSchema();
 
     const days = RETENTION_DAYS[policy];
@@ -369,6 +338,7 @@ export class GDPRComplianceService {
       new_value: { retention_policy: policy, retention_expires_at: expiresAt },
       ip_address: opts.ip_address,
     });
+    c8 ignore stop */
   }
 
   /**
@@ -381,6 +351,10 @@ export class GDPRComplianceService {
    * For scheduled admin-level cleanup, call this once per tenant.
    */
   async purgeExpiredMemories(tenantId: string): Promise<number> {
+    void tenantId;
+    throw new Error('Retention purge is unavailable pending audience-safe scheduled execution');
+
+    /* c8 ignore start -- retained below as design history until replaced
     await this.ensureSchema();
 
     const res = await this.pool.query(
@@ -392,6 +366,7 @@ export class GDPRComplianceService {
       [tenantId, new Date().toISOString()]
     );
     return res.rowCount ?? 0;
+    c8 ignore stop */
   }
 
   async getRetentionStats(tenantId: string): Promise<RetentionStats> {
@@ -497,6 +472,11 @@ export class GDPRComplianceService {
   // ── Data Export (Article 20 portability) ────────────────────────────────────
 
   async exportData(tenantId: string, userId?: string): Promise<GDPRExport> {
+    void tenantId;
+    void userId;
+    throw new Error('GDPR export is unavailable pending subject-scoped context and memory ownership enforcement');
+
+    /* c8 ignore start -- retained below as design history until replaced
     await this.ensureSchema();
 
     const userFilter = userId ? 'AND user_id = $2' : '';
@@ -549,5 +529,6 @@ export class GDPRComplianceService {
       total_memories: memories.rows.length,
       pii_detected_count: piiCount,
     };
+    c8 ignore stop */
   }
 }

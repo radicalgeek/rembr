@@ -117,6 +117,7 @@ class MaintenanceWorker {
         const contradictions = await this.service.enqueueContradictionDetectionJobs(tenant.tenant_id, this.enqueueLimit);
         const evolution = await this.service.enqueueMemoryEvolutionJobs(tenant.tenant_id, this.enqueueLimit);
         const cleanup = await this.service.enqueueExpiredMemoryCleanupJobs(tenant.tenant_id, this.enqueueLimit);
+        const expiredSnapshots = await this.service.cleanExpiredSnapshots(tenant.tenant_id, this.enqueueLimit);
         const processedMissing = await this.service.processEmbeddingBackfillBatch(tenant.tenant_id, this.batchSize);
         const processedStale = await this.service.processStaleEmbeddingBatch(tenant.tenant_id, this.batchSize);
         const processedRelationships = await this.service.processRelationshipInferenceBatch(
@@ -148,7 +149,7 @@ class MaintenanceWorker {
         contradictionsAdded += processedContradictions.added ?? 0;
         memoriesEvolved += processedEvolution.added ?? 0;
         memoriesPruned += processedEvolution.deleted ?? 0;
-        cleanupActions += processedCleanup.deleted ?? 0;
+        cleanupActions += (processedCleanup.deleted ?? 0) + expiredSnapshots;
         tenantHealth[tenant.tenant_id] = {
           missingEmbeddings: health.missing_embeddings,
           staleEmbeddings: health.stale_embeddings,

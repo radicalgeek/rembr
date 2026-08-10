@@ -261,11 +261,8 @@ export function getConsolidatedTools(): Tool[] {
           max_tokens: {
             type: 'number',
             description: '[all] Maximum tokens to return (truncates results to fit budget)',
-            minimum: 100
-          },
-          token_budget_category: {
-            type: 'string',
-            description: '[all] Budget category name to check against context_budgets table'
+            minimum: 100,
+            maximum: 250000
           }
         },
         required: ['operation']
@@ -504,11 +501,6 @@ export function getConsolidatedTools(): Tool[] {
             description: '[detect] Confidence threshold (0.0-1.0)',
             minimum: 0,
             maximum: 1
-          },
-          live_analysis: {
-            type: 'string',
-            enum: ['auto', 'always', 'never'],
-            description: '[detect] Run live analysis when stored contradiction relationships are missing (default: auto)'
           }
         },
         required: ['operation']

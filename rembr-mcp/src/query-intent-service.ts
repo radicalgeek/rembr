@@ -186,19 +186,32 @@ export class QueryIntentService {
   /**
    * Get memory distribution statistics to help with intent classification
    */
-  async getMemoryDistribution(tenantId: string, projectId?: string): Promise<Record<string, number>> {
+  async getMemoryDistribution(
+    tenantId: string,
+    projectId?: string,
+    userId?: string,
+  ): Promise<Record<string, number>> {
     const query = `
-      SELECT category, COUNT(*) as count
-      FROM memories 
-      WHERE tenant_id = $1 
-      ${projectId ? 'AND project_id = $2' : ''}
-      AND category IS NOT NULL
-      GROUP BY category
+      SELECT m.category, COUNT(*) as count
+      FROM memories m
+      LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+      WHERE m.tenant_id = $1
+        AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+        AND (
+          (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+          OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND (
+            p.id IS NULL OR p.is_personal = false OR p.owner_id = $3::uuid
+            OR EXISTS (SELECT 1 FROM project_members pm
+                       WHERE pm.project_id = p.id AND pm.user_id = $3::uuid)
+          ))
+        )
+        AND m.category IS NOT NULL
+      GROUP BY m.category
       ORDER BY count DESC
     `;
     
-    const params = projectId ? [tenantId, projectId] : [tenantId];
-    const result = await this.database.query(query, params);
+    const params = [tenantId, projectId || null, userId || null];
+    const result = await this.database.query(query, params, tenantId);
     
     const distribution: Record<string, number> = {};
     for (const row of result.rows) {

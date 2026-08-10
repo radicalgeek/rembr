@@ -15,6 +15,7 @@ function createMockDb() {
     getMemoryCount: async () => 4,
     getEmbeddingCount: async () => 3,
     getTodaySearchCount: async () => 0,
+    reserveSearchQuota: async () => undefined,
     searchMemories: async () => [
       {
         id: 'memory-text-hit',
@@ -28,7 +29,11 @@ function createMockDb() {
         relevance_score: 1
       }
     ],
-    query: async () => ({ rows: [] })
+    query: async (sql: string) => ({
+      rows: sql.includes('COUNT(*)::int AS total')
+        ? [{ total: 4, indexed: 3 }]
+        : []
+    })
   } as any;
 }
 
@@ -83,7 +88,7 @@ describe('MemoryService search diagnostics', () => {
     expect(results).toHaveLength(1);
     expect(results.search_metadata).toMatchObject({
       semantic_status: 'failed',
-      semantic_error: 'embedding endpoint unavailable',
+      semantic_error: 'Embedding-backed search failed',
       fallback_used: true,
       min_similarity: 0.5,
       embedding_coverage: 0.75

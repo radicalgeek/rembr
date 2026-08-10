@@ -49,6 +49,7 @@ BEGIN
   IF EXISTS (
     SELECT 1 FROM pg_proc WHERE proname = 'update_updated_at_column'
   ) THEN
+    DROP TRIGGER IF EXISTS compaction_schedules_updated_at ON compaction_schedules;
     CREATE TRIGGER compaction_schedules_updated_at
       BEFORE UPDATE ON compaction_schedules
       FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

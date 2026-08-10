@@ -1,0 +1,7 @@
+.git
+.env*
+node_modules
+coverage
+*.log
+Dockerfile*
+README.md

@@ -39,7 +39,13 @@ async function test() {
   const authService = new AuthService();
   
   // Generate test JWT
-  const testJWT = authService.generateJWT('test-tenant-123', 'test-user-456');
+  const testJWT = authService.generateJWT(
+    'test-tenant-123',
+    'test-user-456',
+    undefined,
+    0,
+    ['memory:read', 'memory:write', 'context:manage', 'snapshot:manage']
+  );
   console.log('Generated test JWT:', testJWT.substring(0, 50) + '...');
   
   // Verify JWT

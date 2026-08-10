@@ -16,6 +16,7 @@
  */
 
 import type { Request, Response, NextFunction } from 'express';
+import { constantTimeSecretEqual, singleHeaderValue } from '../security/secret-comparison.js';
 
 /** The header name clients must send. */
 export const ADMIN_KEY_HEADER = 'x-admin-key';
@@ -38,9 +39,9 @@ export function adminAuthMiddleware(req: Request, res: Response, next: NextFunct
     return;
   }
 
-  const provided = req.headers[ADMIN_KEY_HEADER] as string | undefined;
+  const provided = singleHeaderValue(req.headers[ADMIN_KEY_HEADER]);
 
-  if (!provided || provided !== adminApiKey) {
+  if (!provided || !constantTimeSecretEqual(adminApiKey, provided)) {
     res.status(401).json({ error: 'Unauthorized: X-Admin-Key required' });
     return;
   }

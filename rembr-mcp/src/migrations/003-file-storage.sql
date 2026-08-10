@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS memory_attachments (
   filename TEXT NOT NULL,
   content_type TEXT NOT NULL,
   size_bytes BIGINT NOT NULL,
+  upload_status VARCHAR(20) NOT NULL DEFAULT 'ready'
+    CHECK (upload_status IN ('pending', 'ready')),
   
   -- MinIO storage location
   minio_bucket TEXT NOT NULL,
@@ -49,7 +51,7 @@ CREATE TABLE IF NOT EXISTS tenant_storage_usage (
   tenant_id UUID PRIMARY KEY,
   total_bytes BIGINT DEFAULT 0,
   file_count INTEGER DEFAULT 0,
-  quota_bytes BIGINT NOT NULL DEFAULT 53687091200, -- 50GB default for test
+  quota_bytes BIGINT NOT NULL DEFAULT 104857600, -- 100 MiB free-plan default
   
   -- Timestamps
   updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -119,6 +121,6 @@ COMMENT ON COLUMN memory_attachments.minio_key IS 'Object key in MinIO (UUID-bas
 COMMENT ON COLUMN memory_attachments.is_private IS 'If TRUE, only user_id can access (follows memory privacy)';
 
 COMMENT ON TABLE tenant_storage_usage IS 'Track storage usage per tenant for quota enforcement';
-COMMENT ON COLUMN tenant_storage_usage.quota_bytes IS 'Storage quota in bytes (50GB test, 200GB prod)';
+COMMENT ON COLUMN tenant_storage_usage.quota_bytes IS 'Storage quota in bytes; initialised from the tenant plan or an explicit custom override';
 
 -- Migration complete

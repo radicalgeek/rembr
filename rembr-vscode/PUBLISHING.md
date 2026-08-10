@@ -89,7 +89,7 @@ Should include:
 Test what will be published without actually publishing:
 
 ```bash
-cd /Users/mark/rembr/rembr-client
+cd /path/to/rembr/rembr-client
 npm publish --dry-run
 ```
 
@@ -101,7 +101,7 @@ Review the output carefully. Should show:
 ### 2. Publish to npm
 
 ```bash
-cd /Users/mark/rembr/rembr-client
+cd /path/to/rembr/rembr-client
 
 # Publish as public scoped package
 npm publish --access public
@@ -143,7 +143,7 @@ npx rembr setup
 After successful publish, tag the release:
 
 ```bash
-cd /Users/mark/rembr
+cd /path/to/rembr
 git add rembr-client/
 git commit -m "RELEASE: @rembr/client v1.0.0
 
@@ -348,7 +348,7 @@ npm outdated
 
 **Ready to publish?** Run:
 ```bash
-cd /Users/mark/rembr/rembr-client
+cd /path/to/rembr/rembr-client
 npm publish --access public
 ```
 

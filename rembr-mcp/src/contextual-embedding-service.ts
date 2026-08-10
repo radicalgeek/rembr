@@ -109,7 +109,7 @@ export class ContextualEmbeddingService {
     const enhancedContent = this.enhanceContentForDomain(content, domain, category);
     
     // Generate embedding with domain-specific weights
-    const embedding = await this.generateContextualEmbedding(enhancedContent, domain);
+    const embedding = await this.generateContextualEmbedding(enhancedContent, domain, tenantId);
     
     // Calculate context weights
     const contextWeights = this.calculateContextWeights(content, domain, category);
@@ -255,9 +255,9 @@ export class ContextualEmbeddingService {
   /**
    * Generate contextual embedding with domain weights
    */
-  private async generateContextualEmbedding(enhancedContent: string, domain: string): Promise<number[]> {
+  private async generateContextualEmbedding(enhancedContent: string, domain: string, tenantId: string): Promise<number[]> {
     // Generate base embedding
-    const baseEmbedding = await this.embeddingProvider.generateEmbedding(enhancedContent);
+    const baseEmbedding = await this.embeddingProvider.generateEmbedding(enhancedContent, { tenantId });
     
     // Apply domain-specific transformations
     const domainContext = this.DOMAIN_CONTEXTS[domain];
@@ -428,22 +428,11 @@ export class ContextualEmbeddingService {
    * Database operations
    */
   private async createEmbeddingSpaceTable(): Promise<void> {
-    const query = `
-      CREATE TABLE IF NOT EXISTS embedding_spaces (
-        id UUID PRIMARY KEY,
-        tenant_id UUID NOT NULL,
-        name VARCHAR(255) NOT NULL,
-        description TEXT,
-        domain VARCHAR(100) NOT NULL,
-        model_config JSONB NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `;
-    
-    try {
-      await this.database.query(query);
-    } catch (error) {
-      console.log('Embedding spaces table creation skipped:', (error as Error).message);
+    const existing = await this.database.query(
+      `SELECT to_regclass('public.embedding_spaces') AS table_name`,
+    );
+    if (!existing.rows[0]?.table_name) {
+      throw new Error('Contextual embeddings are unavailable: migration 030 has not been applied');
     }
   }
 
@@ -468,11 +457,9 @@ export class ContextualEmbeddingService {
   private async storeContextualEmbedding(embedding: ContextualEmbedding): Promise<void> {
     // Store in enhanced memory_embeddings table or separate table
     // For now, this would require database schema updates
-    console.log('Contextual embedding created:', {
-      memory_id: embedding.memory_id,
-      space: embedding.embedding_space_id,
-      features: Object.keys(embedding.domain_features).length
-    });
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`Contextual embedding created with ${Object.keys(embedding.domain_features).length} features`);
+    }
   }
 
   private generateUUID(): string {
