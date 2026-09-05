@@ -23,6 +23,8 @@ import {
   shouldCapture,
 } from "./capture.js"
 import { RembrClient } from "./rembr-client.js"
+import { FileMemory } from "./file-memory.js"
+import { FallbackMemory } from "./fallback.js"
 
 const PLUGIN_ID = "memory-rembr"
 const AUTO_RECALL_TIMEOUT_MS = 3_000
@@ -84,6 +86,19 @@ export default definePluginEntry({
     const client = cfg.apiKey
       ? new RembrClient({ url: cfg.url, apiKey: cfg.apiKey, timeoutMs: cfg.timeoutMs })
       : null
+    const fileMemory = new FileMemory()
+    const fallback = new FallbackMemory({
+      client,
+      fileMemory,
+      fallbackOnFailure: cfg.fallbackOnFailure,
+      timeoutMs: cfg.timeoutMs,
+      probeIntervalMs: 5_000,
+      maxProbeIntervalMs: 60_000,
+    })
+
+    const onFallback = (reason: string) => {
+      api.logger.warn(`${PLUGIN_ID}: Rembr unavailable; using local file-based memory (${reason})`)
+    }
 
     /** Per-session index of the next message to consider for auto-capture. */
     const autoCaptureCursors = new Map<string, number>()
@@ -128,14 +143,14 @@ export default definePluginEntry({
             })
           }
           try {
-            const results = await client.recall(clip(query, cfg.recallMaxChars), {
+            const results = await fallback.recall(clip(query, cfg.recallMaxChars), {
               limit: limit ?? cfg.recallLimit,
               minSimilarity: cfg.minSimilarity,
-            })
+            }, onFallback)
             if (!results.trim()) {
-              return textResult("No relevant memories found.", { count: 0 })
+              return textResult("No relevant memories found.", { count: 0, source: fallback.isFallbackActive() ? "local" : "rembr" })
             }
-            return textResult(`${UNTRUSTED_PREAMBLE}\n\n${results}`, { source: "rembr" })
+            return textResult(`${UNTRUSTED_PREAMBLE}\n\n${results}`, { source: fallback.isFallbackActive() ? "local" : "rembr" })
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
             recordCooldown(message)
@@ -182,11 +197,13 @@ export default definePluginEntry({
             )
           }
           try {
-            const response = await client.remember(text, normalizeCategory(category, cfg.defaultCategory), {
-              source: PLUGIN_ID,
-              importance: importance ?? 0.7,
-            })
-            return textResult(response || `Stored: "${clip(text, 100)}"`, { action: "created" })
+            const response = await fallback.remember(
+              text,
+              normalizeCategory(category, cfg.defaultCategory),
+              { source: PLUGIN_ID, importance: importance ?? 0.7 },
+              onFallback,
+            )
+            return textResult(response || `Stored: "${clip(text, 100)}"`, { action: "created", source: fallback.isFallbackActive() ? "local" : "rembr" })
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
             api.logger.warn(`${PLUGIN_ID}: memory_store failed: ${message}`)
@@ -219,10 +236,10 @@ export default definePluginEntry({
               })
             }
             if (query) {
-              const results = await client.recall(clip(query, cfg.recallMaxChars), {
+              const results = await fallback.recall(clip(query, cfg.recallMaxChars), {
                 limit: 5,
                 minSimilarity: cfg.minSimilarity,
-              })
+              }, onFallback)
               if (!results.trim()) {
                 return textResult("No matching memories found.", { found: 0 })
               }
@@ -255,10 +272,10 @@ export default definePluginEntry({
       try {
         const recall = await withTimeout(
           AUTO_RECALL_TIMEOUT_MS,
-          client.recall(clip(event.prompt, cfg.recallMaxChars), {
+          fallback.recall(clip(event.prompt, cfg.recallMaxChars), {
             limit: cfg.recallLimit,
             minSimilarity: cfg.minSimilarity,
-          }),
+          }, onFallback),
         )
         if (recall.status === "timeout") {
           api.logger.warn(
@@ -300,11 +317,16 @@ export default definePluginEntry({
             if (!shouldCapture(text, { customTriggers: cfg.customTriggers, maxChars: cfg.captureMaxChars })) {
               continue
             }
-            await client.remember(text.trim(), detectCategory(text, cfg.defaultCategory), {
-              source: PLUGIN_ID,
-              importance: 0.7,
-              autoCaptured: true,
-            })
+            await fallback.remember(
+              text.trim(),
+              detectCategory(text, cfg.defaultCategory),
+              {
+                source: PLUGIN_ID,
+                importance: 0.7,
+                autoCaptured: true,
+              },
+              onFallback,
+            )
             stored++
           }
           if (cursorKey) autoCaptureCursors.set(cursorKey, index + 1)
@@ -335,10 +357,21 @@ export default definePluginEntry({
           api.logger.warn(`${PLUGIN_ID}: no API key configured; memory tools will report how to configure`)
           return
         }
-        api.logger.info(`${PLUGIN_ID}: initialized (server: ${cfg.url}, embeddings: server-side)`)
-        void client.health().then((ok) => {
-          if (!ok) {
-            api.logger.warn(`${PLUGIN_ID}: Rembr health check failed (${cfg.url}); recall/store may not work`)
+        api.logger.info(`${PLUGIN_ID}: initialized (server: ${cfg.url}, embeddings: server-side, fallback: ${cfg.fallbackOnFailure ? "on" : "off"})`)
+        // Boot-time probe: if Rembr is unreachable, log a clear warning and begin
+        // recovering so the layer re-enables Rembr automatically once it returns.
+        void fallback.probe().then((result) => {
+          if (!result.reachable) {
+            api.logger.warn(
+              `${PLUGIN_ID}: Rembr unreachable at boot (${result.error}); serving memory from local file-based store`,
+            )
+            fallback.startRecovery((reachable, reason) => {
+              if (reachable) {
+                api.logger.info(`${PLUGIN_ID}: Rembr recovered; resuming server-backed memory`)
+              } else {
+                api.logger.warn(`${PLUGIN_ID}: Rembr still unreachable after recovery attempt (${reason})`)
+              }
+            })
           }
         })
       },

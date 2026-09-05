@@ -7,6 +7,8 @@
     "index.ts",
     "config.ts",
     "rembr-client.ts",
+    "file-memory.ts",
+    "fallback.ts",
     "capture.ts",
     "openclaw.plugin.json",
     "README.md"
@@ -42,7 +44,7 @@
     "typebox": "1.1.39"
   },
   "devDependencies": {
-    "@types/node": "^24.2.0",
+    "@types/node": "^24.13.3",
     "openclaw": "^2026.6.5",
     "typescript": "^5.9.3",
     "vitest": "^1.6.1"

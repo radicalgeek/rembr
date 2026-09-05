@@ -44,6 +44,7 @@ export type RembrMemoryConfig = {
   customTriggers?: string[]
   defaultCategory: RembrCategory
   timeoutMs: number
+  fallbackOnFailure: boolean
 }
 
 export const DEFAULT_URL = "https://rembr.ai/mcp"
@@ -65,6 +66,7 @@ const ALLOWED_KEYS = [
   "customTriggers",
   "defaultCategory",
   "timeoutMs",
+  "fallbackOnFailure",
 ] as const
 
 /** Expand ${ENV_VAR} references so secrets never live in config files. */
@@ -167,6 +169,7 @@ export function createRembrConfigSchema(env: Record<string, string | undefined> 
         customTriggers,
         defaultCategory,
         timeoutMs: readBoundedNumber(cfg.timeoutMs, "timeoutMs", DEFAULT_TIMEOUT_MS, 1_000, 120_000),
+        fallbackOnFailure: readBoolean(cfg.fallbackOnFailure, "fallbackOnFailure", true),
       }
     },
   }
