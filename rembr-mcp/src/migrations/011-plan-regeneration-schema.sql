@@ -30,15 +30,17 @@ CREATE TABLE IF NOT EXISTS task_iterations (
 );
 
 -- Indexes for iteration queries
-CREATE INDEX idx_task_iterations_tenant ON task_iterations(tenant_id);
-CREATE INDEX idx_task_iterations_task ON task_iterations(task_id);
-CREATE INDEX idx_task_iterations_started_at ON task_iterations(started_at DESC);
-CREATE INDEX idx_task_iterations_attempt ON task_iterations(attempt_number);
+CREATE INDEX IF NOT EXISTS idx_task_iterations_tenant ON task_iterations(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_task_iterations_task ON task_iterations(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_iterations_started_at ON task_iterations(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_iterations_attempt ON task_iterations(attempt_number);
 
 -- Enable RLS
 ALTER TABLE task_iterations ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS task_iterations_tenant_isolation ON task_iterations;
 CREATE POLICY task_iterations_tenant_isolation ON task_iterations
-    USING (tenant_id = current_setting('app.current_tenant_id', TRUE)::uuid);
+    USING (tenant_id::text = current_setting('app.current_tenant', TRUE))
+    WITH CHECK (tenant_id::text = current_setting('app.current_tenant', TRUE));
 
 
 -- ============================================================================
@@ -58,29 +60,32 @@ CREATE TABLE IF NOT EXISTS plan_regenerations (
     triggered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     resolved_at TIMESTAMPTZ,
     new_plan TEXT,
-    metadata JSONB DEFAULT '{}'::jsonb,
-    
-    CONSTRAINT plan_regenerations_tenant_task_fk 
-        FOREIGN KEY (tenant_id, task_id) 
-        REFERENCES task_iterations(tenant_id, task_id)
-        ON DELETE CASCADE
+    metadata JSONB DEFAULT '{}'::jsonb
 );
 
+-- task_iterations contains multiple attempts per logical task, so
+-- (tenant_id, task_id) is deliberately not unique and cannot be a valid FK
+-- target. Migration 012 creates the canonical tasks table later in the chain;
+-- until the migration order is consolidated, tenant/task integrity is enforced
+-- by the service's exact predicates rather than an invalid foreign key.
+
 -- Indexes for regeneration queries
-CREATE INDEX idx_plan_regenerations_tenant ON plan_regenerations(tenant_id);
-CREATE INDEX idx_plan_regenerations_task ON plan_regenerations(task_id);
-CREATE INDEX idx_plan_regenerations_triggered_at ON plan_regenerations(triggered_at DESC);
-CREATE INDEX idx_plan_regenerations_reason_type ON plan_regenerations(reason_type);
-CREATE INDEX idx_plan_regenerations_resolved ON plan_regenerations(resolved_at) WHERE resolved_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_plan_regenerations_tenant ON plan_regenerations(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_plan_regenerations_task ON plan_regenerations(task_id);
+CREATE INDEX IF NOT EXISTS idx_plan_regenerations_triggered_at ON plan_regenerations(triggered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_plan_regenerations_reason_type ON plan_regenerations(reason_type);
+CREATE INDEX IF NOT EXISTS idx_plan_regenerations_resolved ON plan_regenerations(resolved_at) WHERE resolved_at IS NOT NULL;
 
 -- GIN indexes for JSONB queries
-CREATE INDEX idx_plan_regenerations_context ON plan_regenerations USING GIN (context_snapshot);
-CREATE INDEX idx_plan_regenerations_prompt ON plan_regenerations USING GIN (generated_prompt);
+CREATE INDEX IF NOT EXISTS idx_plan_regenerations_context ON plan_regenerations USING GIN (context_snapshot);
+CREATE INDEX IF NOT EXISTS idx_plan_regenerations_prompt ON plan_regenerations USING GIN (generated_prompt);
 
 -- Enable RLS
 ALTER TABLE plan_regenerations ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS plan_regenerations_tenant_isolation ON plan_regenerations;
 CREATE POLICY plan_regenerations_tenant_isolation ON plan_regenerations
-    USING (tenant_id = current_setting('app.current_tenant_id', TRUE)::uuid);
+    USING (tenant_id::text = current_setting('app.current_tenant', TRUE))
+    WITH CHECK (tenant_id::text = current_setting('app.current_tenant', TRUE));
 
 
 -- ============================================================================

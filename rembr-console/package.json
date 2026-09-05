@@ -28,6 +28,6 @@
   "author": "Mark @ radicalgeek",
   "license": "MIT",
   "devDependencies": {
-    "vitest": "^1.6.1"
+    "vitest": "^4.1.10"
   }
 }

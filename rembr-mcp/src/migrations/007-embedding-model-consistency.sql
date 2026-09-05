@@ -38,13 +38,13 @@ BEGIN
     WHERE model_fingerprint IS NULL
   LOOP
     -- Compute fingerprint: SHA-256(provider || model || dimensions)
-    v_fingerprint := encode(
-      digest(
+    v_fingerprint := pg_catalog.encode(
+      pg_catalog.sha256(pg_catalog.convert_to(
         COALESCE(v_row.provider, '') || '|' ||
         COALESCE(v_row.model, '') || '|' ||
         COALESCE(v_row.dimensions::text, ''),
-        'sha256'
-      ),
+        'UTF8'
+      )),
       'hex'
     );
 

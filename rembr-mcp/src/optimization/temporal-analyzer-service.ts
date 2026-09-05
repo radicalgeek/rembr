@@ -69,9 +69,6 @@ export class TemporalAnalyzerService {
     tenantId: string,
     outdatedThresholdDays?: number
   ): Promise<FreshnessAnalysis[]> {
-    // Set tenant context
-    await this.db.query('SELECT set_config($1, $2, FALSE)', ['app.current_tenant', tenantId]);
-
     // Query memories with access stats
     const result = await this.db.query(`
       SELECT 
@@ -83,7 +80,7 @@ export class TemporalAnalyzerService {
       FROM memories m
       WHERE m.tenant_id = $1
       ORDER BY m.created_at DESC
-    `, [tenantId]);
+    `, [tenantId], tenantId);
 
     const now = new Date();
     const analyses: FreshnessAnalysis[] = [];
@@ -139,8 +136,6 @@ export class TemporalAnalyzerService {
   async markOutdated(memoryIds: string[], tenantId: string): Promise<number> {
     if (memoryIds.length === 0) return 0;
 
-    await this.db.query('SELECT set_config($1, $2, FALSE)', ['app.current_tenant', tenantId]);
-
     const result = await this.db.query(`
       UPDATE memories
       SET metadata = jsonb_set(
@@ -153,7 +148,7 @@ export class TemporalAnalyzerService {
         to_jsonb(NOW()::text)
       )
       WHERE id = ANY($1)
-    `, [memoryIds]);
+    `, [memoryIds], tenantId);
 
     return result.rowCount || 0;
   }
@@ -169,8 +164,6 @@ export class TemporalAnalyzerService {
       return { archivedCount: 0, memoryIds: [] };
     }
 
-    await this.db.query('SELECT set_config($1, $2, FALSE)', ['app.current_tenant', tenantId]);
-
     // Copy to archived_memories
     await this.db.query(`
       INSERT INTO archived_memories (
@@ -183,12 +176,12 @@ export class TemporalAnalyzerService {
       FROM memories m
       LEFT JOIN memory_embeddings me ON m.id = me.memory_id
       WHERE m.id = ANY($1)
-    `, [memoryIds]);
+    `, [memoryIds], tenantId);
 
     // Delete from memories
     const result = await this.db.query(`
       DELETE FROM memories WHERE id = ANY($1) AND tenant_id = $2
-    `, [memoryIds, tenantId]);
+    `, [memoryIds, tenantId], tenantId);
 
     return {
       archivedCount: result.rowCount || 0,

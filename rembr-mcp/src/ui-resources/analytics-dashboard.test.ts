@@ -45,10 +45,11 @@ describe('analytics-dashboard', () => {
     expect(html).toContain('Predictive Analytics');
   });
 
-  it('should include Chart.js script', () => {
+  it('should omit remote executable chart dependencies', () => {
     const html = renderAnalyticsDashboard(mockData);
-    
-    expect(html).toContain('chart.js');
+
+    expect(html).not.toContain('chart.js');
+    expect(html).toContain("script-src 'none'");
   });
 
   it('should display growth prediction', () => {

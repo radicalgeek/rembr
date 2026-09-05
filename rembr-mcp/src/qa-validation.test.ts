@@ -19,12 +19,12 @@ import { PLAN_LIMITS, createRateLimitMiddleware } from './rate-limiter.js';
 // Daily limits (REM-48) — defined inline so this test file doesn't depend on
 // the REM-48 branch before it merges into main.
 const DAILY_PLAN_LIMITS: Record<string, number> = {
-  free:       1000,
+  free:       10000,
   pro:        100000,
   team:       1000000,
   business:   1000000,
   enterprise: 10000000,
-  default:    1000,
+  default:    10000,
 };
 import { getPIICapabilities, clampSensitivity, assertPIIOperationAllowed, PII_PLAN_CAPABILITIES } from './pii-plan-limits.js';
 
@@ -136,7 +136,7 @@ describe('Plan-tier capability escalation (QA)', () => {
 // Daily Rate Limit Configuration (REM-48)
 // ─────────────────────────────────────────────────────────
 describe('Daily rate limit configuration (QA)', () => {
-  it('free plan: 1,000 req/day', () => expect(DAILY_PLAN_LIMITS.free).toBe(1000));
+  it('free plan: 10,000 calls/day, matching the advertised search allowance', () => expect(DAILY_PLAN_LIMITS.free).toBe(10000));
   it('pro plan: 100,000 req/day', () => expect(DAILY_PLAN_LIMITS.pro).toBe(100000));
   it('team plan: 1,000,000 req/day', () => expect(DAILY_PLAN_LIMITS.team).toBe(1000000));
   it('enterprise: > team', () => expect(DAILY_PLAN_LIMITS.enterprise).toBeGreaterThan(DAILY_PLAN_LIMITS.team));

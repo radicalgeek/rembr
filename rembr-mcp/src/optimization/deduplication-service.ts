@@ -75,9 +75,6 @@ export class DeduplicationService {
     similarityThreshold: number = 0.85,
     batchSize: number = 100
   ): Promise<DuplicateCluster[]> {
-    // Set tenant context for RLS
-    await this.db.query('SELECT set_config($1, $2, FALSE)', ['app.current_tenant', tenantId]);
-
     // Load all memories with embeddings
     const result = await this.db.query(`
       SELECT m.id, m.content, m.created_at, m.category, me.embedding
@@ -86,7 +83,7 @@ export class DeduplicationService {
       WHERE m.tenant_id = $1
       ORDER BY m.created_at ASC
       LIMIT $2
-    `, [tenantId, batchSize]);
+    `, [tenantId, batchSize], tenantId);
 
     const memories = result.rows.map((row: any) => ({
       ...row,
@@ -160,9 +157,6 @@ export class DeduplicationService {
       throw new Error('Cluster must have at least 2 memories to merge');
     }
 
-    // Set tenant context
-    await this.db.query('SELECT set_config($1, $2, FALSE)', ['app.current_tenant', tenantId]);
-
     // Sort by created_at to keep oldest
     const sorted = [...cluster.memories].sort((a, b) => 
       a.created_at.getTime() - b.created_at.getTime()
@@ -204,7 +198,7 @@ export class DeduplicationService {
     `, [
       JSON.stringify(duplicates.map(d => d.id)),
       canonical.id
-    ]);
+    ], tenantId);
 
     return {
       keptMemoryId: canonical.id,
@@ -238,10 +232,10 @@ export class DeduplicationService {
       FROM memories m
       LEFT JOIN memory_embeddings me ON m.id = me.memory_id
       WHERE m.id = $3
-    `, [reason, replacedById, memoryId]);
+    `, [reason, replacedById, memoryId], tenantId);
 
     // Delete from memories
-    await this.db.query('DELETE FROM memories WHERE id = $1 AND tenant_id = $2', [memoryId, tenantId]);
+    await this.db.query('DELETE FROM memories WHERE id = $1 AND tenant_id = $2', [memoryId, tenantId], tenantId);
   }
 
   /**
@@ -327,11 +321,9 @@ export class DeduplicationService {
     duplicateClusters: number;
     estimatedDuplicates: number;
   }> {
-    await this.db.query('SELECT set_config($1, $2, FALSE)', ['app.current_tenant', tenantId]);
-
     const result = await this.db.query(`
       SELECT COUNT(*) as count FROM memories WHERE tenant_id = $1
-    `, [tenantId]);
+    `, [tenantId], tenantId);
 
     const clusters = await this.findDuplicateClusters(tenantId);
 

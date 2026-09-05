@@ -190,7 +190,7 @@ Run the maintenance worker with any OpenAI-compatible chat endpoint, including l
 TEXT_GENERATION_PROVIDER=openai-compatible
 LM_STUDIO_BASE_URL=http://your-openai-compatible-host:4000/v1
 LM_STUDIO_MODEL=qwen3
-MEMORY_EVOLUTION_APPLY_ENABLED=true
+MEMORY_EVOLUTION_APPLY_ENABLED=false
 ```
 
 ### RLM And Task Workflows
@@ -227,6 +227,13 @@ Rembr is intentionally exposed through MCP so it can be used by multiple agent r
 git clone https://github.com/radicalgeek/rembr.git
 cd rembr
 cp .env.example .env
+
+# Before starting, edit .env and fill every required value. Generate distinct
+# values for POSTGRES_PASSWORD, DB_APP_PASSWORD, JWT_SECRET, ADMIN_API_KEY,
+# API_KEY_SECRET, METRICS_SECRET and REMBR_CONSOLE_AUTH_TOKEN. For example,
+# `openssl rand -hex 32` produces a suitable value for each one.
+${EDITOR:-vi} .env
+
 docker compose --profile ollama up -d --build
 docker compose exec ollama ollama pull nomic-embed-text
 
@@ -236,14 +243,14 @@ node rembr-mcp/scripts/bootstrap-tenant.mjs \
 docker compose up -d rembr-console
 ```
 
-Configure your MCP client with your Rembr endpoint and API key:
+Configure your MCP client with the local endpoint and the API key minted above:
 
 ```json
 {
   "mcpServers": {
     "rembr": {
       "type": "http",
-      "url": "https://mcp.rembr.ai/mcp",
+      "url": "http://127.0.0.1:3000/mcp",
       "headers": {
         "x-api-key": "your_api_key_here"
       }

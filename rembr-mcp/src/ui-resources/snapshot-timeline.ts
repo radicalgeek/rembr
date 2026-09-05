@@ -11,7 +11,7 @@
  * - Token usage visualization
  */
 
-import { renderTemplate, SCRIPT_INCLUDES } from './index.js';
+import { renderTemplate, SCRIPT_INCLUDES, safeJsonForHtml } from './index.js';
 
 export interface SnapshotTimelineData {
   snapshots: Array<{
@@ -36,7 +36,7 @@ export interface SnapshotTimelineData {
  * Render the snapshot timeline UI
  */
 export function renderSnapshotTimeline(data: SnapshotTimelineData): string {
-  const dataJson = JSON.stringify(data, null, 2);
+  const dataJson = safeJsonForHtml(data);
   
   // Sort snapshots by created_at
   const sortedSnapshots = [...data.snapshots].sort(
@@ -48,7 +48,7 @@ export function renderSnapshotTimeline(data: SnapshotTimelineData): string {
     const isExpired = snapshot.expires_at && new Date(snapshot.expires_at) < new Date();
     
     return `
-      <div class="timeline-item" data-snapshot-id="${snapshot.id}" data-index="${index}">
+      <div class="timeline-item" data-snapshot-id="${escapeHtml(snapshot.id)}" data-index="${index}">
         <div class="timeline-marker"></div>
         <div class="timeline-content">
           <div class="snapshot-card ${isExpired ? 'expired' : ''}" id="snapshot-${index}">
@@ -57,7 +57,7 @@ export function renderSnapshotTimeline(data: SnapshotTimelineData): string {
               <div style="flex: 1;">
                 <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem;">
                   <div style="font-weight: 600; font-size: 1rem;">
-                    ${snapshot.name || `Snapshot ${index + 1}`}
+                    ${escapeHtml(snapshot.name || `Snapshot ${index + 1}`)}
                   </div>
                   ${isExpired ? '<span class="rembr-badge rembr-badge-error">Expired</span>' : ''}
                 </div>
@@ -108,7 +108,7 @@ export function renderSnapshotTimeline(data: SnapshotTimelineData): string {
                         <div style="background: var(--rembr-bg); padding: 1rem; border-radius: 6px; border-left: 3px solid var(--rembr-primary);">
                           <div style="display: flex; align-items: center; justify-content: between; margin-bottom: 0.5rem;">
                             <div style="display: flex; gap: 0.5rem; align-items: center; flex: 1;">
-                              ${mem.category ? `<span class="rembr-badge rembr-badge-primary" style="font-size: 0.65rem;">${mem.category}</span>` : ''}
+                              ${mem.category ? `<span class="rembr-badge rembr-badge-primary" style="font-size: 0.65rem;">${escapeHtml(mem.category)}</span>` : ''}
                               <span style="font-size: 0.75rem; color: var(--rembr-text-secondary);">
                                 Relevance: ${(mem.relevance_score * 100).toFixed(0)}%
                               </span>
@@ -307,7 +307,7 @@ export function renderSnapshotTimeline(data: SnapshotTimelineData): string {
               <!-- Snapshot A -->
               <div>
                 <div style="font-weight: 600; margin-bottom: 0.5rem; font-size: 1.125rem;">
-                  \${snapshotA.name || 'Snapshot ' + (indexA + 1)}
+                  \${escapeHtml(snapshotA.name || 'Snapshot ' + (indexA + 1))}
                 </div>
                 <div style="font-size: 0.75rem; color: var(--rembr-text-secondary); margin-bottom: 1rem;">
                   \${formatDate(snapshotA.created_at)}
@@ -323,7 +323,7 @@ export function renderSnapshotTimeline(data: SnapshotTimelineData): string {
               <!-- Snapshot B -->
               <div>
                 <div style="font-weight: 600; margin-bottom: 0.5rem; font-size: 1.125rem;">
-                  \${snapshotB.name || 'Snapshot ' + (indexB + 1)}
+                  \${escapeHtml(snapshotB.name || 'Snapshot ' + (indexB + 1))}
                 </div>
                 <div style="font-size: 0.75rem; color: var(--rembr-text-secondary); margin-bottom: 1rem;">
                   \${formatDate(snapshotB.created_at)}
@@ -448,7 +448,11 @@ export function renderSnapshotTimeline(data: SnapshotTimelineData): string {
       </script>
 
       <script>
-        function escapeHtml(text) { return text; }
+        function escapeHtml(value) {
+          return String(value ?? '').replace(/[&<>"']/g, character => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+          })[character]);
+        }
         function formatDate(date) {
           return new Date(date).toLocaleString('en-US', { 
             month: 'short', 

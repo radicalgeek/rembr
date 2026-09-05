@@ -90,8 +90,6 @@ export class QualityScorerService {
     tenantId: string,
     projectId?: string
   ): Promise<QualityMetrics> {
-    await this.db.query('SELECT set_config($1, $2, FALSE)', ['app.current_tenant', tenantId]);
-
     // Get memory counts
     const memoryStats = await this.getMemoryStats(tenantId, projectId);
     
@@ -157,8 +155,6 @@ export class QualityScorerService {
    * @returns Inserted metric ID
    */
   async storeMetrics(metrics: QualityMetrics): Promise<string> {
-    await this.db.query('SELECT set_config($1, $2, FALSE)', ['app.current_tenant', metrics.tenantId]);
-
     const result = await this.db.query(`
       INSERT INTO graph_quality_metrics (
         tenant_id, project_id,
@@ -190,7 +186,7 @@ export class QualityScorerService {
       metrics.overallQualityScore,
       JSON.stringify(metrics.scores),
       metrics.measuredAt
-    ]);
+    ], metrics.tenantId);
 
     return result.rows[0].id;
   }
@@ -242,8 +238,6 @@ export class QualityScorerService {
    * @returns Array of detected anomalies
    */
   async detectAnomalies(tenantId: string): Promise<string[]> {
-    await this.db.query('SELECT set_config($1, $2, FALSE)', ['app.current_tenant', tenantId]);
-
     // Get last 7 measurements
     const result = await this.db.query(`
       SELECT overall_quality_score, measured_at
@@ -251,7 +245,7 @@ export class QualityScorerService {
       WHERE tenant_id = $1
       ORDER BY measured_at DESC
       LIMIT 7
-    `, [tenantId]);
+    `, [tenantId], tenantId);
 
     if (result.rows.length < 3) {
       return []; // Not enough data for trend analysis
@@ -291,7 +285,7 @@ export class QualityScorerService {
       FULL OUTER JOIN archived_memories am ON m.tenant_id = am.tenant_id
       WHERE m.tenant_id = $1 OR am.tenant_id = $1
       ${projectId ? 'AND (m.project_id = $2 OR am.project_id = $2)' : ''}
-    `, projectId ? [tenantId, projectId] : [tenantId]);
+    `, projectId ? [tenantId, projectId] : [tenantId], tenantId);
 
     const active = Number(result.rows[0]?.active || 0);
     const archived = Number(result.rows[0]?.archived || 0);
@@ -332,7 +326,7 @@ export class QualityScorerService {
       FROM memories
       WHERE tenant_id = $1
       ${projectId ? 'AND project_id = $2' : ''}
-    `, projectId ? [tenantId, projectId] : [tenantId]);
+    `, projectId ? [tenantId, projectId] : [tenantId], tenantId);
 
     return {
       freshMemories: Number(result.rows[0]?.fresh || 0),
@@ -368,7 +362,7 @@ export class QualityScorerService {
         SUM(CASE WHEN rel_count = 0 THEN 1 ELSE 0 END)::int as orphaned,
         SUM(CASE WHEN rel_count > 10 THEN 1 ELSE 0 END)::int as highly_connected
       FROM memory_stats
-    `, projectId ? [tenantId, projectId] : [tenantId]);
+    `, projectId ? [tenantId, projectId] : [tenantId], tenantId);
 
     const stats = result.rows[0];
     const totalRel = Number(stats?.total_rel || 0);

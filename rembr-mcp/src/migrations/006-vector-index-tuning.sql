@@ -41,7 +41,7 @@
 -- It is a GUC (Grand Unified Configuration) parameter that can be set:
 --   - Per-session     : SET hnsw.ef_search = 100;
 --   - Per-transaction : SET LOCAL hnsw.ef_search = 100;
---   - Globally        : ALTER DATABASE rembr SET hnsw.ef_search = 100;
+--   - Globally        : ALTER DATABASE <database_name> SET hnsw.ef_search = 100;
 --
 -- Default pgvector value: 40 (pgvector ≥ 0.6)
 -- Recommended for rembr:  64 — matches ef_construction, gives ~97 % recall
@@ -65,7 +65,14 @@
 
 -- Set the recommended ef_search default at the database level.
 -- Individual queries can override with SET hnsw.ef_search = <n> for the session.
-ALTER DATABASE rembr SET hnsw.ef_search = 64;
+DO $set_database_default$
+BEGIN
+  EXECUTE pg_catalog.format(
+    'ALTER DATABASE %I SET hnsw.ef_search = 64',
+    pg_catalog.current_database()
+  );
+END
+$set_database_default$;
 
 -- Document the index parameters in a metadata table for observability.
 CREATE TABLE IF NOT EXISTS vector_index_config (

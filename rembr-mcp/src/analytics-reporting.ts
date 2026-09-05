@@ -10,6 +10,11 @@
 
 import { MemoryDatabase } from './database.js';
 import { Pool } from 'pg';
+import {
+  assertExportByteBudget,
+  encodeCsvCell,
+  encodeMarkdownCell,
+} from './security/export-encoding.js';
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -80,10 +85,14 @@ export interface AnalyticsReport {
 export class AnalyticsReportingService {
   private pool: Pool;
   private tenantId: string;
+  private projectId?: string;
+  private userId?: string;
 
-  constructor(pool: Pool, tenantId: string) {
+  constructor(pool: Pool, tenantId: string, projectId?: string, userId?: string) {
     this.pool = pool;
     this.tenantId = tenantId;
+    this.projectId = projectId;
+    this.userId = userId;
   }
 
   private async queryWithTenant<T extends Record<string, unknown>>(
@@ -142,7 +151,8 @@ export class AnalyticsReportingService {
          AND created_at >= $3
          AND created_at <= $4
        GROUP BY 1
-       ORDER BY 1`,
+       ORDER BY 1
+       LIMIT 10000`,
       [truncFn, this.tenantId, from, to],
     );
 
@@ -179,13 +189,25 @@ export class AnalyticsReportingService {
          COUNT(*)                                         AS memories_stored,
          COUNT(*) FILTER (WHERE pii_detected = true)    AS pii_detected,
          COUNT(DISTINCT category)                        AS unique_categories
-       FROM memories
-       WHERE tenant_id = $2
-         AND created_at >= $3
-         AND created_at <= $4
+       FROM memories m
+       LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+       WHERE m.tenant_id = $2
+         AND m.created_at >= $3
+         AND m.created_at <= $4
+         AND ($5::uuid IS NULL OR m.project_id = $5::uuid)
+         AND (
+           (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $6::uuid)
+           OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+           OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND p.id IS NOT NULL AND (
+             p.is_personal = false OR p.owner_id = $6::uuid
+             OR EXISTS (SELECT 1 FROM project_members pm
+                        WHERE pm.project_id = p.id AND pm.user_id = $6::uuid)
+           ))
+         )
        GROUP BY 1
-       ORDER BY 1`,
-      [truncFn, this.tenantId, from, to],
+       ORDER BY 1
+       LIMIT 10000`,
+      [truncFn, this.tenantId, from, to, this.projectId || null, this.userId || null],
     );
 
     return result.rows.map(r => ({
@@ -236,7 +258,8 @@ export class AnalyticsReportingService {
            AND called_at >= $3
            AND called_at <= $4
          GROUP BY 1
-         ORDER BY 1`,
+         ORDER BY 1
+         LIMIT 10000`,
         [truncFn, this.tenantId, from, to],
       );
 
@@ -264,19 +287,56 @@ export class AnalyticsReportingService {
   async getMemoryGrowthStats(from: Date, to: Date): Promise<MemoryGrowthStats> {
     const [startResult, endResult, dailyResult] = await Promise.all([
       this.queryWithTenant<{ count: string }>(
-        `SELECT COUNT(*) AS count FROM memories WHERE tenant_id=$1 AND created_at < $2`,
-        [this.tenantId, from],
+        `SELECT COUNT(*) AS count
+         FROM memories m
+         LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+         WHERE m.tenant_id = $1 AND m.created_at < $2
+           AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+           AND (
+             (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+             OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+             OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND p.id IS NOT NULL AND (
+               p.is_personal = false OR p.owner_id = $4::uuid
+               OR EXISTS (SELECT 1 FROM project_members pm
+                          WHERE pm.project_id = p.id AND pm.user_id = $4::uuid)
+             ))
+           )`,
+        [this.tenantId, from, this.projectId || null, this.userId || null],
       ),
       this.queryWithTenant<{ count: string }>(
-        `SELECT COUNT(*) AS count FROM memories WHERE tenant_id=$1 AND created_at <= $2`,
-        [this.tenantId, to],
+        `SELECT COUNT(*) AS count
+         FROM memories m
+         LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+         WHERE m.tenant_id = $1 AND m.created_at <= $2
+           AND ($3::uuid IS NULL OR m.project_id = $3::uuid)
+           AND (
+             (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $4::uuid)
+             OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+             OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND p.id IS NOT NULL AND (
+               p.is_personal = false OR p.owner_id = $4::uuid
+               OR EXISTS (SELECT 1 FROM project_members pm
+                          WHERE pm.project_id = p.id AND pm.user_id = $4::uuid)
+             ))
+           )`,
+        [this.tenantId, to, this.projectId || null, this.userId || null],
       ),
       this.queryWithTenant<{ day: Date; count: string }>(
-        `SELECT DATE(created_at AT TIME ZONE 'UTC') AS day, COUNT(*) AS count
-         FROM memories
-         WHERE tenant_id=$1 AND created_at >= $2 AND created_at <= $3
+        `SELECT DATE(m.created_at AT TIME ZONE 'UTC') AS day, COUNT(*) AS count
+         FROM memories m
+         LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+         WHERE m.tenant_id=$1 AND m.created_at >= $2 AND m.created_at <= $3
+           AND ($4::uuid IS NULL OR m.project_id = $4::uuid)
+           AND (
+             (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $5::uuid)
+             OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+             OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND p.id IS NOT NULL AND (
+               p.is_personal = false OR p.owner_id = $5::uuid
+               OR EXISTS (SELECT 1 FROM project_members pm
+                          WHERE pm.project_id = p.id AND pm.user_id = $5::uuid)
+             ))
+           )
          GROUP BY 1 ORDER BY 2 DESC LIMIT 1`,
-        [this.tenantId, from, to],
+        [this.tenantId, from, to, this.projectId || null, this.userId || null],
       ),
     ]);
 
@@ -300,7 +360,7 @@ export class AnalyticsReportingService {
   // ─── Category Breakdown ──────────────────────────────────
 
   async getCategoryBreakdown(): Promise<CategoryBreakdown[]> {
-    const result = await this.pool.query<{
+    const result = await this.queryWithTenant<{
       category: string;
       count: string;
       pii_count: string;
@@ -308,16 +368,28 @@ export class AnalyticsReportingService {
       last_used: Date | null;
     }>(
       `SELECT
-         COALESCE(category, 'uncategorized') AS category,
+         COALESCE(m.category, 'uncategorized') AS category,
          COUNT(*)                             AS count,
-         COUNT(*) FILTER (WHERE pii_detected = true) AS pii_count,
-         AVG(LENGTH(content))                AS avg_len,
-         MAX(created_at)                     AS last_used
-       FROM memories
-       WHERE tenant_id = $1
+         COUNT(*) FILTER (WHERE m.pii_detected = true) AS pii_count,
+         AVG(LENGTH(m.content))                AS avg_len,
+         MAX(m.created_at)                     AS last_used
+       FROM memories m
+       LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+       WHERE m.tenant_id = $1
+         AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+         AND (
+           (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+           OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+           OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND p.id IS NOT NULL AND (
+             p.is_personal = false OR p.owner_id = $3::uuid
+             OR EXISTS (SELECT 1 FROM project_members pm
+                        WHERE pm.project_id = p.id AND pm.user_id = $3::uuid)
+           ))
+         )
        GROUP BY 1
-       ORDER BY 2 DESC`,
-      [this.tenantId],
+       ORDER BY 2 DESC
+       LIMIT 100`,
+      [this.tenantId, this.projectId || null, this.userId || null],
     );
 
     const total = result.rows.reduce((s, r) => s + parseInt(r.count, 10), 0);
@@ -342,35 +414,71 @@ export class AnalyticsReportingService {
     by_category: Array<{ category: string; pii_count: number }>;
   }> {
     const [countResult, typeResult, catResult] = await Promise.all([
-      this.pool.query<{ total: string; pii: string }>(
+      this.queryWithTenant<{ total: string; pii: string }>(
         `SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE pii_detected = true) AS pii
-         FROM memories WHERE tenant_id = $1`,
-        [this.tenantId],
+         FROM memories m
+         LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+         WHERE m.tenant_id = $1
+           AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+           AND (
+             (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+             OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+             OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND p.id IS NOT NULL AND (
+               p.is_personal = false OR p.owner_id = $3::uuid
+               OR EXISTS (SELECT 1 FROM project_members pm
+                          WHERE pm.project_id = p.id AND pm.user_id = $3::uuid)
+             ))
+           )`,
+        [this.tenantId, this.projectId || null, this.userId || null],
       ),
-      this.pool.query<{ types: string[] }>(
-        `SELECT pii_types AS types FROM memories
-         WHERE tenant_id = $1 AND pii_detected = true AND pii_types IS NOT NULL`,
-        [this.tenantId],
+      this.queryWithTenant<{ type: string; count: string }>(
+        `SELECT pii_type AS type, COUNT(*) AS count
+         FROM memories m
+         LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+         CROSS JOIN LATERAL unnest(m.pii_types) AS pii_type
+         WHERE m.tenant_id = $1 AND m.pii_detected = true AND m.pii_types IS NOT NULL
+           AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+           AND (
+             (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+             OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+             OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND p.id IS NOT NULL AND (
+               p.is_personal = false OR p.owner_id = $3::uuid
+               OR EXISTS (SELECT 1 FROM project_members pm
+                          WHERE pm.project_id = p.id AND pm.user_id = $3::uuid)
+             ))
+           )
+         GROUP BY pii_type
+         ORDER BY count DESC, pii_type
+         LIMIT 100`,
+        [this.tenantId, this.projectId || null, this.userId || null],
       ),
-      this.pool.query<{ category: string; pii_count: string }>(
-        `SELECT COALESCE(category,'uncategorized') AS category, COUNT(*) AS pii_count
-         FROM memories
-         WHERE tenant_id = $1 AND pii_detected = true
-         GROUP BY 1 ORDER BY 2 DESC`,
-        [this.tenantId],
+      this.queryWithTenant<{ category: string; pii_count: string }>(
+        `SELECT COALESCE(m.category,'uncategorized') AS category, COUNT(*) AS pii_count
+         FROM memories m
+         LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+         WHERE m.tenant_id = $1 AND m.pii_detected = true
+           AND ($2::uuid IS NULL OR m.project_id = $2::uuid)
+           AND (
+             (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+             OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+             OR (COALESCE(m.visibility, 'shared') IN ('shared', 'project') AND p.id IS NOT NULL AND (
+               p.is_personal = false OR p.owner_id = $3::uuid
+               OR EXISTS (SELECT 1 FROM project_members pm
+                          WHERE pm.project_id = p.id AND pm.user_id = $3::uuid)
+             ))
+           )
+         GROUP BY 1 ORDER BY 2 DESC
+         LIMIT 100`,
+        [this.tenantId, this.projectId || null, this.userId || null],
       ),
     ]);
 
     const total = parseInt(countResult.rows[0]?.total ?? '0', 10);
     const pii   = parseInt(countResult.rows[0]?.pii   ?? '0', 10);
 
-    // Tally PII type occurrences
-    const byType: Record<string, number> = {};
-    for (const row of typeResult.rows) {
-      for (const type of (row.types ?? [])) {
-        byType[type] = (byType[type] ?? 0) + 1;
-      }
-    }
+    const byType: Record<string, number> = Object.fromEntries(
+      typeResult.rows.map(row => [row.type, parseInt(row.count, 10)]),
+    );
 
     return {
       total_memories: total,
@@ -429,7 +537,7 @@ export class AnalyticsReportingService {
   // ─── Export Formatters ───────────────────────────────────
 
   exportAsJSON(report: AnalyticsReport): string {
-    return JSON.stringify(report, null, 2);
+    return assertExportByteBudget(JSON.stringify(report, null, 2));
   }
 
   exportAsCSV(report: AnalyticsReport): string {
@@ -441,40 +549,36 @@ export class AnalyticsReportingService {
 
       if (Array.isArray(data) && data.length > 0) {
         const headers = Object.keys(data[0]);
-        lines.push(headers.join(','));
+        lines.push(headers.map(encodeCsvCell).join(','));
         for (const row of data as Record<string, unknown>[]) {
-          lines.push(headers.map(h => {
-            const v = row[h];
-            const s = v == null ? '' : String(v);
-            return s.includes(',') ? `"${s}"` : s;
-          }).join(','));
+          lines.push(headers.map(header => encodeCsvCell(row[header])).join(','));
         }
       } else if (data && typeof data === 'object' && !Array.isArray(data)) {
         lines.push('key,value');
         for (const [k, v] of Object.entries(data as Record<string, unknown>)) {
           if (typeof v !== 'object') {
-            lines.push(`${k},${v}`);
+            lines.push(`${encodeCsvCell(k)},${encodeCsvCell(v)}`);
           }
         }
       }
     }
 
-    return lines.join('\n');
+    return assertExportByteBudget(lines.join('\n'));
   }
 
   exportAsMarkdown(report: AnalyticsReport): string {
     const lines: string[] = [
       `# Rembr Analytics Report`,
       ``,
-      `**Generated:** ${report.generated_at}`,
-      `**Period:** ${report.config.from} → ${report.config.to}`,
-      `**Granularity:** ${report.config.granularity}`,
-      `**Title:** ${report.config.title ?? 'Custom Report'}`,
+      `**Generated:** ${encodeMarkdownCell(report.generated_at)}`,
+      `**Period:** ${encodeMarkdownCell(report.config.from)} → ${encodeMarkdownCell(report.config.to)}`,
+      `**Granularity:** ${encodeMarkdownCell(report.config.granularity)}`,
+      `**Title:** ${encodeMarkdownCell(report.config.title ?? 'Custom Report')}`,
       ``,
     ];
 
     for (const [section, data] of Object.entries(report.sections)) {
-      lines.push(`## ${section.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}`);
+      lines.push(`## ${encodeMarkdownCell(section.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()))}`);
       lines.push('');
 
       if (Array.isArray(data)) {
@@ -482,12 +586,12 @@ export class AnalyticsReportingService {
           lines.push('_No data_');
         } else {
           const headers = Object.keys(data[0]);
-          lines.push('| ' + headers.join(' | ') + ' |');
+          lines.push('| ' + headers.map(encodeMarkdownCell).join(' | ') + ' |');
           lines.push('| ' + headers.map(() => '---').join(' | ') + ' |');
           for (const row of data as Record<string, unknown>[]) {
             lines.push('| ' + headers.map(h => {
               const v = row[h];
-              return v == null ? '' : String(v);
+              return encodeMarkdownCell(v);
             }).join(' | ') + ' |');
           }
         }
@@ -497,7 +601,7 @@ export class AnalyticsReportingService {
           lines.push('_No data_');
         } else {
           for (const [k, v] of entries) {
-            lines.push(`- **${k}:** ${v}`);
+            lines.push(`- **${encodeMarkdownCell(k)}:** ${encodeMarkdownCell(v)}`);
           }
         }
       } else {
@@ -507,7 +611,7 @@ export class AnalyticsReportingService {
       lines.push('');
     }
 
-    return lines.join('\n');
+    return assertExportByteBudget(lines.join('\n'));
   }
 
   export(report: AnalyticsReport, format: ReportFormat): string {

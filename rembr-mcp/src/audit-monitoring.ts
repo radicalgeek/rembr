@@ -145,28 +145,6 @@ export const DEFAULT_THRESHOLDS: AlertThreshold[] = [
   },
 ];
 
-// ─── Schema ───────────────────────────────────────────────────────────────────
-
-const SCHEMA_SQL = `
-  CREATE TABLE IF NOT EXISTS audit_alerts (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id   UUID NOT NULL,
-    threshold_id TEXT NOT NULL,
-    threshold_name TEXT NOT NULL,
-    severity    TEXT NOT NULL CHECK (severity IN ('info','warning','critical')),
-    metric      TEXT NOT NULL,
-    observed_value FLOAT NOT NULL,
-    threshold_value FLOAT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'firing' CHECK (status IN ('firing','resolved','acknowledged')),
-    message     TEXT NOT NULL,
-    fired_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    resolved_at TIMESTAMPTZ,
-    metadata    JSONB
-  );
-  CREATE INDEX IF NOT EXISTS idx_audit_alerts_tenant ON audit_alerts (tenant_id, fired_at DESC);
-  CREATE INDEX IF NOT EXISTS idx_audit_alerts_status ON audit_alerts (tenant_id, status);
-`;
-
 // ─── Service ──────────────────────────────────────────────────────────────────
 
 export class AuditMonitoringService {
@@ -176,7 +154,10 @@ export class AuditMonitoringService {
 
   private async ensureSchema(): Promise<void> {
     if (this.schemaEnsured) return;
-    await this.pool.query(SCHEMA_SQL);
+    const existing = await this.pool.query(`SELECT to_regclass('public.audit_alerts') AS table_name`);
+    if (!existing.rows[0]?.table_name) {
+      throw new Error('Audit monitoring is unavailable: migration 030 has not been applied');
+    }
     this.schemaEnsured = true;
   }
 

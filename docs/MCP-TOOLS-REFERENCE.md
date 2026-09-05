@@ -45,6 +45,11 @@ This reference documents the legacy named tools. The 20 consolidated operation-b
 | 14 | **Task Management & Work Queue** | 7 | `manage_task`, `task_state`, `task_dependencies`, `task_search`, `work_queue`, `plan_compaction`, `plan_regeneration` |
 | 15 | **System** | 1 | `rembr-server` |
 
+This catalogue includes implemented and release-gated tools. Authenticated
+`tools/list` is authoritative for the operations enabled for a credential in the
+running release. Release-gated tools are omitted from discovery and denied before
+dispatch, including for `mcp:full` credentials.
+
 ---
 
 ## 1. Core Memory
@@ -356,7 +361,8 @@ Optional: action, user_id, resource_type, start_time, end_time, limit
 ```
 
 ### `generate_compliance_report`
-Generate SOC2/GDPR compliance audit report.
+Generate an evidence-oriented SOC 2/GDPR control-mapping report. The output is
+not a certification or legal compliance determination.
 
 ```
 Optional: report_type, start_date, end_date
@@ -480,7 +486,10 @@ Required: content (string)
 
 ## 12. File Storage
 
-MinIO-backed attachment storage for memories.
+MinIO-backed attachment storage for memories. These five tools are release-gated
+until a production object store, credentials, network policy and recovery contract
+are configured and verified. They are currently omitted from `tools/list` and
+denied before dispatch.
 
 ### `upload_attachment`
 Upload a file attachment to a memory.

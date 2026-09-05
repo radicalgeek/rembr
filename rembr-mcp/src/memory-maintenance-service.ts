@@ -295,7 +295,11 @@ export class MemoryMaintenanceService {
     };
   }
 
-  async enqueueContradictionDetectionJobs(tenantId: string, limit = 500): Promise<EnqueueResult> {
+  async enqueueContradictionDetectionJobs(
+    tenantId: string,
+    limit = 500,
+    scope?: { projectId?: string; userId?: string },
+  ): Promise<EnqueueResult> {
     const result = await this.db.query(`
       INSERT INTO memory_processing_jobs (
         tenant_id,
@@ -316,7 +320,23 @@ export class MemoryMaintenanceService {
         jsonb_build_object('reason', 'scheduled_contradiction_detection', 'source', 'maintenance_worker')
       FROM memories m
       JOIN memory_embeddings me ON me.memory_id = m.id
+      LEFT JOIN projects p ON p.id = m.project_id
       WHERE m.tenant_id = $2
+        AND (
+          $3::boolean = false
+          OR (
+            ($4::uuid IS NULL OR m.project_id = $4::uuid)
+            AND (
+              (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $5::uuid)
+              OR (
+                COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+                AND (p.id IS NULL OR p.is_personal = false OR p.owner_id = $5::uuid
+                     OR EXISTS (SELECT 1 FROM project_members pm
+                                WHERE pm.project_id = p.id AND pm.user_id = $5::uuid))
+              )
+            )
+          )
+        )
         AND NOT EXISTS (
           SELECT 1
           FROM memory_processing_jobs j
@@ -328,7 +348,46 @@ export class MemoryMaintenanceService {
       ORDER BY m.created_at ASC
       LIMIT $1
       RETURNING id
-    `, [limit, tenantId], tenantId);
+    `, [limit, tenantId, Boolean(scope), scope?.projectId || null, scope?.userId || null], tenantId);
+
+    return {
+      job_type: 'contradiction_detection',
+      created: result.rowCount ?? 0
+    };
+  }
+
+  async enqueueContradictionDetectionJobForMemory(tenantId: string, memoryId: string): Promise<EnqueueResult> {
+    const result = await this.db.query(`
+      INSERT INTO memory_processing_jobs (
+        tenant_id,
+        project_id,
+        memory_id,
+        job_type,
+        status,
+        priority,
+        metadata
+      )
+      SELECT
+        m.tenant_id,
+        m.project_id,
+        m.id,
+        'contradiction_detection',
+        'pending',
+        90,
+        jsonb_build_object('reason', 'memory_changed', 'source', 'mcp_server')
+      FROM memories m
+      WHERE m.tenant_id = $1
+        AND m.id = $2
+        AND NOT EXISTS (
+          SELECT 1
+          FROM memory_processing_jobs j
+          WHERE j.tenant_id = m.tenant_id
+            AND j.memory_id = m.id
+            AND j.job_type = 'contradiction_detection'
+            AND j.status IN ('pending', 'leased')
+        )
+      RETURNING id
+    `, [tenantId, memoryId], tenantId);
 
     return {
       job_type: 'contradiction_detection',
@@ -435,6 +494,28 @@ export class MemoryMaintenanceService {
     }
   }
 
+  /** Remove expired immutable snapshots in bounded tenant-scoped batches. */
+  async cleanExpiredSnapshots(tenantId: string, limit = 500): Promise<number> {
+    const boundedLimit = Math.max(1, Math.min(1000, Math.trunc(limit)));
+    const result = await this.db.query(`
+      WITH expired AS (
+        SELECT id
+        FROM context_snapshots
+        WHERE tenant_id = $1
+          AND expires_at IS NOT NULL
+          AND expires_at <= NOW()
+        ORDER BY expires_at, id
+        LIMIT $2
+      )
+      DELETE FROM context_snapshots s
+      USING expired
+      WHERE s.id = expired.id
+        AND s.tenant_id = $1
+      RETURNING s.id
+    `, [tenantId, boundedLimit], tenantId);
+    return result.rowCount ?? 0;
+  }
+
   async claimJobs(
     jobType: MemoryMaintenanceJobType,
     tenantId: string,
@@ -497,7 +578,7 @@ export class MemoryMaintenanceService {
           continue;
         }
 
-        const embedding = await this.embeddingProvider.generateEmbedding(memory.content);
+        const embedding = await this.embeddingProvider.generateEmbedding(memory.content, { tenantId: memory.tenant_id });
         await this.db.storeEmbedding(
           memory.id,
           memory.tenant_id,
@@ -546,7 +627,7 @@ export class MemoryMaintenanceService {
           continue;
         }
 
-        const embedding = await this.embeddingProvider.generateEmbedding(memory.content);
+        const embedding = await this.embeddingProvider.generateEmbedding(memory.content, { tenantId: memory.tenant_id });
         await this.db.storeEmbedding(
           memory.id,
           memory.tenant_id,
@@ -678,11 +759,11 @@ export class MemoryMaintenanceService {
   async processMemoryEvolutionBatch(
     tenantId: string,
     limit = 3,
-    minConfidence = 0.85
+    _minConfidence = 0.85
   ): Promise<ProcessBatchResult> {
     const jobs = await this.claimJobs('memory_evolution', tenantId, limit, 900);
     const llm = OllamaClient.getInstance();
-    const applyEnabled = process.env.MEMORY_EVOLUTION_APPLY_ENABLED !== 'false';
+    const assessmentEnabled = process.env.MEMORY_EVOLUTION_ASSESSMENT_ENABLED === 'true';
     let succeeded = 0;
     let failed = 0;
     let processed = 0;
@@ -696,7 +777,7 @@ export class MemoryMaintenanceService {
         }
 
         const memoryResult = await this.db.query(`
-          SELECT id, tenant_id, project_id, content, category, metadata, created_at, updated_at
+          SELECT id, tenant_id, project_id, user_id, visibility, content, category, metadata, created_at, updated_at
           FROM memories
           WHERE id = $1
             AND tenant_id = $2
@@ -709,25 +790,26 @@ export class MemoryMaintenanceService {
           continue;
         }
 
-        const candidates = await this.getEvolutionContext(memory.id, memory.tenant_id, memory.project_id);
-        const decision = await this.assessMemoryEvolution(llm, memory, candidates);
+        const candidates = await this.getEvolutionContext(
+          memory.id,
+          memory.tenant_id,
+          memory.project_id,
+          memory.user_id,
+          memory.visibility,
+        );
+        const decision = assessmentEnabled
+          ? await this.assessMemoryEvolution(llm, memory, candidates)
+          : {
+              action: 'keep' as const,
+              confidence: 0,
+              reason: 'Memory evolution assessment is disabled until explicitly enabled',
+            };
         processed++;
 
-        if (!applyEnabled || decision.confidence < minConfidence || decision.action === 'keep') {
-          await this.recordMemoryEvolutionDecision(job, memory, decision, !applyEnabled);
-        } else if (decision.action === 'rewrite' && decision.rewrittenContent?.trim()) {
-          await this.applyMemoryRewrite(job, memory, decision);
-          added++;
-        } else if (decision.action === 'archive_source') {
-          await this.applyMemoryArchive(job, memory, decision);
-          deleted++;
-        } else {
-          await this.recordMemoryEvolutionDecision(job, memory, {
-            ...decision,
-            action: 'keep',
-            reason: `Decision was not actionable: ${decision.reason}`
-          });
-        }
+        // Model output is evidence for a proposal, never authorisation to
+        // rewrite or archive durable tenant knowledge. Application requires a
+        // separate reviewed workflow that is intentionally absent here.
+        await this.recordMemoryEvolutionDecision(job, memory, decision, true);
 
         await this.completeJob(job.id, job.tenant_id);
         succeeded++;
@@ -1027,7 +1109,13 @@ export class MemoryMaintenanceService {
       (message.includes('memory_cleanup_actions') && message.includes('does not exist'));
   }
 
-  private async getEvolutionContext(memoryId: string, tenantId: string, projectId?: string): Promise<any[]> {
+  private async getEvolutionContext(
+    memoryId: string,
+    tenantId: string,
+    projectId?: string,
+    userId?: string,
+    visibility?: string,
+  ): Promise<any[]> {
     const related = await this.db.query(`
       SELECT
         m.id,
@@ -1044,22 +1132,30 @@ export class MemoryMaintenanceService {
       END
       WHERE (mr.source_memory_id = $1 OR mr.target_memory_id = $1)
         AND m.tenant_id = $2
+        AND m.project_id IS NOT DISTINCT FROM $3::uuid
+        AND (
+          ($5::text = 'personal' AND m.visibility = 'personal' AND m.user_id = $4::uuid)
+          OR ($5::text <> 'personal' AND COALESCE(m.visibility, 'shared') <> 'personal')
+        )
       ORDER BY mr.confidence DESC, m.updated_at DESC
       LIMIT 12
-    `, [memoryId, tenantId], tenantId);
+    `, [memoryId, tenantId, projectId || null, userId || null, visibility || 'shared'], tenantId);
 
     if (related.rows.length > 0) {
       return related.rows;
     }
 
-    const params = projectId ? [tenantId, memoryId, projectId] : [tenantId, memoryId];
-    const projectFilter = projectId ? 'AND project_id = $3' : '';
+    const params = [tenantId, memoryId, projectId || null, userId || null, visibility || 'shared'];
     const recent = await this.db.query(`
       SELECT id, content, category, created_at, updated_at, 'recent_context' AS relationship_type, 0.25 AS confidence
       FROM memories
       WHERE tenant_id = $1
         AND id != $2
-        ${projectFilter}
+        AND project_id IS NOT DISTINCT FROM $3::uuid
+        AND (
+          ($5::text = 'personal' AND visibility = 'personal' AND user_id = $4::uuid)
+          OR ($5::text <> 'personal' AND COALESCE(visibility, 'shared') <> 'personal')
+        )
       ORDER BY updated_at DESC
       LIMIT 8
     `, params, tenantId);
@@ -1108,7 +1204,8 @@ Respond as JSON:
     try {
       const response = await llm.generateText(prompt, systemPrompt, {
         temperature: 0,
-        maxTokens: 700
+        maxTokens: 700,
+        tenantId: memory.tenant_id,
       });
       return this.parseMemoryEvolutionDecision(response);
     } catch (error) {
@@ -1364,7 +1461,13 @@ Respond as JSON:
         $5::text,
         $7::boolean,
         TRUE,
-        jsonb_build_object('job_id', $6::uuid, 'decision', $3::text)
+        jsonb_build_object(
+          'job_id', $6::uuid,
+          'decision', $3::text,
+          'rewritten_content', $8::text,
+          'superseded_by_memory_id', $9::uuid,
+          'requires_review', TRUE
+        )
       FROM marked
     `, [
       memory.id,
@@ -1373,7 +1476,9 @@ Respond as JSON:
       decision.confidence,
       decision.reason,
       job.id,
-      dryRun
+      dryRun,
+      decision.rewrittenContent || null,
+      decision.supersededByMemoryId || null,
     ], memory.tenant_id);
   }
 

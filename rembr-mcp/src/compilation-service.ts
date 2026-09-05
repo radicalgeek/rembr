@@ -44,9 +44,19 @@ export interface MemoryGraph {
   }[];
   relationships: MemoryRelationship[];
   tags: Record<string, MemoryTag[]>; // memory_id -> tags
+  truncated: boolean;
+  returned_count: number;
+  total_count: number;
+  continuation?: string;
 }
 
 export class CompilationService {
+  private static readonly GRAPH_MAX_NODES = 100;
+  private static readonly GRAPH_MAX_EDGES = 500;
+  private static readonly GRAPH_MAX_TAGS = 1_000;
+  private static readonly GRAPH_CONTENT_CHARS = 2_048;
+  private static readonly GRAPH_EVIDENCE_CHARS = 2_048;
+
   constructor(private db: MemoryDatabase) {}
 
   /**
@@ -70,7 +80,7 @@ export class CompilationService {
 
     // Fetch all memories
     const memories = await Promise.all(
-      memoryIds.map(id => this.db.getMemoryById(id, tenant_id, authContext.project_id))
+      memoryIds.map(id => this.db.getMemoryById(id, tenant_id, authContext.project_id, authContext.user_id))
     );
 
     // Simple heuristic-based relationship extraction
@@ -90,7 +100,8 @@ export class CompilationService {
             ) VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT DO NOTHING
             RETURNING *`,
-            [m1.id, m2.id, 'contradicts', contradiction.confidence, contradiction.evidence]
+            [m1.id, m2.id, 'contradicts', contradiction.confidence, contradiction.evidence],
+            tenant_id,
           );
           if (result.rows.length > 0) {
             relationships.push(result.rows[0]);
@@ -107,7 +118,8 @@ export class CompilationService {
               ) VALUES ($1, $2, $3, $4)
               ON CONFLICT DO NOTHING
               RETURNING *`,
-              [m1.id, m2.id, 'relates_to', similarity]
+              [m1.id, m2.id, 'relates_to', similarity],
+              tenant_id,
             );
             if (result.rows.length > 0) {
               relationships.push(result.rows[0]);
@@ -125,7 +137,8 @@ export class CompilationService {
               ) VALUES ($1, $2, $3, $4)
               ON CONFLICT DO NOTHING
               RETURNING *`,
-              [m1.id, m2.id, 'refines', containsKeyTerms]
+              [m1.id, m2.id, 'refines', containsKeyTerms],
+              tenant_id,
             );
             if (result.rows.length > 0) {
               relationships.push(result.rows[0]);
@@ -148,29 +161,62 @@ export class CompilationService {
     const { tenant_id } = authContext;
     
 
-    // Get all memories in context
-    const memories = await this.db.getContextMemories(contextId, tenant_id);
+    const fetchedMemories = await this.db.getContextMemories(
+      contextId,
+      tenant_id,
+      authContext.project_id,
+      authContext.user_id,
+      CompilationService.GRAPH_MAX_NODES,
+      CompilationService.GRAPH_CONTENT_CHARS,
+      false,
+    );
+    const memories = fetchedMemories.slice(0, CompilationService.GRAPH_MAX_NODES).map(memory => ({
+      ...memory,
+      content: String(memory.content || '').slice(0, CompilationService.GRAPH_CONTENT_CHARS),
+      metadata: {},
+    }));
+    const totalCount = Number(fetchedMemories[0]?.total_count || memories.length);
 
     const memoryIds = memories.map(m => m.id);
 
     // Get relationships between these memories
     const relationshipsResult = await this.db.query(
-      `SELECT * FROM memory_relationships
+      `SELECT id, source_memory_id, target_memory_id, relationship_type,
+              confidence, LEFT(evidence, $3::integer) AS evidence, created_at
+       FROM memory_relationships
        WHERE source_memory_id = ANY($1::uuid[])
-         AND target_memory_id = ANY($1::uuid[])`,
-      [memoryIds]
+         AND target_memory_id = ANY($1::uuid[])
+       ORDER BY confidence DESC, id
+       LIMIT $2::integer`,
+      [
+        memoryIds,
+        CompilationService.GRAPH_MAX_EDGES,
+        CompilationService.GRAPH_EVIDENCE_CHARS,
+      ],
+      tenant_id,
     );
 
     // Get tags
     const tagsResult = await this.db.query(
-      `SELECT * FROM memory_tags
-       WHERE memory_id = ANY($1::uuid[])`,
-      [memoryIds]
+      `SELECT id, memory_id, tag, tag_type, confidence
+       FROM (
+         SELECT mt.*,
+                ROW_NUMBER() OVER (
+                  PARTITION BY mt.memory_id ORDER BY mt.confidence DESC, mt.id
+                ) AS tag_rank
+         FROM memory_tags mt
+         WHERE mt.memory_id = ANY($1::uuid[])
+       ) ranked
+       WHERE tag_rank <= 10
+       ORDER BY memory_id, tag_rank
+       LIMIT $2::integer`,
+      [memoryIds, CompilationService.GRAPH_MAX_TAGS],
+      tenant_id,
     );
 
     // Group tags by memory
     const tagsByMemory: Record<string, MemoryTag[]> = {};
-    for (const tag of tagsResult.rows) {
+    for (const tag of tagsResult.rows.slice(0, CompilationService.GRAPH_MAX_TAGS)) {
       if (!tagsByMemory[tag.memory_id]) {
         tagsByMemory[tag.memory_id] = [];
       }
@@ -183,8 +229,14 @@ export class CompilationService {
         content: m.content,
         category: m.category
       })),
-      relationships: relationshipsResult.rows,
-      tags: tagsByMemory
+      relationships: relationshipsResult.rows.slice(0, CompilationService.GRAPH_MAX_EDGES),
+      tags: tagsByMemory,
+      truncated: totalCount > memories.length,
+      returned_count: memories.length,
+      total_count: totalCount,
+      continuation: totalCount > memories.length
+        ? 'Narrow the context or page its memories before requesting another graph segment.'
+        : undefined,
     };
   }
 
@@ -199,7 +251,15 @@ export class CompilationService {
     
 
     // Get all memories in context
-    const memories = await this.db.getContextMemories(contextId, tenant_id);
+    const memories = await this.db.getContextMemories(
+      contextId,
+      tenant_id,
+      authContext.project_id,
+      authContext.user_id,
+      100,
+      16_000,
+      false,
+    );
     const memoryIds = memories.map(m => m.id);
 
     // Get contradiction relationships
@@ -207,11 +267,14 @@ export class CompilationService {
       `SELECT * FROM memory_relationships
        WHERE relationship_type = 'contradicts'
          AND source_memory_id = ANY($1::uuid[])
-       ORDER BY confidence DESC`,
-      [memoryIds]
+         AND target_memory_id = ANY($1::uuid[])
+       ORDER BY confidence DESC, id
+       LIMIT $2::integer`,
+      [memoryIds, CompilationService.GRAPH_MAX_EDGES],
+      tenant_id,
     );
 
-    return result.rows;
+    return result.rows.slice(0, CompilationService.GRAPH_MAX_EDGES);
   }
 
   /**
@@ -225,68 +288,65 @@ export class CompilationService {
     
 
     const insights: CompiledInsight[] = [];
+    const addInsight = (
+      insightType: string,
+      content: string,
+      metadata: Record<string, any>,
+      confidence: number,
+    ) => {
+      insights.push({
+        id: randomUUID(),
+        context_id: contextId,
+        insight_type: insightType,
+        content,
+        metadata,
+        confidence,
+        created_at: new Date(),
+      });
+    };
 
     // Get context memories
-    const memories = await this.db.getContextMemories(contextId, tenant_id);
+    const memories = await this.db.getContextMemories(
+      contextId,
+      tenant_id,
+      authContext.project_id,
+      authContext.user_id,
+      100,
+      16_000,
+      false,
+    );
 
     // Insight 1: Category distribution
     const categoryDist = this.getCategoryDistribution(memories);
     if (Object.keys(categoryDist).length > 0) {
-      const result = await this.db.query(
-        `INSERT INTO compiled_insights (
-          id, context_id, insight_type, content, metadata, confidence, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
-        RETURNING *`,
-        [
-          randomUUID(),
-          contextId,
-          'category_distribution',
-          `This context contains ${memories.length} memories across ${Object.keys(categoryDist).length} categories`,
-          JSON.stringify(categoryDist),
-          1.0
-        ]
+      addInsight(
+        'category_distribution',
+        `This context contains ${memories.length} memories across ${Object.keys(categoryDist).length} categories`,
+        categoryDist,
+        1.0,
       );
-      insights.push(result.rows[0]);
     }
 
     // Insight 2: Temporal patterns
     const temporalPattern = this.getTemporalPattern(memories);
     if (temporalPattern) {
-      const result = await this.db.query(
-        `INSERT INTO compiled_insights (
-          id, context_id, insight_type, content, metadata, confidence, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
-        RETURNING *`,
-        [
-          randomUUID(),
-          contextId,
-          'temporal_pattern',
-          temporalPattern.description,
-          JSON.stringify(temporalPattern.data),
-          temporalPattern.confidence
-        ]
+      addInsight(
+        'temporal_pattern',
+        temporalPattern.description,
+        temporalPattern.data,
+        temporalPattern.confidence,
       );
-      insights.push(result.rows[0]);
     }
 
     // Insight 3: Key entities (simple extraction)
     const entities = this.extractEntities(memories);
     if (entities.length > 0) {
-      const result = await this.db.query(
-        `INSERT INTO compiled_insights (
-          id, context_id, insight_type, content, metadata, confidence, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
-        RETURNING *`,
-        [
-          randomUUID(),
-          contextId,
-          'key_entities',
-          `Identified ${entities.length} key entities`,
-          JSON.stringify({ entities }),
-          0.7
-        ]
+      addInsight(
+        'key_entities',
+        `Identified ${entities.length} key entities`,
+        { entities },
+        0.7,
       );
-      insights.push(result.rows[0]);
     }
 
     // Phase 4 Enhancement: Graph-based insights
@@ -294,41 +354,23 @@ export class CompilationService {
     // Insight 4: Relationship statistics
     const relationshipStats = await this.getRelationshipStatistics(memories, tenant_id);
     if (relationshipStats.totalRelationships > 0) {
-      const result = await this.db.query(
-        `INSERT INTO compiled_insights (
-          id, context_id, insight_type, content, metadata, confidence, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
-        RETURNING *`,
-        [
-          randomUUID(),
-          contextId,
-          'relationship_statistics',
-          `Found ${relationshipStats.totalRelationships} relationships with ${relationshipStats.avgConfidence.toFixed(2)} avg confidence`,
-          JSON.stringify(relationshipStats),
-          0.9
-        ]
+      addInsight(
+        'relationship_statistics',
+        `Found ${relationshipStats.totalRelationships} relationships with ${relationshipStats.avgConfidence.toFixed(2)} avg confidence`,
+        relationshipStats,
+        0.9,
       );
-      insights.push(result.rows[0]);
     }
 
     // Insight 5: Most connected memories (knowledge hubs)
     const knowledgeHubs = await this.getKnowledgeHubs(memories, tenant_id);
     if (knowledgeHubs.length > 0) {
-      const result = await this.db.query(
-        `INSERT INTO compiled_insights (
-          id, context_id, insight_type, content, metadata, confidence, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
-        RETURNING *`,
-        [
-          randomUUID(),
-          contextId,
-          'knowledge_hubs',
-          `Identified ${knowledgeHubs.length} highly connected memories acting as knowledge hubs`,
-          JSON.stringify({ hubs: knowledgeHubs }),
-          0.8
-        ]
+      addInsight(
+        'knowledge_hubs',
+        `Identified ${knowledgeHubs.length} highly connected memories acting as knowledge hubs`,
+        { hubs: knowledgeHubs },
+        0.8,
       );
-      insights.push(result.rows[0]);
     }
 
     // Insight 6: Relationship type distribution
@@ -337,21 +379,12 @@ export class CompilationService {
       const mostCommonType = Object.entries(relationshipTypes)
         .sort(([,a], [,b]) => b - a)[0]?.[0] || 'none';
         
-      const result = await this.db.query(
-        `INSERT INTO compiled_insights (
-          id, context_id, insight_type, content, metadata, confidence, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
-        RETURNING *`,
-        [
-          randomUUID(),
-          contextId,
-          'relationship_types',
-          `Most common relationship type: ${mostCommonType}. Graph shows ${Object.keys(relationshipTypes).length} relationship types`,
-          JSON.stringify(relationshipTypes),
-          0.8
-        ]
+      addInsight(
+        'relationship_types',
+        `Most common relationship type: ${mostCommonType}. Graph shows ${Object.keys(relationshipTypes).length} relationship types`,
+        relationshipTypes,
+        0.8,
       );
-      insights.push(result.rows[0]);
     }
 
     return insights;
@@ -371,16 +404,19 @@ export class CompilationService {
       return [];
     }
 
-    const result = await this.db.query(
-      `SELECT ci.* FROM compiled_insights ci
-       INNER JOIN contexts c ON ci.context_id = c.id
-       INNER JOIN projects p ON c.project_id = p.id
-       WHERE ci.context_id = $1 AND p.tenant_id = $2
-       ORDER BY ci.created_at DESC`,
-      [contextId, tenant_id]
+    // Legacy cached insights have no audience column and may have been derived
+    // from another user's personal memories. Validate context access, then
+    // force a caller-scoped recomputation in the handler.
+    await this.db.getContextMemories(
+      contextId,
+      tenant_id,
+      authContext.project_id,
+      authContext.user_id,
+      1,
+      1,
+      false,
     );
-
-    return result.rows;
+    return [];
   }
 
   /**
@@ -392,7 +428,15 @@ export class CompilationService {
     authContext: AuthContext
   ): Promise<MemoryTag[]> {
     const { tenant_id } = authContext;
-    
+    const memory = await this.db.getMemoryById(
+      memoryId,
+      tenant_id,
+      authContext.project_id,
+      authContext.user_id,
+    );
+    if (!memory) {
+      throw new Error('Memory not found or access denied');
+    }
 
     const createdTags: MemoryTag[] = [];
 
@@ -401,7 +445,8 @@ export class CompilationService {
         `INSERT INTO memory_tags (memory_id, tag, tag_type, confidence)
          VALUES ($1, $2, $3, $4)
          RETURNING *`,
-        [memoryId, tag, tagType || null, confidence || 1.0]
+        [memoryId, tag, tagType || null, confidence || 1.0],
+        tenant_id,
       );
       createdTags.push(result.rows[0]);
     }
@@ -616,10 +661,13 @@ export class CompilationService {
       FROM memory_relationships mr
       JOIN memories m1 ON m1.id = mr.source_memory_id
       JOIN memories m2 ON m2.id = mr.target_memory_id
-      WHERE (mr.source_memory_id = ANY($1) OR mr.target_memory_id = ANY($1))
+      WHERE mr.source_memory_id = ANY($1)
+        AND mr.target_memory_id = ANY($1)
         AND m1.tenant_id = $2 AND m2.tenant_id = $2
       GROUP BY relationship_type
-    `, [memoryIds, tenantId]);
+      ORDER BY count DESC
+      LIMIT 100
+    `, [memoryIds, tenantId], tenantId);
 
     const relationshipsByType: Record<string, number> = {};
     let totalRelationships = 0;
@@ -656,20 +704,22 @@ export class CompilationService {
     const result = await this.db.query(`
       SELECT 
         m.id,
-        m.content,
+        LEFT(m.content, $3::integer) AS content,
         COUNT(mr.id) as connection_count,
         ARRAY_AGG(DISTINCT mr.relationship_type) as relationship_types
       FROM memories m
       LEFT JOIN memory_relationships mr ON (
         (mr.source_memory_id = m.id OR mr.target_memory_id = m.id)
+        AND mr.source_memory_id = ANY($1)
+        AND mr.target_memory_id = ANY($1)
         AND mr.confidence > 0.7
       )
       WHERE m.id = ANY($1) AND m.tenant_id = $2
-      GROUP BY m.id, m.content
+      GROUP BY m.id
       HAVING COUNT(mr.id) >= 3  -- Must have at least 3 relationships to be a hub
       ORDER BY connection_count DESC
       LIMIT 5
-    `, [memoryIds, tenantId]);
+    `, [memoryIds, tenantId, CompilationService.GRAPH_CONTENT_CHARS], tenantId);
 
     return result.rows.map((row: any) => ({
       memoryId: row.id,
@@ -694,12 +744,14 @@ export class CompilationService {
       FROM memory_relationships mr
       JOIN memories m1 ON m1.id = mr.source_memory_id
       JOIN memories m2 ON m2.id = mr.target_memory_id
-      WHERE (mr.source_memory_id = ANY($1) OR mr.target_memory_id = ANY($1))
+      WHERE mr.source_memory_id = ANY($1)
+        AND mr.target_memory_id = ANY($1)
         AND m1.tenant_id = $2 AND m2.tenant_id = $2
         AND mr.confidence > 0.6
       GROUP BY relationship_type
       ORDER BY count DESC
-    `, [memoryIds, tenantId]);
+      LIMIT 100
+    `, [memoryIds, tenantId], tenantId);
 
     const distribution: Record<string, number> = {};
     for (const row of result.rows) {

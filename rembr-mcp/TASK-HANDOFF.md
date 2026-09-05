@@ -423,11 +423,11 @@ Tests cover:
 
 - **Indexes**: Optimized for `to_agent + status` and `from_agent + status` queries
 - **JSONB Context**: Indexed with GIN for efficient context queries
-- **Tenant Isolation**: Row-level security enforces tenant boundaries
+- **Tenant Isolation**: Explicit tenant predicates and table RLS enforce tenant boundaries
 
 ## Security
 
-- **Row-Level Security**: All queries enforce tenant isolation
+- **Audience checks**: Every handoff query includes tenant and agent predicates
 - **Agent Validation**: Accept/reject operations verify agent identity
 - **Status Immutability**: Accepted/rejected handoffs cannot be re-processed
 

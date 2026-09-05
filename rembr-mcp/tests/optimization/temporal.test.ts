@@ -12,7 +12,6 @@ describe('TemporalAnalyzerService', () => {
 
   it('should analyze memory freshness', async () => {
     mockDb.query
-      .mockResolvedValueOnce({ rows: [] }) // SET tenant
       .mockResolvedValueOnce({
         rows: [
           {
@@ -32,7 +31,6 @@ describe('TemporalAnalyzerService', () => {
 
   it('should mark memories as outdated', async () => {
     mockDb.query
-      .mockResolvedValueOnce({ rows: [] }) // SET tenant
       .mockResolvedValueOnce({ rows: [], rowCount: 2 }); // UPDATE
 
     const result = await service.markOutdated(['m1', 'm2'], 'tenant-1');
@@ -41,7 +39,6 @@ describe('TemporalAnalyzerService', () => {
 
   it('should archive outdated memories', async () => {
     mockDb.query
-      .mockResolvedValueOnce({ rows: [] }) // SET tenant
       .mockResolvedValueOnce({ rows: [], rowCount: 2 }) // INSERT
       .mockResolvedValueOnce({ rows: [], rowCount: 2 }); // DELETE
 
@@ -53,7 +50,6 @@ describe('TemporalAnalyzerService', () => {
   it('should get temporal statistics', async () => {
     const now = new Date();
     mockDb.query
-      .mockResolvedValueOnce({ rows: [] }) // SET tenant
       .mockResolvedValueOnce({ // SELECT memories
         rows: [
           {

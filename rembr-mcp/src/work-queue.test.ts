@@ -7,6 +7,7 @@ import type { QueueItem } from './work-queue.js';
 
 const TENANT = 'a1b2c3d4-0000-0000-0000-000000000001';
 const AGENT  = 'agent-iris-001';
+const SCHEMA_EXISTS = { rows: [{ table_name: 'work_queue' }], rowCount: 1 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -37,10 +38,11 @@ function makeItemRow(overrides: Partial<Record<string, any>> = {}): Record<strin
 }
 
 function makePool(responses: any[]) {
+  const scripted = [SCHEMA_EXISTS, ...responses.slice(1)];
   let idx = 0;
   return {
     query: vi.fn().mockImplementation(() => {
-      const res = responses[idx] ?? { rows: [], rowCount: 0 };
+      const res = scripted[idx] ?? { rows: [], rowCount: 0 };
       idx++;
       return Promise.resolve(res);
     }),
@@ -50,6 +52,19 @@ function makePool(responses: any[]) {
 // ─── enqueue ──────────────────────────────────────────────────────────────────
 
 describe('enqueue', () => {
+  it('fails closed when migration 024 has not installed the queue table', async () => {
+    const pool = {
+      query: vi.fn().mockResolvedValue({ rows: [{ table_name: null }], rowCount: 1 }),
+    } as any;
+    const svc = new WorkQueueService(pool);
+    await expect(svc.enqueue(TENANT, {
+      queue_name: 'default',
+      task_type: 'process_memory',
+      payload: {},
+    })).rejects.toThrow('migration 024');
+    expect(pool.query).toHaveBeenCalledTimes(1);
+  });
+
   it('inserts a new item and returns it', async () => {
     const row = makeItemRow();
     const pool = makePool([{ rows: [] }, { rows: [row] }]); // schema + insert
@@ -272,6 +287,11 @@ describe('get', () => {
     const item = await svc.get(TENANT, 'item-001');
     expect(item).not.toBeNull();
     expect(item!.id).toBe('item-001');
+    const getCall = pool.query.mock.calls.find((call: any[]) =>
+      String(call[0]).includes('SELECT * FROM work_queue WHERE id'));
+    expect(getCall).toHaveLength(2);
+    expect(getCall[0]).toContain('tenant_id = $2');
+    expect(getCall[1]).toEqual(['item-001', TENANT]);
   });
 
   it('returns null when not found', async () => {

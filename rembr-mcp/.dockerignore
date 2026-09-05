@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+node_modules
+dist
+coverage
+test-results
+playwright-report
+*.log
+*.tsbuildinfo
+tests
+manifests-*
+patches
+Dockerfile*
+README.md

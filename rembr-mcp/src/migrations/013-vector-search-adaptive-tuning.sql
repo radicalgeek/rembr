@@ -40,8 +40,9 @@ CREATE INDEX IF NOT EXISTS idx_vss_tenant_recorded
 -- RLS: each tenant can only see their own stats rows
 ALTER TABLE vector_search_stats ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS vss_tenant_isolation ON vector_search_stats;
 CREATE POLICY vss_tenant_isolation ON vector_search_stats
-  USING (tenant_id::text = current_setting('app.current_tenant_id', true));
+  USING (tenant_id::text = current_setting('app.current_tenant', true));
 
 -- Automatic cleanup: remove rows older than 30 days
 CREATE OR REPLACE FUNCTION clean_old_vector_search_stats()
@@ -70,10 +71,21 @@ CREATE TABLE IF NOT EXISTS vector_ef_search_tiers (
   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Older reruns could insert the same tier repeatedly because only the serial
+-- primary key conflicted. Collapse those rows before adding the natural key.
+DELETE FROM vector_ef_search_tiers older
+USING vector_ef_search_tiers newer
+WHERE older.min_memory_count = newer.min_memory_count
+  AND older.id < newer.id;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vector_ef_search_tiers_min_memory
+  ON vector_ef_search_tiers (min_memory_count);
+
 -- Upsert current tier values
 INSERT INTO vector_ef_search_tiers (min_memory_count, ef_search, notes) VALUES
   (0,       40,  'Default for small tenants (< 10k memories). Fast queries, high recall.'),
   (10000,   64,  'Mid-size tenants. Matches database default set in migration 006.'),
   (100000, 100,  'Large tenants. ~97% recall at ~1.5x query cost vs ef_search=64.'),
   (500000, 128,  'Very large tenants. ~99% recall at ~2x query cost vs ef_search=64.')
-ON CONFLICT DO NOTHING;
+ON CONFLICT (min_memory_count) DO UPDATE
+SET ef_search = EXCLUDED.ef_search,
+    notes = EXCLUDED.notes;

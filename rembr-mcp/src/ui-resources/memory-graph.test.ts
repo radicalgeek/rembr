@@ -71,19 +71,19 @@ describe('memory-graph', () => {
     expect(html).toContain('Memory Graph');
   });
 
-  it('should include D3.js script', () => {
+  it('should omit remote executable graph dependencies', () => {
     const html = renderMemoryGraph(mockGraphData);
-    
-    expect(html).toContain('d3js.org');
-    expect(html).toContain('d3.v7');
+
+    expect(html).not.toContain('d3js.org');
+    expect(html).not.toContain('d3.v7');
+    expect(html).toContain("script-src 'none'");
   });
 
-  it('should embed graph data as JSON', () => {
+  it('should not embed graph data into executable HTML', () => {
     const html = renderMemoryGraph(mockGraphData);
-    
-    expect(html).toContain('const graphData =');
-    expect(html).toContain('node1');
-    expect(html).toContain('node2');
+
+    expect(html).not.toContain('const graphData =');
+    expect(html).not.toContain('<script');
   });
 
   it('should include metrics display', () => {
@@ -103,12 +103,11 @@ describe('memory-graph', () => {
     expect(html).toContain('Reset Zoom');
   });
 
-  it('should render node content safely', () => {
+  it('should not place raw memory content in the static overview', () => {
     const html = renderMemoryGraph(mockGraphData);
-    
-    // Should contain node content
-    expect(html).toContain('This is test content');
-    expect(html).toContain('Another test content');
+
+    expect(html).not.toContain('This is test content');
+    expect(html).not.toContain('Another test content');
   });
 
   it('should include export buttons', () => {

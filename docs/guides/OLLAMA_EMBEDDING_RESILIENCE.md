@@ -296,7 +296,7 @@ docker stop ollama
 
 # Verify fallback behavior
 curl -X POST http://localhost:3001/mcp/store_memory \
-  -H "X-API-Key: mb_live_..." \
+  --config /run/secrets/rembr-curl.config \
   -d '{"content":"Test during outage"}'
 
 # Check logs for fallback activation

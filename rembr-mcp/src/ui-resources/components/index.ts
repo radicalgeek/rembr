@@ -16,87 +16,11 @@ import { CARD_STYLES } from './cards.js';
 import { NAVIGATION_STYLES } from './navigation.js';
 import { LAYOUT_STYLES } from './layouts.js';
 
-// Button components
-export {
-  renderButton,
-  renderIconButton,
-  renderButtonGroup,
-  BUTTON_STYLES,
-  type ButtonOptions,
-  type ButtonGroupOptions,
-} from './buttons.js';
-
-// Input components
-export {
-  renderInput,
-  renderTextarea,
-  renderSelect,
-  renderCheckbox,
-  INPUT_STYLES,
-  type InputOptions,
-  type TextareaOptions,
-  type SelectOptions,
-  type SelectOption,
-  type CheckboxOptions,
-} from './inputs.js';
-
-// Form components
-export {
-  renderForm,
-  renderLoginForm,
-  renderSignupForm,
-  renderContactForm,
-  FORM_STYLES,
-  type FormOptions,
-  type FormField,
-  type LoginFormOptions,
-  type SignupFormOptions,
-  type ContactFormOptions,
-} from './forms.js';
-
-// Card components
-export {
-  renderCard,
-  renderProfileCard,
-  renderFeatureCard,
-  renderStatsCard,
-  renderCardGrid,
-  CARD_STYLES,
-  type CardOptions,
-  type ProfileCardOptions,
-  type FeatureCardOptions,
-  type StatsCardOptions,
-  type CardGridOptions,
-} from './cards.js';
-
-// Navigation components
-export {
-  renderHeader,
-  renderFooter,
-  renderSidebar,
-  renderBreadcrumb,
-  NAVIGATION_STYLES,
-  type HeaderOptions,
-  type NavLink,
-  type FooterOptions,
-  type FooterSection,
-  type SidebarOptions,
-  type BreadcrumbOptions,
-  type BreadcrumbItem,
-} from './navigation.js';
-
-// Layout components
-export {
-  renderDashboardLayout,
-  renderLandingPageLayout,
-  renderCenteredLayout,
-  renderTwoColumnLayout,
-  LAYOUT_STYLES,
-  type DashboardLayoutOptions,
-  type LandingPageLayoutOptions,
-  type CenteredLayoutOptions,
-  type TwoColumnLayoutOptions,
-} from './layouts.js';
+// Parameterised HTML renderers are intentionally not re-exported from the
+// runtime barrel. Their historical APIs accept trusted HTML/attributes and are
+// retained only for internal compatibility tests until replaced with typed,
+// escaped primitives. Exporting them would make a future MCP renderer an XSS
+// footgun. Static style aggregation remains available below.
 
 /**
  * Collect all component styles into a single string

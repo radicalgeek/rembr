@@ -15,6 +15,7 @@ describe('AuditLogger Tamper-Resistance (REM-251)', () => {
   let pool: Pool
   let auditLogger: AuditLogger
   const TEST_TENANT_ID = '550e8400-e29b-41d4-a716-446655440000'
+  const OTHER_TENANT_ID = '550e8400-e29b-41d4-a716-446655440001'
 
   beforeEach(async () => {
     // Use test database
@@ -61,8 +62,15 @@ describe('AuditLogger Tamper-Resistance (REM-251)', () => {
 
       -- Add columns
       ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS seq_num BIGSERIAL;
+      ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS tenant_seq_num BIGINT;
       ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS entry_hash TEXT;
       ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS prev_hash TEXT;
+
+      CREATE TABLE IF NOT EXISTS audit_chain_heads (
+        chain_key TEXT PRIMARY KEY,
+        last_seq BIGINT NOT NULL,
+        last_hash TEXT
+      );
 
       -- Drop triggers if they exist (idempotent)
       DROP TRIGGER IF EXISTS audit_set_hash ON audit_logs;
@@ -74,16 +82,19 @@ describe('AuditLogger Tamper-Resistance (REM-251)', () => {
       CREATE OR REPLACE FUNCTION set_audit_entry_hash()
       RETURNS TRIGGER AS $$
       DECLARE
+        v_chain_key TEXT;
+        v_tenant_seq BIGINT;
         v_prev_hash TEXT;
         v_entry_hash TEXT;
       BEGIN
-        -- Get prev_hash from the most recent entry for this tenant
-        SELECT entry_hash INTO v_prev_hash
-          FROM audit_logs
-         WHERE tenant_id = NEW.tenant_id
-         ORDER BY seq_num DESC
-         LIMIT 1;
+        v_chain_key := COALESCE(NEW.tenant_id::text, '__system__');
+        PERFORM pg_advisory_xact_lock(hashtextextended(v_chain_key, 0));
+        SELECT last_seq, last_hash INTO v_tenant_seq, v_prev_hash
+          FROM audit_chain_heads
+         WHERE chain_key = v_chain_key
+         FOR UPDATE;
 
+        NEW.tenant_seq_num := COALESCE(v_tenant_seq, 0) + 1;
         NEW.prev_hash := v_prev_hash;
 
         -- Compute entry_hash (canonical field order matching migration)
@@ -92,12 +103,27 @@ describe('AuditLogger Tamper-Resistance (REM-251)', () => {
             COALESCE(NEW.id::TEXT, '') || '|' ||
             COALESCE(NEW.tenant_id::TEXT, '') || '|' ||
             COALESCE(NEW.user_id, '') || '|' ||
+            COALESCE(NEW.api_key_id, '') || '|' ||
             COALESCE(NEW.agent_id, '') || '|' ||
+            COALESCE(NEW.ip_address, '') || '|' ||
+            COALESCE(NEW.user_agent, '') || '|' ||
             COALESCE(NEW.event_type, '') || '|' ||
             COALESCE(NEW.resource_type, '') || '|' ||
             COALESCE(NEW.resource_id, '') || '|' ||
             COALESCE(NEW.action_result, '') || '|' ||
+            COALESCE(NEW.error_message, '') || '|' ||
+            COALESCE(NEW.payload_before::TEXT, '') || '|' ||
+            COALESCE(NEW.payload_after::TEXT, '') || '|' ||
+            COALESCE(NEW.query_parameters::TEXT, '') || '|' ||
+            COALESCE(NEW.session_id, '') || '|' ||
+            COALESCE(NEW.request_id, '') || '|' ||
+            COALESCE(NEW.metadata::TEXT, '') || '|' ||
+            COALESCE(NEW.type, '') || '|' ||
+            COALESCE(NEW.user_identifier, '') || '|' ||
+            COALESCE(NEW.provider, '') || '|' ||
+            COALESCE(NEW.success::TEXT, '') || '|' ||
             EXTRACT(EPOCH FROM NEW.created_at)::TEXT || '|' ||
+            NEW.tenant_seq_num::TEXT || '|' ||
             COALESCE(v_prev_hash, 'GENESIS'),
             'sha256'
           ),
@@ -105,6 +131,11 @@ describe('AuditLogger Tamper-Resistance (REM-251)', () => {
         );
 
         NEW.entry_hash := v_entry_hash;
+        INSERT INTO audit_chain_heads(chain_key, last_seq, last_hash)
+        VALUES (v_chain_key, NEW.tenant_seq_num, v_entry_hash)
+        ON CONFLICT (chain_key) DO UPDATE
+          SET last_seq = EXCLUDED.last_seq,
+              last_hash = EXCLUDED.last_hash;
         RETURN NEW;
       END;
       $$ LANGUAGE plpgsql;
@@ -143,6 +174,7 @@ describe('AuditLogger Tamper-Resistance (REM-251)', () => {
     // Clean up test tenant data
     // NOTE: This will fail due to immutability trigger, so truncate instead
     await pool.query('TRUNCATE TABLE audit_logs RESTART IDENTITY CASCADE')
+    await pool.query('TRUNCATE TABLE audit_chain_heads')
   })
 
   afterEach(async () => {
@@ -182,6 +214,84 @@ describe('AuditLogger Tamper-Resistance (REM-251)', () => {
       // Verify integrity
       const violations = await auditLogger.verifyIntegrity(TEST_TENANT_ID, 100)
       expect(violations).toHaveLength(0)
+    })
+
+    it('serialises concurrent inserts into one linear tenant chain', async () => {
+      await Promise.all(Array.from({ length: 24 }, (_, index) => auditLogger.log({
+        tenantId: TEST_TENANT_ID,
+        eventType: `concurrent.${index}`,
+        resourceType: 'test',
+        actionResult: 'success',
+      })))
+
+      const result = await pool.query(
+        `SELECT tenant_seq_num, prev_hash, entry_hash
+           FROM audit_logs
+          WHERE tenant_id = $1
+          ORDER BY tenant_seq_num`,
+        [TEST_TENANT_ID],
+      )
+      expect(result.rows).toHaveLength(24)
+      expect(result.rows.map(row => Number(row.tenant_seq_num))).toEqual(
+        Array.from({ length: 24 }, (_, index) => index + 1),
+      )
+      expect(result.rows[0].prev_hash).toBeNull()
+      for (let index = 1; index < result.rows.length; index += 1) {
+        expect(result.rows[index].prev_hash).toBe(result.rows[index - 1].entry_hash)
+      }
+      expect(await auditLogger.verifyIntegrity(TEST_TENANT_ID, 100)).toHaveLength(0)
+    })
+
+    it('uses tenant sequences rather than global sequence gaps', async () => {
+      for (const [tenantId, suffix] of [
+        [TEST_TENANT_ID, 'a1'],
+        [OTHER_TENANT_ID, 'b1'],
+        [TEST_TENANT_ID, 'a2'],
+        [OTHER_TENANT_ID, 'b2'],
+      ] as const) {
+        await auditLogger.log({
+          tenantId,
+          eventType: `interleaved.${suffix}`,
+          resourceType: 'test',
+          actionResult: 'success',
+        })
+      }
+
+      const global = await pool.query(
+        `SELECT tenant_id, seq_num, tenant_seq_num
+           FROM audit_logs
+          ORDER BY seq_num`,
+      )
+      expect(global.rows.map(row => Number(row.seq_num))).toEqual([1, 2, 3, 4])
+      expect(global.rows.filter(row => row.tenant_id === TEST_TENANT_ID)
+        .map(row => Number(row.tenant_seq_num))).toEqual([1, 2])
+      expect(await auditLogger.detectGaps(TEST_TENANT_ID)).toHaveLength(0)
+      expect(await auditLogger.detectGaps(OTHER_TENANT_ID)).toHaveLength(0)
+      expect(await auditLogger.verifyIntegrity(TEST_TENANT_ID, 100)).toHaveLength(0)
+      expect(await auditLogger.verifyIntegrity(OTHER_TENANT_ID, 100)).toHaveLength(0)
+    })
+
+    it('keeps insert order canonical when timestamps arrive out of order', async () => {
+      await pool.query(
+        `INSERT INTO audit_logs
+           (tenant_id, event_type, resource_type, action_result, created_at)
+         VALUES ($1, 'timestamp.later', 'test', 'success', '2026-08-09T12:00:00Z'),
+                ($1, 'timestamp.earlier', 'test', 'success', '2026-08-08T12:00:00Z')`,
+        [TEST_TENANT_ID],
+      )
+
+      const result = await pool.query(
+        `SELECT event_type, tenant_seq_num
+           FROM audit_logs
+          WHERE tenant_id = $1
+          ORDER BY tenant_seq_num`,
+        [TEST_TENANT_ID],
+      )
+      expect(result.rows).toEqual([
+        expect.objectContaining({ event_type: 'timestamp.later', tenant_seq_num: '1' }),
+        expect.objectContaining({ event_type: 'timestamp.earlier', tenant_seq_num: '2' }),
+      ])
+      expect(await auditLogger.verifyIntegrity(TEST_TENANT_ID, 100)).toHaveLength(0)
     })
 
     it('should detect hash mismatch when entry_hash is tampered', async () => {
@@ -232,7 +342,7 @@ describe('AuditLogger Tamper-Resistance (REM-251)', () => {
       // Tamper with prev_hash of second record
       await pool.query('ALTER TABLE audit_logs DISABLE TRIGGER audit_immutable')
       const rows = await pool.query(
-        'SELECT id FROM audit_logs WHERE tenant_id = $1 ORDER BY seq_num DESC LIMIT 1',
+        'SELECT id FROM audit_logs WHERE tenant_id = $1 ORDER BY tenant_seq_num DESC LIMIT 1',
         [TEST_TENANT_ID]
       )
       await pool.query(
@@ -294,7 +404,7 @@ describe('AuditLogger Tamper-Resistance (REM-251)', () => {
       const rows = await pool.query(
         `SELECT id FROM audit_logs 
          WHERE tenant_id = $1 
-         ORDER BY seq_num ASC 
+         ORDER BY tenant_seq_num ASC
          LIMIT 1 OFFSET 1`,
         [TEST_TENANT_ID]
       )
@@ -323,7 +433,7 @@ describe('AuditLogger Tamper-Resistance (REM-251)', () => {
 
       // Delete records 2 and 5 (creating 2 gaps)
       const rows = await pool.query(
-        'SELECT id FROM audit_logs WHERE tenant_id = $1 ORDER BY seq_num ASC',
+        'SELECT id FROM audit_logs WHERE tenant_id = $1 ORDER BY tenant_seq_num ASC',
         [TEST_TENANT_ID]
       )
 
@@ -396,7 +506,8 @@ describe('AuditLogger Tamper-Resistance (REM-251)', () => {
       })
 
       const rows = await pool.query(
-        `SELECT *, EXTRACT(EPOCH FROM created_at) AS created_at_epoch 
+        `SELECT *, tenant_seq_num AS seq_num,
+                EXTRACT(EPOCH FROM created_at) AS created_at_epoch
          FROM audit_logs 
          WHERE tenant_id = $1`,
         [TEST_TENANT_ID]
@@ -429,7 +540,7 @@ describe('AuditLogger Tamper-Resistance (REM-251)', () => {
       })
 
       const row2 = await pool.query(
-        'SELECT * FROM audit_logs WHERE tenant_id = $1 ORDER BY seq_num DESC LIMIT 1',
+        'SELECT * FROM audit_logs WHERE tenant_id = $1 ORDER BY tenant_seq_num DESC LIMIT 1',
         [TEST_TENANT_ID]
       )
 

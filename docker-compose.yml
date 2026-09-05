@@ -1,101 +1,138 @@
-# Rembr self-hosted stack: engine + PostgreSQL/pgvector + web console.
-# See SELF-HOSTING.md for the full walkthrough.
-#
-# Quick start:
-#   docker compose up -d --build
-#   node rembr-mcp/scripts/bootstrap-tenant.mjs | docker compose exec -T postgres psql -U rembr -d rembr
-#   REMBR_API_KEY=<printed key> docker compose up -d rembr-console
-#
-# Embeddings default to a local Ollama (profile "ollama"); set EMBEDDING_*
-# variables in .env to use any OpenAI-compatible endpoint instead. Background
-# memory evolution uses the same image via the rembr-maintenance-worker service.
+# Rembr self-hosted stack. Copy .env.example to .env and populate every
+# required secret before starting it. Host ports bind loopback by default.
 
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: rembr-self-host-database:local
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: deploy/compose/Dockerfile
     environment:
       POSTGRES_USER: rembr
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rembr}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: rembr
     volumes:
       - rembr-pgdata:/var/lib/postgresql/data
-      - ./deploy/k8s/02-create-schema.sql:/docker-entrypoint-initdb.d/02-create-schema.sql:ro
-    ports:
-      - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rembr -d rembr"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [data]
+
+  rembr-db-bootstrap:
+    image: rembr-self-host-database:local
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: deploy/compose/Dockerfile
+    user: "999:999"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/opt/rembr-bootstrap/bootstrap-database.sh"]
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: rembr
+      PGUSER: rembr
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DB_APP_PASSWORD: ${DB_APP_PASSWORD:?Set DB_APP_PASSWORD in .env}
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [data]
 
   rembr-mcp:
     build: ./rembr-mcp
     depends_on:
       postgres:
         condition: service_healthy
+      rembr-db-bootstrap:
+        condition: service_completed_successfully
     environment:
-      DATABASE_URL: postgresql://rembr:${POSTGRES_PASSWORD:-rembr}@postgres:5432/rembr
-      JWT_SECRET: ${JWT_SECRET:-self-host-dev-secret-change-me}
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: rembr
+      DB_USER: rembr_app
+      DB_PASSWORD: ${DB_APP_PASSWORD:?Set DB_APP_PASSWORD in .env}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      PUBLIC_URL: ${PUBLIC_URL:?Set PUBLIC_URL in .env}
+      JWT_ISSUER: ${PUBLIC_URL:?Set PUBLIC_URL in .env}
+      JWT_AUDIENCE: rembr-mcp
+      OAUTH_EXPECTED_ISSUER: ${PUBLIC_URL:?Set PUBLIC_URL in .env}
+      OAUTH_EXPECTED_AUDIENCE: ${OAUTH_AUDIENCE:?Set OAUTH_AUDIENCE in .env}
+      API_KEY_SECRET: ${API_KEY_SECRET:?Set API_KEY_SECRET in .env}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env}
+      METRICS_SECRET: ${METRICS_SECRET:?Set METRICS_SECRET in .env}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-ollama}
       OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
       OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-768}
-      TEXT_GENERATION_PROVIDER: ${TEXT_GENERATION_PROVIDER:-openai-compatible}
-      LM_STUDIO_BASE_URL: ${LM_STUDIO_BASE_URL:-}
-      LM_STUDIO_MODEL: ${LM_STUDIO_MODEL:-}
-      TEXT_GENERATION_TIMEOUT_MS: ${TEXT_GENERATION_TIMEOUT_MS:-180000}
+      ENABLE_OPTIMIZATION: "false"
+      MEMORY_EVOLUTION_APPLY_ENABLED: "false"
+      NODE_ENV: production
       PORT: "3000"
     ports:
-      - "3000:3000"
-
-  rembr-maintenance-worker:
-    build: ./rembr-mcp
-    command: ["node", "dist/maintenance-worker.js"]
-    depends_on:
-      postgres:
-        condition: service_healthy
-      rembr-mcp:
-        condition: service_started
-    environment:
-      DATABASE_URL: postgresql://rembr:${POSTGRES_PASSWORD:-rembr}@postgres:5432/rembr
-      JWT_SECRET: ${JWT_SECRET:-self-host-dev-secret-change-me}
-      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-ollama}
-      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
-      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
-      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
-      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-768}
-      TEXT_GENERATION_PROVIDER: ${TEXT_GENERATION_PROVIDER:-openai-compatible}
-      LM_STUDIO_BASE_URL: ${LM_STUDIO_BASE_URL:-}
-      LM_STUDIO_MODEL: ${LM_STUDIO_MODEL:-}
-      TEXT_GENERATION_TIMEOUT_MS: ${TEXT_GENERATION_TIMEOUT_MS:-180000}
-      MAINTENANCE_INTERVAL_MS: ${MAINTENANCE_INTERVAL_MS:-60000}
-      MAINTENANCE_ENQUEUE_LIMIT: ${MAINTENANCE_ENQUEUE_LIMIT:-500}
-      MAINTENANCE_EMBEDDING_BATCH_SIZE: ${MAINTENANCE_EMBEDDING_BATCH_SIZE:-10}
-      MAINTENANCE_EVOLUTION_BATCH_SIZE: ${MAINTENANCE_EVOLUTION_BATCH_SIZE:-2}
-      MAINTENANCE_EVOLUTION_MIN_CONFIDENCE: ${MAINTENANCE_EVOLUTION_MIN_CONFIDENCE:-0.85}
-      MEMORY_EVOLUTION_APPLY_ENABLED: ${MEMORY_EVOLUTION_APPLY_ENABLED:-true}
+      - "${REMBR_BIND_ADDRESS:-127.0.0.1}:3000:3000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    init: true
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [app, data]
 
   rembr-console:
     build: ./rembr-console
     depends_on:
-      - rembr-mcp
+      rembr-mcp:
+        condition: service_healthy
     environment:
       REMBR_URL: http://rembr-mcp:3000/mcp
       REMBR_API_KEY: ${REMBR_API_KEY:-}
+      REMBR_CONSOLE_AUTH_TOKEN: ${REMBR_CONSOLE_AUTH_TOKEN:-}
+      REMBR_CONSOLE_MODE: ${REMBR_CONSOLE_MODE:-read-only}
+      HOST: 0.0.0.0
       PORT: "8080"
     ports:
-      - "8080:8080"
+      - "${CONSOLE_BIND_ADDRESS:-127.0.0.1}:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    init: true
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [app]
 
   ollama:
-    image: ollama/ollama
+    image: ollama/ollama@sha256:b88c73ace3e115f8ec53dc8761ae1c0aabfa675406e3681786b98757ce050f42
     profiles: ["ollama"]
     volumes:
       - rembr-ollama:/root/.ollama
-    ports:
-      - "11434:11434"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks: [app]
+
+networks:
+  app: {}
+  data:
+    internal: true
 
 volumes:
   rembr-pgdata:

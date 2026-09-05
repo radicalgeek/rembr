@@ -9,7 +9,12 @@
  * - Result export: JSON, CSV, Markdown
  */
 
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
+import {
+  assertExportByteBudget,
+  encodeCsvCell,
+  encodeMarkdownCell,
+} from './security/export-encoding.js';
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -88,6 +93,22 @@ export interface SavedSearch {
   use_count: number;
 }
 
+const MAX_FILTER_RESULTS = 500;
+const MAX_FILTER_OFFSET = 10_000;
+const MAX_FILTER_TERMS = 20;
+const MAX_QUERY_LENGTH = 2_000;
+const MAX_RESULT_CONTENT_BYTES = 1_500_000;
+const METADATA_KEY_PATTERN = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+interface BuiltFilter {
+  whereClause: string;
+  params: unknown[];
+  nextParameter: number;
+  orderBy: string;
+  limit: number;
+  offset: number;
+}
+
 // ─────────────────────────────────────────────────────────
 // Service
 // ─────────────────────────────────────────────────────────
@@ -97,7 +118,201 @@ export class EnhancedSearchService {
     private pool: Pool,
     private tenantId: string,
     private projectId?: string,
+    private userId?: string,
+    private ownerPrincipal: string = userId
+      ? `user:${userId}`
+      : `agent-tenant:${tenantId}`,
   ) {}
+
+  private async withTenantContext<T>(operation: (client: PoolClient) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`SELECT set_config('app.current_tenant', $1, true)`, [this.tenantId]);
+      const result = await operation(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private validateMetadataKey(key: string): void {
+    if (!METADATA_KEY_PATTERN.test(key)) {
+      throw new Error('Metadata filter keys must use 1-64 safe characters');
+    }
+  }
+
+  private addAudiencePredicate(
+    alias: string,
+    conditions: string[],
+    params: unknown[],
+    parameter: number,
+  ): number {
+    const userParameter = parameter++;
+    params.push(this.userId ?? null);
+    conditions.push(`(
+      (${alias}.visibility = 'personal' AND ${alias}.user_id = $${userParameter}::uuid)
+      OR (
+        COALESCE(${alias}.visibility, 'shared') IN ('shared', 'project')
+        AND (
+          ${alias}.project_id IS NULL
+          OR EXISTS (
+            SELECT 1
+            FROM projects audience_project
+            WHERE audience_project.id = ${alias}.project_id
+              AND audience_project.tenant_id = ${alias}.tenant_id
+              AND (
+                COALESCE(audience_project.is_personal, FALSE) = FALSE
+                OR audience_project.owner_id = $${userParameter}::uuid
+                OR EXISTS (
+                  SELECT 1 FROM project_members audience_member
+                  WHERE audience_member.project_id = audience_project.id
+                    AND audience_member.user_id = $${userParameter}::uuid
+                )
+              )
+          )
+        )
+      )
+    )`);
+    return parameter;
+  }
+
+  private buildFilter(filter: AdvancedFilter): BuiltFilter {
+    const conditions: string[] = ['m.tenant_id = $1'];
+    const params: unknown[] = [this.tenantId];
+    let p = 2;
+
+    if (this.projectId) {
+      conditions.push(`m.project_id = $${p++}::uuid`);
+      params.push(this.projectId);
+    }
+    p = this.addAudiencePredicate('m', conditions, params, p);
+
+    const cats = filter.categories ?? (filter.category ? [filter.category] : undefined);
+    if (cats && cats.length > 0) {
+      if (cats.length > MAX_FILTER_TERMS || cats.some(category => typeof category !== 'string' || category.length > 100)) {
+        throw new Error('Category filter exceeds allowed bounds');
+      }
+      conditions.push(`m.category = ANY($${p++}::text[])`);
+      params.push(cats);
+    }
+
+    for (const [field, operator] of [
+      ['created_after', '>='], ['created_before', '<='],
+      ['updated_after', '>='], ['updated_before', '<='],
+    ] as const) {
+      const raw = filter[field];
+      if (!raw) continue;
+      const date = new Date(raw);
+      if (!Number.isFinite(date.getTime())) throw new Error(`Invalid ${field} date`);
+      const column = field.startsWith('created') ? 'm.created_at' : 'm.updated_at';
+      conditions.push(`${column} ${operator} $${p++}`);
+      params.push(date);
+    }
+
+    for (const [field, operator] of [
+      ['min_content_length', '>='], ['max_content_length', '<='],
+    ] as const) {
+      const value = filter[field];
+      if (value == null) continue;
+      if (!Number.isSafeInteger(value) || value < 0 || value > 10_000_000) {
+        throw new Error(`Invalid ${field}`);
+      }
+      conditions.push(`LENGTH(m.content) ${operator} $${p++}`);
+      params.push(value);
+    }
+
+    if (filter.pii_only === true) {
+      conditions.push('m.pii_detected = true');
+    } else if (filter.exclude_pii === true) {
+      conditions.push('(m.pii_detected = false OR m.pii_detected IS NULL)');
+    }
+
+    if (filter.query) {
+      if (typeof filter.query !== 'string' || filter.query.length > MAX_QUERY_LENGTH) {
+        throw new Error('Search query exceeds allowed bounds');
+      }
+      conditions.push(`to_tsvector('english', m.content) @@ plainto_tsquery('english', $${p++})`);
+      params.push(filter.query);
+    }
+
+    const metadataEntries = Object.entries(filter.metadata_filter ?? {});
+    if (metadataEntries.length > MAX_FILTER_TERMS) throw new Error('Too many metadata filters');
+    for (const [key, value] of metadataEntries) {
+      this.validateMetadataKey(key);
+      conditions.push(`m.metadata ->> $${p++} = $${p++}`);
+      params.push(key, String(value));
+    }
+
+    const metadataConditions = filter.metadata_conditions ?? [];
+    if (metadataConditions.length > MAX_FILTER_TERMS) throw new Error('Too many metadata conditions');
+    for (const condition of metadataConditions) {
+      this.validateMetadataKey(condition.key);
+      const keyParameter = p++;
+      params.push(condition.key);
+      switch (condition.operator) {
+        case 'eq':
+          conditions.push(`m.metadata ->> $${keyParameter} = $${p++}`);
+          params.push(String(condition.value));
+          break;
+        case 'neq':
+          conditions.push(`m.metadata ->> $${keyParameter} != $${p++}`);
+          params.push(String(condition.value));
+          break;
+        case 'contains':
+          conditions.push(`m.metadata ->> $${keyParameter} ILIKE $${p++}`);
+          params.push(`%${String(condition.value).slice(0, 1_000)}%`);
+          break;
+        case 'exists':
+          conditions.push(`m.metadata ? $${keyParameter}`);
+          break;
+        case 'gt':
+        case 'lt': {
+          const numericValue = Number(condition.value);
+          if (!Number.isFinite(numericValue)) throw new Error('Numeric metadata filter requires a finite value');
+          const comparison = condition.operator === 'gt' ? '>' : '<';
+          conditions.push(`CASE
+            WHEN (m.metadata ->> $${keyParameter}) ~ '^-?[0-9]+([.][0-9]+)?$'
+            THEN (m.metadata ->> $${keyParameter})::numeric ${comparison} $${p++}
+            ELSE FALSE
+          END`);
+          params.push(numericValue);
+          break;
+        }
+        default:
+          throw new Error('Unknown metadata filter operator');
+      }
+    }
+
+    const sortField: Record<SortField, string> = {
+      created_at: 'm.created_at',
+      updated_at: 'm.updated_at',
+      content_length: 'LENGTH(m.content)',
+      category: 'm.category',
+    };
+    const selectedSort = filter.sort_by ?? 'created_at';
+    if (!(selectedSort in sortField)) throw new Error('Invalid sort field');
+    const orderBy = `${sortField[selectedSort]} ${filter.sort_order === 'asc' ? 'ASC' : 'DESC'}`;
+    const requestedLimit = filter.limit ?? 50;
+    const requestedOffset = filter.offset ?? 0;
+    if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1) throw new Error('Invalid result limit');
+    if (!Number.isSafeInteger(requestedOffset) || requestedOffset < 0 || requestedOffset > MAX_FILTER_OFFSET) {
+      throw new Error('Invalid result offset');
+    }
+
+    return {
+      whereClause: conditions.join(' AND '),
+      params,
+      nextParameter: p,
+      orderBy,
+      limit: Math.min(requestedLimit, MAX_FILTER_RESULTS),
+      offset: requestedOffset,
+    };
+  }
 
   // ─── Advanced Filter Query ───────────────────────────────
 
@@ -109,126 +324,22 @@ export class EnhancedSearchService {
     total: number;
     limit: number;
     offset: number;
+    truncated: boolean;
   }> {
-    const conditions: string[] = ['m.tenant_id = $1'];
-    const params: unknown[] = [this.tenantId];
-    let p = 2;
+    return this.withTenantContext(client => this.filterMemoriesWithClient(client, filter));
+  }
 
-    // Project filter
-    if (this.projectId) {
-      conditions.push(`m.project_id = $${p++}`);
-      params.push(this.projectId);
-    }
-
-    // Category filter (multi)
-    const cats = filter.categories ?? (filter.category ? [filter.category] : undefined);
-    if (cats && cats.length > 0) {
-      conditions.push(`m.category = ANY($${p++})`);
-      params.push(cats);
-    }
-
-    // Date range
-    if (filter.created_after) {
-      conditions.push(`m.created_at >= $${p++}`);
-      params.push(new Date(filter.created_after));
-    }
-    if (filter.created_before) {
-      conditions.push(`m.created_at <= $${p++}`);
-      params.push(new Date(filter.created_before));
-    }
-    if (filter.updated_after) {
-      conditions.push(`m.updated_at >= $${p++}`);
-      params.push(new Date(filter.updated_after));
-    }
-    if (filter.updated_before) {
-      conditions.push(`m.updated_at <= $${p++}`);
-      params.push(new Date(filter.updated_before));
-    }
-
-    // Content length
-    if (filter.min_content_length != null) {
-      conditions.push(`LENGTH(m.content) >= $${p++}`);
-      params.push(filter.min_content_length);
-    }
-    if (filter.max_content_length != null) {
-      conditions.push(`LENGTH(m.content) <= $${p++}`);
-      params.push(filter.max_content_length);
-    }
-
-    // PII filter
-    if (filter.pii_only === true) {
-      conditions.push(`m.pii_detected = true`);
-    } else if (filter.exclude_pii === true) {
-      conditions.push(`(m.pii_detected = false OR m.pii_detected IS NULL)`);
-    }
-
-    // Full-text query
-    if (filter.query) {
-      conditions.push(`to_tsvector('english', m.content) @@ plainto_tsquery('english', $${p++})`);
-      params.push(filter.query);
-    }
-
-    // Simple metadata filter
-    if (filter.metadata_filter) {
-      for (const [key, val] of Object.entries(filter.metadata_filter)) {
-        conditions.push(`m.metadata->>'${key.replace(/'/g, "''")}' = $${p++}`);
-        params.push(String(val));
-      }
-    }
-
-    // Structured metadata conditions
-    for (const cond of (filter.metadata_conditions ?? [])) {
-      const safeKey = cond.key.replace(/'/g, "''");
-      switch (cond.operator) {
-        case 'eq':
-          conditions.push(`m.metadata->>'${safeKey}' = $${p++}`);
-          params.push(String(cond.value));
-          break;
-        case 'neq':
-          conditions.push(`m.metadata->>'${safeKey}' != $${p++}`);
-          params.push(String(cond.value));
-          break;
-        case 'contains':
-          conditions.push(`m.metadata->>'${safeKey}' ILIKE $${p++}`);
-          params.push(`%${cond.value}%`);
-          break;
-        case 'exists':
-          conditions.push(`m.metadata ? '${safeKey}'`);
-          break;
-        case 'gt':
-          conditions.push(`(m.metadata->>'${safeKey}')::numeric > $${p++}`);
-          params.push(Number(cond.value));
-          break;
-        case 'lt':
-          conditions.push(`(m.metadata->>'${safeKey}')::numeric < $${p++}`);
-          params.push(Number(cond.value));
-          break;
-      }
-    }
-
-    const whereClause = conditions.join(' AND ');
-
-    // Sort
-    const sortField: Record<SortField, string> = {
-      created_at:     'm.created_at',
-      updated_at:     'm.updated_at',
-      content_length: 'LENGTH(m.content)',
-      category:       'm.category',
-    };
-    const orderBy = `${sortField[filter.sort_by ?? 'created_at']} ${filter.sort_order === 'asc' ? 'ASC' : 'DESC'}`;
-
-    const limit  = Math.min(filter.limit  ?? 50, 500);
-    const offset = filter.offset ?? 0;
-
-    // Count query (no limit/offset)
-    const countResult = await this.pool.query<{ total: string }>(
-      `SELECT COUNT(*) AS total FROM memories m WHERE ${whereClause}`,
-      params,
+  private async filterMemoriesWithClient(
+    client: PoolClient,
+    filter: AdvancedFilter,
+  ): Promise<{ items: FilteredMemory[]; total: number; limit: number; offset: number; truncated: boolean }> {
+    const built = this.buildFilter(filter);
+    const countResult = await client.query<{ total: string }>(
+      `SELECT COUNT(*) AS total FROM memories m WHERE ${built.whereClause}`,
+      built.params,
     );
-    const total = parseInt(countResult.rows[0]?.total ?? '0', 10);
-
-    // Data query
-    const dataResult = await this.pool.query<{
+    const total = Number.parseInt(countResult.rows[0]?.total ?? '0', 10);
+    const dataResult = await client.query<{
       id: string;
       content: string;
       category: string | null;
@@ -239,24 +350,38 @@ export class EnhancedSearchService {
     }>(
       `SELECT m.id, m.content, m.category, m.metadata, m.pii_detected, m.created_at, m.updated_at
        FROM memories m
-       WHERE ${whereClause}
-       ORDER BY ${orderBy}
-       LIMIT $${p++} OFFSET $${p++}`,
-      [...params, limit, offset],
+       WHERE ${built.whereClause}
+       ORDER BY ${built.orderBy}
+       LIMIT $${built.nextParameter} OFFSET $${built.nextParameter + 1}`,
+      [...built.params, built.limit, built.offset],
     );
 
-    const items: FilteredMemory[] = dataResult.rows.map(r => ({
-      id:             r.id,
-      content:        r.content,
-      category:       r.category,
-      metadata:       r.metadata ?? {},
-      pii_detected:   r.pii_detected ?? false,
-      created_at:     r.created_at instanceof Date ? r.created_at.toISOString() : (r.created_at ?? new Date(0).toISOString()),
-      updated_at:     r.updated_at instanceof Date ? r.updated_at.toISOString() : (r.updated_at ?? new Date(0).toISOString()),
-      content_length: r.content.length,
-    }));
+    const items: FilteredMemory[] = [];
+    let encodedBytes = 0;
+    for (const row of dataResult.rows) {
+      const rowBytes = Buffer.byteLength(row.content, 'utf8') +
+        Buffer.byteLength(JSON.stringify(row.metadata ?? {}), 'utf8') + 512;
+      if (encodedBytes + rowBytes > MAX_RESULT_CONTENT_BYTES) break;
+      encodedBytes += rowBytes;
+      items.push({
+        id: row.id,
+        content: row.content,
+        category: row.category,
+        metadata: row.metadata ?? {},
+        pii_detected: row.pii_detected ?? false,
+        created_at: row.created_at instanceof Date ? row.created_at.toISOString() : (row.created_at ?? new Date(0).toISOString()),
+        updated_at: row.updated_at instanceof Date ? row.updated_at.toISOString() : (row.updated_at ?? new Date(0).toISOString()),
+        content_length: row.content.length,
+      });
+    }
 
-    return { items, total, limit, offset };
+    return {
+      items,
+      total,
+      limit: built.limit,
+      offset: built.offset,
+      truncated: items.length < dataResult.rows.length,
+    };
   }
 
   // ─── Batch Operations ────────────────────────────────────
@@ -275,16 +400,29 @@ export class EnhancedSearchService {
       return { affected: 0, ids: [], errors: ['batch_delete requires at least one filter condition'] };
     }
 
-    const { items } = await this.filterMemories({ ...filter, limit: 500, offset: 0 });
-    const ids = items.map(m => m.id);
-    if (ids.length === 0) return { affected: 0, ids: [], errors: [] };
+    return this.withTenantContext(async client => {
+      const { items } = await this.filterMemoriesWithClient(client, { ...filter, limit: MAX_FILTER_RESULTS, offset: 0 });
+      const selectedIds = items.map(memory => memory.id);
+      if (selectedIds.length === 0) return { affected: 0, ids: [], errors: [] };
 
-    await this.pool.query(
-      `DELETE FROM memories WHERE tenant_id = $1 AND id = ANY($2)`,
-      [this.tenantId, ids],
-    );
-
-    return { affected: ids.length, ids, errors: [] };
+      const conditions = ['m.id = ANY($2::uuid[])'];
+      const params: unknown[] = [this.tenantId, selectedIds];
+      let parameter = 3;
+      if (this.projectId) {
+        conditions.push(`m.project_id = $${parameter++}::uuid`);
+        params.push(this.projectId);
+      }
+      this.addAudiencePredicate('m', conditions, params, parameter);
+      const deleted = await client.query<{ id: string }>(
+        `DELETE FROM memories m
+          WHERE m.tenant_id = $1
+            AND ${conditions.join(' AND ')}
+        RETURNING m.id`,
+        params,
+      );
+      const ids = deleted.rows.map(row => row.id);
+      return { affected: ids.length, ids, errors: [] };
+    });
   }
 
   /**
@@ -305,101 +443,148 @@ export class EnhancedSearchService {
       return { affected: 0, ids: [], errors: ['batch_update requires category or metadata_merge'] };
     }
 
-    const { items } = await this.filterMemories({ ...filter, limit: 500, offset: 0 });
-    const ids = items.map(m => m.id);
-    if (ids.length === 0) return { affected: 0, ids: [], errors: [] };
-
-    const setClauses: string[] = ['updated_at = NOW()'];
-    const params: unknown[] = [this.tenantId, ids];
-    let p = 3;
-
-    if (updates.category) {
-      setClauses.push(`category = $${p++}`);
-      params.push(updates.category);
+    if (updates.category && (typeof updates.category !== 'string' || updates.category.length > 100)) {
+      return { affected: 0, ids: [], errors: ['Invalid category update'] };
     }
-    if (updates.metadata_merge) {
-      setClauses.push(`metadata = metadata || $${p++}::jsonb`);
-      params.push(JSON.stringify(updates.metadata_merge));
+    const encodedMetadata = updates.metadata_merge === undefined
+      ? undefined
+      : JSON.stringify(updates.metadata_merge);
+    if (encodedMetadata && Buffer.byteLength(encodedMetadata, 'utf8') > 32_768) {
+      return { affected: 0, ids: [], errors: ['Metadata update exceeds 32 KiB'] };
     }
 
-    await this.pool.query(
-      `UPDATE memories SET ${setClauses.join(', ')} WHERE tenant_id = $1 AND id = ANY($2)`,
-      params,
-    );
+    return this.withTenantContext(async client => {
+      const { items } = await this.filterMemoriesWithClient(client, { ...filter, limit: MAX_FILTER_RESULTS, offset: 0 });
+      const selectedIds = items.map(memory => memory.id);
+      if (selectedIds.length === 0) return { affected: 0, ids: [], errors: [] };
 
-    return { affected: ids.length, ids, errors: [] };
+      const setClauses: string[] = ['updated_at = NOW()'];
+      const params: unknown[] = [this.tenantId, selectedIds];
+      let parameter = 3;
+      if (updates.category) {
+        setClauses.push(`category = $${parameter++}`);
+        params.push(updates.category);
+      }
+      if (encodedMetadata) {
+        setClauses.push(`metadata = metadata || $${parameter++}::jsonb`);
+        params.push(encodedMetadata);
+      }
+      const conditions = ['m.tenant_id = $1', 'm.id = ANY($2::uuid[])'];
+      if (this.projectId) {
+        conditions.push(`m.project_id = $${parameter++}::uuid`);
+        params.push(this.projectId);
+      }
+      this.addAudiencePredicate('m', conditions, params, parameter);
+      const updated = await client.query<{ id: string }>(
+        `UPDATE memories m SET ${setClauses.join(', ')}
+         WHERE ${conditions.join(' AND ')} RETURNING m.id`,
+        params,
+      );
+      const ids = updated.rows.map(row => row.id);
+      return { affected: ids.length, ids, errors: [] };
+    });
   }
 
   // ─── Saved Searches ──────────────────────────────────────
 
-  private async ensureSavedSearchTable(): Promise<void> {
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS saved_searches (
-        id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-        tenant_id   TEXT        NOT NULL,
-        name        TEXT        NOT NULL,
-        description TEXT,
-        filter      JSONB       NOT NULL DEFAULT '{}',
-        use_count   INTEGER     NOT NULL DEFAULT 0,
-        last_used_at TIMESTAMPTZ,
-        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE (tenant_id, name)
-      )
-    `);
+  private async ensureSavedSearchTable(client: PoolClient): Promise<void> {
+    const existing = await client.query(`SELECT to_regclass('public.saved_searches') AS table_name`);
+    if (!existing.rows[0]?.table_name) {
+      throw new Error('Saved searches are unavailable: migration 030 has not been applied');
+    }
   }
 
   async saveSearch(name: string, filter: AdvancedFilter, description?: string): Promise<SavedSearch> {
-    await this.ensureSavedSearchTable();
+    const safeName = name?.trim();
+    if (!safeName || safeName.length > 100) throw new Error('Saved search name must be 1-100 characters');
+    if (description && description.length > 1_000) throw new Error('Saved search description exceeds 1,000 characters');
+    // Build once before storage so invalid keys, limits and dates never become
+    // a persistent payload that fails later during execution.
+    this.buildFilter(filter);
+    const encodedFilter = JSON.stringify(filter);
+    if (Buffer.byteLength(encodedFilter, 'utf8') > 32_768) throw new Error('Saved search filter exceeds 32 KiB');
 
-    const result = await this.pool.query<SavedSearch & { created_at: Date; last_used_at: Date | null }>(
-      `INSERT INTO saved_searches (tenant_id, name, description, filter)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (tenant_id, name)
-       DO UPDATE SET filter = EXCLUDED.filter, description = COALESCE(EXCLUDED.description, saved_searches.description)
-       RETURNING *`,
-      [this.tenantId, name, description ?? null, JSON.stringify(filter)],
-    );
-
-    return this._formatSavedSearch(result.rows[0] as any);
+    return this.withTenantContext(async client => {
+      await this.ensureSavedSearchTable(client);
+      const result = await client.query<SavedSearch & { created_at: Date; last_used_at: Date | null }>(
+        `INSERT INTO saved_searches
+           (tenant_id, project_id, user_id, owner_principal, name, description, filter)
+         VALUES ($1, $2::uuid, $3::uuid, $4, $5, $6, $7::jsonb)
+         ON CONFLICT (
+           tenant_id,
+           owner_principal,
+           COALESCE(project_id, '00000000-0000-0000-0000-000000000000'::uuid),
+           name
+         )
+         DO UPDATE SET
+           filter = EXCLUDED.filter,
+           description = COALESCE(EXCLUDED.description, saved_searches.description)
+         RETURNING *`,
+        [
+          this.tenantId,
+          this.projectId ?? null,
+          this.userId ?? null,
+          this.ownerPrincipal,
+          safeName,
+          description ?? null,
+          encodedFilter,
+        ],
+      );
+      return this._formatSavedSearch(result.rows[0] as any);
+    });
   }
 
   async listSavedSearches(): Promise<SavedSearch[]> {
-    await this.ensureSavedSearchTable();
-    const result = await this.pool.query(
-      `SELECT * FROM saved_searches WHERE tenant_id = $1 ORDER BY use_count DESC, created_at DESC`,
-      [this.tenantId],
-    );
-    return result.rows.map(r => this._formatSavedSearch(r));
+    return this.withTenantContext(async client => {
+      await this.ensureSavedSearchTable(client);
+      const result = await client.query(
+        `SELECT * FROM saved_searches
+         WHERE tenant_id = $1
+           AND owner_principal = $2
+           AND project_id IS NOT DISTINCT FROM $3::uuid
+         ORDER BY use_count DESC, created_at DESC
+         LIMIT 100`,
+        [this.tenantId, this.ownerPrincipal, this.projectId ?? null],
+      );
+      return result.rows.map(row => this._formatSavedSearch(row));
+    });
   }
 
   async executeSavedSearch(name: string): Promise<{
     search: SavedSearch;
     results: Awaited<ReturnType<EnhancedSearchService['filterMemories']>>;
   }> {
-    await this.ensureSavedSearchTable();
-
-    const row = await this.pool.query(
-      `UPDATE saved_searches SET use_count = use_count + 1, last_used_at = NOW()
-       WHERE tenant_id = $1 AND name = $2
-       RETURNING *`,
-      [this.tenantId, name],
-    );
-
-    if (row.rows.length === 0) throw new Error(`Saved search '${name}' not found`);
-
-    const search = this._formatSavedSearch(row.rows[0]);
-    const results = await this.filterMemories(search.filter);
-
-    return { search, results };
+    return this.withTenantContext(async client => {
+      await this.ensureSavedSearchTable(client);
+      const row = await client.query(
+        `UPDATE saved_searches SET use_count = use_count + 1, last_used_at = NOW()
+         WHERE tenant_id = $1
+           AND owner_principal = $2
+           AND project_id IS NOT DISTINCT FROM $3::uuid
+           AND name = $4
+         RETURNING *`,
+        [this.tenantId, this.ownerPrincipal, this.projectId ?? null, name],
+      );
+      if (row.rows.length === 0) throw new Error('Saved search not found');
+      const search = this._formatSavedSearch(row.rows[0]);
+      const results = await this.filterMemoriesWithClient(client, search.filter);
+      return { search, results };
+    });
   }
 
   async deleteSavedSearch(name: string): Promise<boolean> {
-    await this.ensureSavedSearchTable();
-    const result = await this.pool.query(
-      `DELETE FROM saved_searches WHERE tenant_id = $1 AND name = $2`,
-      [this.tenantId, name],
-    );
-    return (result.rowCount ?? 0) > 0;
+    return this.withTenantContext(async client => {
+      await this.ensureSavedSearchTable(client);
+      const result = await client.query(
+        `DELETE FROM saved_searches
+         WHERE tenant_id = $1
+           AND owner_principal = $2
+           AND project_id IS NOT DISTINCT FROM $3::uuid
+           AND name = $4`,
+        [this.tenantId, this.ownerPrincipal, this.projectId ?? null, name],
+      );
+      return (result.rowCount ?? 0) > 0;
+    });
   }
 
   private _formatSavedSearch(row: Record<string, unknown>): SavedSearch {
@@ -418,32 +603,32 @@ export class EnhancedSearchService {
   // ─── Export ──────────────────────────────────────────────
 
   exportAsJSON(items: FilteredMemory[], meta?: Record<string, unknown>): string {
-    return JSON.stringify({ exported_at: new Date().toISOString(), count: items.length, ...meta, items }, null, 2);
+    return assertExportByteBudget(
+      JSON.stringify({ exported_at: new Date().toISOString(), count: items.length, ...meta, items }, null, 2),
+    );
   }
 
   exportAsCSV(items: FilteredMemory[]): string {
     const headers = ['id', 'category', 'pii_detected', 'content_length', 'created_at', 'updated_at', 'content'];
-    const escape  = (v: unknown) => {
-      const s = v == null ? '' : String(v);
-      return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s;
-    };
-    const rows = items.map(m => headers.map(h => escape(m[h as keyof FilteredMemory])).join(','));
-    return [headers.join(','), ...rows].join('\n');
+    const rows = items.map(memory => headers
+      .map(header => encodeCsvCell(memory[header as keyof FilteredMemory]))
+      .join(','));
+    return assertExportByteBudget([headers.join(','), ...rows].join('\n'));
   }
 
   exportAsMarkdown(items: FilteredMemory[], title?: string): string {
     const lines = [
-      `# ${title ?? 'Search Results'}`,
+      `# ${encodeMarkdownCell(title ?? 'Search Results')}`,
       ``,
       `**Exported:** ${new Date().toISOString()}  **Count:** ${items.length}`,
       ``,
       `| id | category | pii | length | created_at |`,
       `|----|----------|-----|--------|------------|`,
-      ...items.map(m =>
-        `| ${m.id.slice(0, 8)}… | ${m.category ?? '—'} | ${m.pii_detected ? '⚠️' : '✅'} | ${m.content_length} | ${m.created_at.slice(0, 10)} |`
+      ...items.map(memory =>
+        `| ${encodeMarkdownCell(memory.id.slice(0, 8))}… | ${encodeMarkdownCell(memory.category ?? '—')} | ${memory.pii_detected ? '⚠️' : '✅'} | ${memory.content_length} | ${encodeMarkdownCell(memory.created_at.slice(0, 10))} |`
       ),
     ];
-    return lines.join('\n');
+    return assertExportByteBudget(lines.join('\n'));
   }
 
   export(items: FilteredMemory[], format: ExportFormat, meta?: Record<string, unknown>): string {

@@ -83,45 +83,6 @@ export interface RegenerationResult {
 }
 
 // ─────────────────────────────────────────────────────────
-// Schema bootstrap
-// ─────────────────────────────────────────────────────────
-
-const SCHEMA_SQL = `
-  CREATE TABLE IF NOT EXISTS rlm_sessions (
-    id                 UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id          TEXT         NOT NULL,
-    task_id            TEXT         NOT NULL,
-    task_title         TEXT         NOT NULL DEFAULT '',
-    status             TEXT         NOT NULL DEFAULT 'active',
-    acceptance_criteria JSONB       NOT NULL DEFAULT '[]',
-    current_plan       TEXT,
-    regeneration_count INTEGER      NOT NULL DEFAULT 0,
-    metadata           JSONB        NOT NULL DEFAULT '{}',
-    created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    completed_at       TIMESTAMPTZ
-  );
-
-  CREATE TABLE IF NOT EXISTS rlm_iterations (
-    id               UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-    session_id       UUID         NOT NULL REFERENCES rlm_sessions(id) ON DELETE CASCADE,
-    tenant_id        TEXT         NOT NULL,
-    iteration_number INTEGER      NOT NULL,
-    plan_summary     TEXT         NOT NULL DEFAULT '',
-    approach         TEXT         NOT NULL DEFAULT '',
-    outcome          TEXT         NOT NULL DEFAULT 'failed',
-    evidence         JSONB        NOT NULL DEFAULT '[]',
-    error            TEXT,
-    ac_met           JSONB        NOT NULL DEFAULT '[]',
-    ac_failed        JSONB        NOT NULL DEFAULT '[]',
-    duration_ms      INTEGER,
-    started_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    completed_at     TIMESTAMPTZ,
-    metadata         JSONB        NOT NULL DEFAULT '{}'
-  );
-`;
-
-// ─────────────────────────────────────────────────────────
 // Service
 // ─────────────────────────────────────────────────────────
 
@@ -129,6 +90,31 @@ export class RalphRLMService {
   private schemaEnsured = false;
 
   constructor(private pool: Pool, private tenantId: string) {}
+
+  /** Execute one RLM statement with the transaction-local tenant RLS GUC. */
+  private async tenantQuery<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params: unknown[] = [],
+  ): Promise<{ rows: T[]; rowCount?: number | null }> {
+    // Lightweight unit-test pools expose query only; production pg.Pool always
+    // exposes connect and takes the transaction-safe branch.
+    if (typeof (this.pool as any).connect !== 'function') {
+      return this.pool.query(sql, params) as any;
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant', this.tenantId]);
+      const result = await client.query(sql, params);
+      await client.query('COMMIT');
+      return result as any;
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
 
   private async ensureSchema(): Promise<void> {
     if (this.schemaEnsured) return;
@@ -138,15 +124,13 @@ export class RalphRLMService {
         to_regclass('public.rlm_iterations') AS iterations_table
     `);
     if (
-      existing.rows.length === 0 ||
       (existing.rows[0]?.sessions_table && existing.rows[0]?.iterations_table)
     ) {
       this.schemaEnsured = true;
       return;
     }
 
-    await this.pool.query(SCHEMA_SQL);
-    this.schemaEnsured = true;
+    throw new Error('RLM is unavailable: migration 024 has not been applied');
   }
 
   // ─── Session Management ──────────────────────────────────
@@ -166,7 +150,7 @@ export class RalphRLMService {
       status:      'pending' as ACStatus,
     }));
 
-    const result = await this.pool.query<{
+    const result = await this.tenantQuery<{
       id: string; tenant_id: string; task_id: string; task_title: string;
       status: string; acceptance_criteria: AcceptanceCriterion[];
       current_plan: string | null; regeneration_count: number;
@@ -186,13 +170,13 @@ export class RalphRLMService {
     await this.ensureSchema();
 
     const [sessionResult, iterResult] = await Promise.all([
-      this.pool.query(
+      this.tenantQuery(
         `SELECT * FROM rlm_sessions WHERE id = $1 AND tenant_id = $2`,
         [sessionId, this.tenantId],
       ),
-      this.pool.query(
-        `SELECT * FROM rlm_iterations WHERE session_id = $1 ORDER BY iteration_number`,
-        [sessionId],
+      this.tenantQuery(
+        `SELECT * FROM rlm_iterations WHERE session_id = $1 AND tenant_id = $2 ORDER BY iteration_number`,
+        [sessionId, this.tenantId],
       ),
     ]);
 
@@ -210,7 +194,7 @@ export class RalphRLMService {
     if (taskId) { conditions.push(`s.task_id = $${p++}`); params.push(taskId); }
     if (status) { conditions.push(`s.status = $${p++}`); params.push(status); }
 
-    const result = await this.pool.query(
+    const result = await this.tenantQuery(
       `SELECT * FROM rlm_sessions s WHERE ${conditions.join(' AND ')} ORDER BY updated_at DESC`,
       params,
     );
@@ -218,9 +202,9 @@ export class RalphRLMService {
     // Load iterations for each session
     const sessions = await Promise.all(
       result.rows.map(async row => {
-        const iters = await this.pool.query(
-          `SELECT * FROM rlm_iterations WHERE session_id = $1 ORDER BY iteration_number`,
-          [row.id],
+        const iters = await this.tenantQuery(
+          `SELECT * FROM rlm_iterations WHERE session_id = $1 AND tenant_id = $2 ORDER BY iteration_number`,
+          [row.id, this.tenantId],
         );
         return this._formatSession(row, iters.rows);
       })
@@ -240,7 +224,7 @@ export class RalphRLMService {
       setClauses.push(`completed_at = NOW()`);
     }
 
-    await this.pool.query(
+    await this.tenantQuery(
       `UPDATE rlm_sessions SET ${setClauses.join(', ')} WHERE id = $1 AND tenant_id = $2`,
       params,
     );
@@ -274,7 +258,7 @@ export class RalphRLMService {
     // Check if all required AC are met
     const allMet = updated.every(ac => ac.status === 'met' || ac.status === 'skipped');
 
-    await this.pool.query(
+    await this.tenantQuery(
       `UPDATE rlm_sessions SET acceptance_criteria = $3, updated_at = NOW() ${allMet ? ", status = 'complete', completed_at = NOW()" : ''} WHERE id = $1 AND tenant_id = $2`,
       [sessionId, this.tenantId, JSON.stringify(updated)],
     );
@@ -292,14 +276,17 @@ export class RalphRLMService {
   ): Promise<RLMIteration> {
     await this.ensureSchema();
 
+    const session = await this.getSession(sessionId);
+    if (!session) throw new Error(`RLM session not found: ${sessionId}`);
+
     // Get current iteration count
-    const countResult = await this.pool.query<{ count: string }>(
-      `SELECT COUNT(*) AS count FROM rlm_iterations WHERE session_id = $1`,
-      [sessionId],
+    const countResult = await this.tenantQuery<{ count: string }>(
+      `SELECT COUNT(*) AS count FROM rlm_iterations WHERE session_id = $1 AND tenant_id = $2`,
+      [sessionId, this.tenantId],
     );
     const nextNumber = parseInt(countResult.rows[0]?.count ?? '0', 10) + 1;
 
-    const result = await this.pool.query(
+    const result = await this.tenantQuery(
       `INSERT INTO rlm_iterations
          (session_id, tenant_id, iteration_number, plan_summary, approach, metadata)
        VALUES ($1, $2, $3, $4, $5, $6)
@@ -308,7 +295,10 @@ export class RalphRLMService {
     );
 
     // Update session updated_at
-    await this.pool.query(`UPDATE rlm_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
+    await this.tenantQuery(
+      `UPDATE rlm_sessions SET updated_at = NOW() WHERE id = $1 AND tenant_id = $2`,
+      [sessionId, this.tenantId],
+    );
 
     return this._formatIteration(result.rows[0]);
   }
@@ -322,14 +312,18 @@ export class RalphRLMService {
     error?: string,
     durationMs?: number,
   ): Promise<RLMIteration> {
-    const result = await this.pool.query(
+    const result = await this.tenantQuery(
       `UPDATE rlm_iterations
-       SET outcome = $2, evidence = $3, ac_met = $4, ac_failed = $5,
-           error = $6, duration_ms = $7, completed_at = NOW()
-       WHERE id = $1
+       SET outcome = $3, evidence = $4, ac_met = $5, ac_failed = $6,
+           error = $7, duration_ms = $8, completed_at = NOW()
+       WHERE id = $1 AND tenant_id = $2
        RETURNING *`,
-      [iterationId, outcome, JSON.stringify(evidence), JSON.stringify(acMet), JSON.stringify(acFailed), error ?? null, durationMs ?? null],
+      [iterationId, this.tenantId, outcome, JSON.stringify(evidence), JSON.stringify(acMet), JSON.stringify(acFailed), error ?? null, durationMs ?? null],
     );
+
+    if (result.rows.length === 0) {
+      throw new Error(`RLM iteration not found: ${iterationId}`);
+    }
 
     return this._formatIteration(result.rows[0]);
   }
@@ -343,9 +337,10 @@ export class RalphRLMService {
     if (!session) throw new Error(`RLM session not found: ${req.session_id}`);
 
     // Increment regeneration count
-    await this.pool.query(
-      `UPDATE rlm_sessions SET regeneration_count = regeneration_count + 1, status = 'regenerating', updated_at = NOW() WHERE id = $1`,
-      [req.session_id],
+    await this.tenantQuery(
+      `UPDATE rlm_sessions SET regeneration_count = regeneration_count + 1, status = 'regenerating', updated_at = NOW()
+       WHERE id = $1 AND tenant_id = $2`,
+      [req.session_id, this.tenantId],
     );
 
     const pendingAC = session.acceptance_criteria.filter(ac => ac.status !== 'met' && ac.status !== 'skipped');
@@ -396,7 +391,7 @@ export class RalphRLMService {
     const regenerationId = randomUUID();
 
     // Persist regeneration event in session metadata
-    await this.pool.query(
+    await this.tenantQuery(
       `UPDATE rlm_sessions
        SET metadata = jsonb_set(
          metadata,
@@ -448,7 +443,7 @@ export class RalphRLMService {
     const { session } = JSON.parse(stateJson) as { session: RLMSession };
 
     // Re-create session preserving all state
-    const result = await this.pool.query(
+    const result = await this.tenantQuery(
       `INSERT INTO rlm_sessions
          (id, tenant_id, task_id, task_title, status, acceptance_criteria, current_plan, regeneration_count, metadata, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
@@ -457,6 +452,7 @@ export class RalphRLMService {
              acceptance_criteria = EXCLUDED.acceptance_criteria,
              current_plan = EXCLUDED.current_plan,
              updated_at = NOW()
+         WHERE rlm_sessions.tenant_id = EXCLUDED.tenant_id
        RETURNING *`,
       [
         session.id, this.tenantId, session.task_id, session.task_title,
@@ -466,9 +462,13 @@ export class RalphRLMService {
       ],
     );
 
+    if (result.rows.length === 0) {
+      throw new Error('Cannot import an RLM session owned by another tenant');
+    }
+
     // Re-insert iterations
     for (const iter of session.iterations) {
-      await this.pool.query(
+      await this.tenantQuery(
         `INSERT INTO rlm_iterations
            (id, session_id, tenant_id, iteration_number, plan_summary, approach,
             outcome, evidence, ac_met, ac_failed, error, duration_ms, started_at, completed_at, metadata)

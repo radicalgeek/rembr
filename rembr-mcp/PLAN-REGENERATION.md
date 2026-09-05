@@ -329,7 +329,7 @@ Tests cover:
 
 ## Security
 
-- **Row-Level Security**: All tables enforce tenant isolation
+- **Tenant isolation**: Explicit tenant predicates plus RLS on the plan-regeneration tables
 - **Input Validation**: Task IDs and tenant IDs validated
 - **Context Isolation**: Regenerations only access same-tenant data
 

@@ -241,7 +241,9 @@ describe('OllamaClient', () => {
       );
 
       const promise = client.generateText('test');
-      
+
+      await Promise.resolve();
+      await Promise.resolve();
       vi.advanceTimersByTime(60000);
       
       await expect(promise).rejects.toThrow('Text generation timeout after 60000ms');
@@ -262,11 +264,13 @@ describe('OllamaClient', () => {
 
       const promise = lmStudioClient.generateText('User question');
 
+      await Promise.resolve();
+      await Promise.resolve();
       vi.advanceTimersByTime(179999);
       await Promise.resolve();
       vi.advanceTimersByTime(1);
 
-      await expect(promise).rejects.toThrow('Text generation timeout after 180000ms');
+      await expect(promise).rejects.toThrow('Upstream request timed out after 180000ms');
 
       vi.useRealTimers();
     });
@@ -284,6 +288,8 @@ describe('OllamaClient', () => {
 
       const promise = timeoutClient.generateText('test');
 
+      await Promise.resolve();
+      await Promise.resolve();
       vi.advanceTimersByTime(2500);
 
       await expect(promise).rejects.toThrow('Text generation timeout after 2500ms');
@@ -411,7 +417,7 @@ describe('OllamaClient', () => {
       expect(body.max_tokens).toBe(4096);
     });
 
-    it('should include finish reason and reasoning length when OpenAI-compatible response has no content', async () => {
+    it('should reject empty OpenAI-compatible content without reflecting upstream fields', async () => {
       process.env.LM_STUDIO_BASE_URL = 'http://lmstudio.local:1234/v1';
       process.env.LM_STUDIO_MODEL = 'qwen/qwen3.5-9b';
       (OllamaClient as any).instance = undefined;
@@ -428,22 +434,61 @@ describe('OllamaClient', () => {
       }));
 
       await expect(lmStudioClient.generateText('User question'))
-        .rejects.toThrow('finish_reason=length, reasoning_content_chars=23');
+        .rejects.toThrow('returned invalid or oversized content');
+    });
+
+    it('bounds text inputs before calling an upstream model', async () => {
+      await expect(client.generateText('x'.repeat(512 * 1024 + 1))).rejects.toThrow('prompt is invalid or too large');
+      await expect(client.generateText('prompt', undefined, { temperature: Number.NaN })).rejects.toThrow('temperature');
+      await expect(client.generateText('prompt', undefined, { maxTokens: -1 })).rejects.toThrow('maxTokens');
+      await expect(client.generateText('prompt', undefined, { stopSequences: new Array(17).fill('stop') })).rejects.toThrow('stop sequences');
+      expect(mockTextOllamaInstance.generate).not.toHaveBeenCalled();
+    });
+
+    it('rejects oversized OpenAI-compatible bodies and never reflects error bodies', async () => {
+      process.env.LM_STUDIO_BASE_URL = 'http://lmstudio.local:1234/v1';
+      (OllamaClient as any).instance = undefined;
+      const lmStudioClient = OllamaClient.getInstance();
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response('x'.repeat(1024 * 1024 + 1), {
+        headers: { 'content-type': 'application/json' },
+      })));
+      await expect(lmStudioClient.generateText('prompt')).rejects.toThrow('safe byte limit');
+
+      const privateDetail = ['model', 'internal', 'trace'].join('-');
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(privateDetail, { status: 500 })));
+      const failure = await lmStudioClient.generateText('prompt').catch(error => error as Error);
+      expect(failure.message).toBe('OpenAI-compatible text generation failed with status 500');
+      expect(failure.message).not.toContain(privateDetail);
+    });
+
+    it('rejects multiple OpenAI-compatible choices', async () => {
+      process.env.LM_STUDIO_BASE_URL = 'http://lmstudio.local:1234/v1';
+      (OllamaClient as any).instance = undefined;
+      const lmStudioClient = OllamaClient.getInstance();
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+        choices: new Array(17).fill({ message: { content: 'value' } }),
+      }), { headers: { 'content-type': 'application/json' } })));
+      await expect(lmStudioClient.generateText('prompt')).rejects.toThrow('invalid response shape');
     });
   });
 
   describe('isAvailable', () => {
     it('should return true when service is available', async () => {
-      mockOllamaInstance.list.mockResolvedValue({ models: [] });
+      const cancel = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        body: { cancel },
+      }));
 
       const result = await client.isAvailable();
 
       expect(result).toBe(true);
-      expect(mockOllamaInstance.list).toHaveBeenCalled();
+      expect(cancel).toHaveBeenCalledOnce();
     });
 
     it('should return false when service is unavailable', async () => {
-      mockOllamaInstance.list.mockRejectedValue(new Error('Connection failed'));
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Connection failed')));
 
       const result = await client.isAvailable();
 

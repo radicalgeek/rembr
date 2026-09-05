@@ -35,6 +35,9 @@ import type { Pool } from 'pg';
 import type { Request } from 'express';
 import { verifyOAuthToken, verifyApiKey, AuthService } from './auth.js';
 import type { AuthorizationContext } from './authorization.js';
+import { singleHeaderValue } from './security/secret-comparison.js';
+
+const EXTERNAL_AUTH_FAILURE = 'Authentication failed';
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -84,6 +87,29 @@ function extractBearerToken(authHeader: string): string | null {
   return match ? match[1].trim() : null;
 }
 
+function readSingleCredentialHeader(
+  req: Request,
+  name: 'x-api-key' | 'authorization',
+): { present: boolean; valid: boolean; value?: string } {
+  const rawValue = req.headers[name];
+  const rawHeaders = Array.isArray(req.rawHeaders) ? req.rawHeaders : [];
+  let occurrences = 0;
+  for (let index = 0; index < rawHeaders.length; index += 2) {
+    if (rawHeaders[index]?.toLowerCase() === name) occurrences += 1;
+  }
+
+  if (rawValue === undefined && occurrences === 0) {
+    return { present: false, valid: true };
+  }
+
+  const value = singleHeaderValue(rawValue);
+  return {
+    present: true,
+    valid: occurrences <= 1 && value !== undefined && !value.includes(','),
+    value,
+  };
+}
+
 function emit(
   options: UnifiedAuthOptions | undefined,
   event: AuthAuditEvent,
@@ -102,10 +128,10 @@ function emit(
 /**
  * Authenticate an incoming HTTP request against all supported mechanisms.
  *
- * Precedence (highest → lowest):
- *   1. API key (`x-api-key` header)  — always wins if the header is present
- *   2. OAuth Bearer token            — `Authorization: Bearer mcp_oauth_*`
- *   3. JWT Bearer token              — `Authorization: Bearer <jwt>`
+ * Exactly one mechanism may be supplied:
+ *   1. API key (`x-api-key` header)
+ *   2. OAuth Bearer token (`Authorization: Bearer mcp_oauth_*`)
+ *   3. JWT Bearer token (`Authorization: Bearer <jwt>`)
  *
  * Fail-fast rules:
  *   - If an `x-api-key` header is present but the key is invalid → 401, no fallthrough.
@@ -118,9 +144,26 @@ export async function authenticateRequest(
   options?: UnifiedAuthOptions,
 ): Promise<AuthOutcome> {
   const authService = new AuthService();
+  const apiKeyHeader = readSingleCredentialHeader(req, 'x-api-key');
+  const authorizationHeader = readSingleCredentialHeader(req, 'authorization');
+
+  if (!apiKeyHeader.valid || !authorizationHeader.valid ||
+      (apiKeyHeader.present && authorizationHeader.present)) {
+    emit(options, {
+      method: 'none',
+      success: false,
+      error: 'Ambiguous authentication credentials',
+      timestamp: new Date(),
+    });
+    return {
+      success: false,
+      error: EXTERNAL_AUTH_FAILURE,
+      statusCode: 401,
+    };
+  }
 
   // ── 1. API key ────────────────────────────────────────────
-  const apiKey = req.headers['x-api-key'] as string | undefined;
+  const apiKey = apiKeyHeader.value;
   if (apiKey) {
     const result = await verifyApiKey(pool, apiKey);
     const event: AuthAuditEvent = {
@@ -136,7 +179,7 @@ export async function authenticateRequest(
     if (!result.success) {
       return {
         success: false,
-        error: result.error ?? 'Invalid API key',
+        error: EXTERNAL_AUTH_FAILURE,
         attemptedMethod: 'api_key',
         statusCode: 401,
       };
@@ -146,14 +189,20 @@ export async function authenticateRequest(
       success: true,
       tenantId: result.tenantId!,
       projectId: result.projectId,
+      userId: result.userId,
       apiKeyId: result.apiKeyId,
       authMethod: 'api_key',
       authenticatedAt: new Date(),
+      capabilities: result.capabilities || [],
+      metadata: {
+        purpose: result.purpose,
+        authVersion: result.authVersion,
+      },
     };
   }
 
   // ── 2. Bearer token (OAuth or JWT) ────────────────────────
-  const authHeader = req.headers.authorization as string | undefined;
+  const authHeader = authorizationHeader.value;
   if (authHeader) {
     const token = extractBearerToken(authHeader);
     if (!token) {
@@ -165,7 +214,7 @@ export async function authenticateRequest(
       });
       return {
         success: false,
-        error: 'Malformed Authorization header — expected "Bearer <token>"',
+        error: EXTERNAL_AUTH_FAILURE,
         attemptedMethod: 'oauth',
         statusCode: 401,
       };
@@ -186,7 +235,7 @@ export async function authenticateRequest(
       if (!result.success) {
         return {
           success: false,
-          error: result.error ?? 'Invalid OAuth token',
+          error: EXTERNAL_AUTH_FAILURE,
           attemptedMethod: 'oauth',
           statusCode: 401,
         };
@@ -199,6 +248,11 @@ export async function authenticateRequest(
         userId: result.userId,
         authMethod: 'oauth',
         authenticatedAt: new Date(),
+        capabilities: result.capabilities || [],
+        metadata: {
+          clientId: result.clientId,
+          authVersion: result.authVersion,
+        },
       };
     }
 
@@ -216,10 +270,42 @@ export async function authenticateRequest(
     if (!result.success) {
       return {
         success: false,
-        error: result.error ?? 'Invalid JWT token',
+        error: EXTERNAL_AUTH_FAILURE,
         attemptedMethod: 'jwt',
         statusCode: 401,
       };
+    }
+
+    // Stateless JWT access is tied to current principal state. In production,
+    // an auth_version claim is mandatory so logout/deactivation can invalidate
+    // outstanding tokens immediately after the version is incremented.
+    if (process.env.NODE_ENV === 'production' &&
+        (!result.userId || !Number.isInteger(result.authVersion))) {
+      return {
+        success: false,
+        error: EXTERNAL_AUTH_FAILURE,
+        attemptedMethod: 'jwt',
+        statusCode: 401,
+      };
+    }
+
+    if (result.userId && Number.isInteger(result.authVersion)) {
+      const principal = await pool.query(
+        `SELECT t.status AS tenant_status, u.status AS user_status, u.auth_version
+         FROM users u
+         JOIN tenants t ON t.id = u.tenant_id
+         WHERE u.id = $1 AND u.tenant_id = $2`,
+        [result.userId, result.tenantId],
+      );
+      const row = principal.rows[0];
+      if (!row || row.tenant_status !== 'active' || row.user_status !== 'active' || row.auth_version !== result.authVersion) {
+        return {
+          success: false,
+          error: EXTERNAL_AUTH_FAILURE,
+          attemptedMethod: 'jwt',
+          statusCode: 401,
+        };
+      }
     }
 
     return {
@@ -229,6 +315,11 @@ export async function authenticateRequest(
       userId: result.userId,
       authMethod: 'jwt',
       authenticatedAt: new Date(),
+      capabilities: result.capabilities || [],
+      metadata: {
+        authVersion: result.authVersion,
+        purpose: result.purpose,
+      },
     };
   }
 
@@ -245,11 +336,7 @@ export async function authenticateRequest(
 
   return {
     success: false,
-    error:
-      'No valid authentication credentials provided. ' +
-      'Use OAuth (Authorization: Bearer mcp_oauth_*) ' +
-      'or an API key (X-API-Key). Session-based authentication was removed ' +
-      'with MCP 2026-07-28.',
+    error: EXTERNAL_AUTH_FAILURE,
     statusCode: 401,
   };
 }

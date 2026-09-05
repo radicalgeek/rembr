@@ -10,7 +10,7 @@
  * - Interactive charts with tooltips
  */
 
-import { renderTemplate, SCRIPT_INCLUDES } from './index.js';
+import { renderTemplate, SCRIPT_INCLUDES, safeJsonForHtml } from './index.js';
 
 export interface PredictiveAnalyticsData {
   memory_growth_prediction: {
@@ -31,7 +31,7 @@ export interface PredictiveAnalyticsData {
  * Render the predictive analytics dashboard
  */
 export function renderAnalyticsDashboard(data: PredictiveAnalyticsData): string {
-  const dataJson = JSON.stringify(data, null, 2);
+  const dataJson = safeJsonForHtml(data);
   
   // Prepare category data for Chart.js
   const categories = Object.keys(data.category_usage_prediction);
@@ -181,8 +181,8 @@ export function renderAnalyticsDashboard(data: PredictiveAnalyticsData): string 
               <div style="display: flex; align-items: start; gap: 0.75rem;">
                 <span style="font-size: 1.25rem;">${insight.icon}</span>
                 <div style="flex: 1;">
-                  <div style="font-weight: 600; margin-bottom: 0.25rem; font-size: 0.875rem;">${insight.title}</div>
-                  <div style="color: var(--rembr-text-secondary); font-size: 0.875rem;">${insight.description}</div>
+                  <div style="font-weight: 600; margin-bottom: 0.25rem; font-size: 0.875rem;">${escapeHtml(insight.title)}</div>
+                  <div style="color: var(--rembr-text-secondary); font-size: 0.875rem;">${escapeHtml(insight.description)}</div>
                 </div>
               </div>
             </div>
@@ -266,9 +266,9 @@ export function renderAnalyticsDashboard(data: PredictiveAnalyticsData): string 
 
         // Category Usage Chart
         const categoryCtx = document.getElementById('category-chart').getContext('2d');
-        const categories = ${JSON.stringify(categories)};
-        const categoryValues = ${JSON.stringify(categoryValues)};
-        const categoryColors = ${JSON.stringify(categoryColors)};
+        const categories = ${safeJsonForHtml(categories)};
+        const categoryValues = ${safeJsonForHtml(categoryValues)};
+        const categoryColors = ${safeJsonForHtml(categoryColors)};
 
         new Chart(categoryCtx, {
           type: 'doughnut',

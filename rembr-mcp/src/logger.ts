@@ -5,7 +5,30 @@
  * All logs are output to stdout in JSON format for container log collection.
  */
 
+import { toolSchemas } from './schemas.js';
+
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+const SAFE_CONTEXT_KEYS = new Set([
+  'correlationId', 'tool', 'operation', 'category', 'transport', 'searchMode',
+  'resultCount', 'errorType', 'status', 'count', 'durationMs',
+]);
+const SAFE_OPERATIONS = new Set(['authentication', 'http_request', 'database_query', 'optimization']);
+const KNOWN_TOOLS = new Set(Object.keys(toolSchemas));
+
+function sanitiseLogContext(context?: LogContext): LogContext | undefined {
+  if (!context) return undefined;
+  const safe: LogContext = {};
+  for (const [key, value] of Object.entries(context)) {
+    if (!SAFE_CONTEXT_KEYS.has(key)) continue;
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      safe[key] = value;
+    } else if (typeof value === 'string') {
+      safe[key] = value.slice(0, 100).replace(/[\r\n]/g, ' ');
+    }
+  }
+  return Object.keys(safe).length > 0 ? safe : undefined;
+}
 
 export interface LogContext {
   tenantId?: string;
@@ -48,6 +71,7 @@ class StructuredLogger {
     error?: Error,
     metrics?: Record<string, number>
   ): LogEntry {
+    const safeContext = sanitiseLogContext(context);
     const entry: LogEntry = {
       timestamp: new Date().toISOString(),
       level,
@@ -56,21 +80,20 @@ class StructuredLogger {
         service: this.serviceName,
         environment: this.environment,
         version: this.version,
-        ...(context?.tenantId && { tenant_id: context.tenantId }),
-        ...(context?.tool && { tool_name: context.tool }),
-        ...(context?.operation && { operation: context.operation })
+        ...(safeContext?.tool && { tool_name: safeContext.tool }),
+        ...(safeContext?.operation && SAFE_OPERATIONS.has(safeContext.operation) && { operation: safeContext.operation })
       }
     };
 
-    if (context) {
-      entry.context = context;
+    if (safeContext) {
+      entry.context = safeContext;
     }
 
     if (error) {
       entry.error = {
-        message: error.message,
+        message: this.environment === 'production' ? 'Operation failed' : error.message,
         type: error.constructor.name,
-        stack: error.stack,
+        ...(this.environment !== 'production' && { stack: error.stack }),
         code: (error as any).code
       };
     }
@@ -147,8 +170,9 @@ class StructuredLogger {
     durationMs?: number,
     error?: Error
   ): void {
-    const message = `MCP tool ${toolName} ${status}`;
-    const logContext = { ...context, tool: toolName };
+    const safeToolName = KNOWN_TOOLS.has(toolName) ? toolName : 'unknown';
+    const message = `MCP tool ${safeToolName} ${status}`;
+    const logContext = { ...context, tool: safeToolName };
     const metrics = durationMs ? { duration_ms: durationMs } : undefined;
 
     if (status === 'error' && error) {
