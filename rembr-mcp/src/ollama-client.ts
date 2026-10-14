@@ -46,7 +46,11 @@ const MAX_TEXT_TOKENS = 16_384;
  * ## Environment Variables
  * - `OLLAMA_HOST`              — Ollama base URL for embeddings (default: cluster-local service)
  * - `OLLAMA_TEXT_HOST`         — Optional Ollama base URL for text generation
- * - `TEXT_GENERATION_PROVIDER` — "ollama" or "openai-compatible" (also accepts "lmstudio")
+ * - `TEXT_GENERATION_PROVIDER` — "ollama", "openai-compatible" (also accepts "lmstudio"), or "azure"
+ * - `AZURE_OPENAI_ENDPOINT`    — Azure OpenAI endpoint (text gen when TEXT_GENERATION_PROVIDER=azure)
+ * - `AZURE_OPENAI_API_KEY`     — Azure OpenAI API key (sent as the api-key header)
+ * - `AZURE_OPENAI_API_VERSION` — Azure REST API version (default: 2024-10-21)
+ * - `AZURE_OPENAI_TEXT_DEPLOYMENT` — Azure deployment name for text generation
  * - `LM_STUDIO_BASE_URL`       — LM Studio/OpenAI-compatible base URL, e.g. http://host:1234/v1
  * - `LM_STUDIO_MODEL`          — LM Studio model id for text generation
  * - `LM_STUDIO_API_KEY`        — Optional LM Studio bearer token (defaults to a non-empty local token)
@@ -67,8 +71,12 @@ export class OllamaClient {
   private textClient: Ollama;
   private host: string;
   private textHost: string;
-  private textProvider: 'ollama' | 'openai-compatible';
+  private textProvider: 'ollama' | 'openai-compatible' | 'azure';
   private openAICompatibleApiKey: string;
+  private azureEndpoint: string;
+  private azureApiKey: string;
+  private azureApiVersion: string;
+  private azureTextDeployment: string;
   private embeddingModel: string;
   private textModel: string;
   private embeddingCache: EmbeddingCache;
@@ -94,6 +102,10 @@ export class OllamaClient {
     this.openAICompatibleApiKey = process.env.LM_STUDIO_API_KEY
       || process.env.OPENAI_COMPATIBLE_API_KEY
       || 'lm-studio';
+    this.azureEndpoint = (process.env.AZURE_OPENAI_ENDPOINT || '').replace(/\/+$/, '');
+    this.azureApiKey = process.env.AZURE_OPENAI_API_KEY || '';
+    this.azureApiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-10-21';
+    this.azureTextDeployment = process.env.AZURE_OPENAI_TEXT_DEPLOYMENT || '';
     this.embeddingModel = process.env.OLLAMA_EMBEDDING_MODEL || 'nomic-embed-text';
     this.textModel = process.env.LM_STUDIO_MODEL
       || process.env.OPENAI_COMPATIBLE_TEXT_MODEL
@@ -104,7 +116,7 @@ export class OllamaClient {
     this.embeddingCache = EmbeddingCache.getInstance();
     this.MAX_RETRIES = parseInt(process.env.OLLAMA_MAX_RETRIES || '3', 10);
     this.FALLBACK_MODE = process.env.OLLAMA_FALLBACK_EMBEDDING === 'zero' ? 'zero' : 'throw';
-    const defaultTextTimeout = this.textProvider === 'openai-compatible' ? 180_000 : 60_000;
+    const defaultTextTimeout = this.textProvider === 'ollama' ? 60_000 : 180_000;
     this.TEXT_GENERATION_TIMEOUT_MS = this.parsePositiveInt(
       process.env.TEXT_GENERATION_TIMEOUT_MS,
       defaultTextTimeout
@@ -330,6 +342,9 @@ export class OllamaClient {
     this.validateTextGenerationInput(prompt, systemPrompt, options);
     return modelConcurrencyLimiter.withPermit({ tenantId: options?.tenantId, signal: options?.signal }, async () => {
       try {
+      if (this.textProvider === 'azure') {
+        return await this.generateAzureText(prompt, systemPrompt, options);
+      }
       if (this.textProvider === 'openai-compatible') {
         return await this.generateOpenAICompatibleText(prompt, systemPrompt, options);
       }
@@ -425,13 +440,93 @@ export class OllamaClient {
     return text;
   }
 
-  private resolveTextProvider(textHost: string): 'ollama' | 'openai-compatible' {
+  /**
+   * Generate text via Azure OpenAI chat completions.
+   *
+   * Azure uses deployment-based URLs and an `api-key` header rather than the
+   * OpenAI `/v1` + `Authorization: Bearer` shape. gpt-5 family deployments
+   * require `max_completion_tokens` instead of `max_tokens`.
+   */
+  private async generateAzureText(
+    prompt: string,
+    systemPrompt?: string,
+    options?: {
+      temperature?: number;
+      maxTokens?: number;
+      stopSequences?: string[];
+    }
+  ): Promise<string> {
+    if (!this.azureEndpoint || !this.azureApiKey || !this.azureTextDeployment) {
+      throw new Error('Azure text generation requires AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY and AZURE_OPENAI_TEXT_DEPLOYMENT');
+    }
+
+    const messages = [
+      ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+      { role: 'user', content: prompt }
+    ];
+
+    const usesMaxCompletionTokens = this.azureTextDeployment.toLowerCase().startsWith('gpt-5');
+    const body: Record<string, unknown> = {
+      messages,
+      stream: false,
+      temperature: options?.temperature ?? 0.7
+    };
+    if (usesMaxCompletionTokens) {
+      // GPT-5 deployments reject the stop parameter, including non-empty sequences.
+      body.max_completion_tokens = options?.maxTokens ?? 500;
+    } else {
+      body.max_tokens = options?.maxTokens ?? 500;
+      if (options?.stopSequences) {
+        body.stop = options.stopSequences;
+      }
+    }
+
+    const url = `${this.azureEndpoint}/openai/deployments/${encodeURIComponent(this.azureTextDeployment)}/chat/completions?api-version=${encodeURIComponent(this.azureApiVersion)}`;
+    const response = await fetchWithDeadline(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'api-key': this.azureApiKey
+      },
+      body: JSON.stringify(body)
+    }, this.TEXT_GENERATION_TIMEOUT_MS);
+
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => '');
+      await cancelResponseBody(response);
+      throw new Error(`Azure text generation failed (${response.status}): ${errorBody.slice(0, 500)}`);
+    }
+
+    const data = await response.json() as {
+      choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+      error?: { message?: string };
+    };
+
+    const content = data.choices?.[0]?.message?.content;
+    if (typeof content !== 'string' || !content || content.length > MAX_GENERATED_TEXT_CHARS) {
+      const finishReason = data.choices?.[0]?.finish_reason ?? 'unknown';
+      throw new Error(
+        data.error?.message ||
+        `Azure text generation returned no content (finish_reason=${finishReason})`
+      );
+    }
+
+    return content;
+  }
+
+  private resolveTextProvider(textHost: string): 'ollama' | 'openai-compatible' | 'azure' {
     const configured = process.env.TEXT_GENERATION_PROVIDER?.toLowerCase();
+    if (configured === 'azure') {
+      return 'azure';
+    }
     if (configured === 'openai-compatible' || configured === 'lmstudio' || configured === 'lm-studio') {
       return 'openai-compatible';
     }
     if (configured === 'ollama') {
       return 'ollama';
+    }
+    if (process.env.AZURE_OPENAI_TEXT_DEPLOYMENT && process.env.AZURE_OPENAI_ENDPOINT) {
+      return 'azure';
     }
     if (process.env.LM_STUDIO_BASE_URL || process.env.OPENAI_COMPATIBLE_TEXT_BASE_URL) {
       return 'openai-compatible';

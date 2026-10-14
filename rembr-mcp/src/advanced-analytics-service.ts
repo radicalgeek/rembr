@@ -690,6 +690,8 @@ Do these statements contradict each other? Analyze carefully.`;
     includeRelationships: boolean = true,
     projectId?: string,
     userId?: string,
+    minEdgeWeight: number = 0.68,
+    memoryIds?: string[]
   ): Promise<ContextGraph> {
     const memories = await this.getMemoriesForAnalysis(
       tenantId,
@@ -698,6 +700,7 @@ Do these statements contradict each other? Analyze carefully.`;
       userId,
       AdvancedAnalyticsService.GRAPH_MAX_NODES,
       AdvancedAnalyticsService.GRAPH_CONTENT_CHARS,
+      memoryIds
     );
     const totalCount = Number(memories[0]?.total_count || memories.length);
     const boundedMemories = memories.slice(0, AdvancedAnalyticsService.GRAPH_MAX_NODES).map(memory => {
@@ -728,19 +731,21 @@ Do these statements contradict each other? Analyze carefully.`;
     // Create edges based on similarity and relationships
     const edges: GraphEdge[] = [];
     
-    if (includeRelationships && this.embeddingProvider) {
-      for (let i = 0; i < boundedMemories.length && edges.length < AdvancedAnalyticsService.GRAPH_MAX_EDGES; i++) {
-        const neighbourLimit = Math.min(
-          boundedMemories.length,
-          i + 1 + AdvancedAnalyticsService.GRAPH_NEIGHBOURS_PER_NODE,
-        );
-        for (let j = i + 1; j < neighbourLimit && edges.length < AdvancedAnalyticsService.GRAPH_MAX_EDGES; j++) {
-          const edge = await this.calculateMemoryEdge(boundedMemories[i], boundedMemories[j]);
-          if (edge) {
-            edges.push(edge);
-          }
-        }
-      }
+    if (includeRelationships) {
+      // Real pgvector cosine edges for the displayed nodes, computed in one
+      // bounded query instead of per-pair application-side comparisons.
+      const similarities = await this.database.getEmbeddingSimilarityEdges(
+        tenantId,
+        boundedMemories.map(memory => memory.id),
+        minEdgeWeight
+      );
+      edges.push(...similarities.slice(0, AdvancedAnalyticsService.GRAPH_MAX_EDGES).map(edge => ({
+        source: edge.source,
+        target: edge.target,
+        weight: edge.similarity,
+        type: 'similarity' as const,
+        label: edge.similarity > 0.8 ? 'strong' : edge.similarity > 0.6 ? 'moderate' : 'weak'
+      })));
     }
 
     // Detect clusters using category and semantic similarity
@@ -816,6 +821,7 @@ Do these statements contradict each other? Analyze carefully.`;
     userId?: string,
     limit: number = 200,
     contentCharacterLimit: number = 16_000,
+    memoryIds?: string[]
   ): Promise<any[]> {
     const safeLimit = Number.isSafeInteger(limit) ? Math.min(Math.max(limit, 1), 200) : 200;
     const safeContentLimit = Number.isSafeInteger(contentCharacterLimit)
@@ -824,7 +830,32 @@ Do these statements contradict each other? Analyze carefully.`;
     let query: string;
     let params: any[];
 
-    if (contextId) {
+    if (memoryIds?.length) {
+      query = `
+        SELECT m.id, LEFT(m.content, $4::integer) AS content, m.category,
+               CASE WHEN octet_length(m.metadata::text) <= 8192
+                    THEN m.metadata ELSE '{}'::jsonb END AS metadata,
+               m.created_at, m.updated_at, m.relevance_score,
+               COUNT(*) OVER()::integer AS total_count
+        FROM memories m
+        LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
+        WHERE m.tenant_id = $1 AND m.id = ANY($2::uuid[])
+          AND (
+            (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
+            OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
+            OR (
+              COALESCE(m.visibility, 'shared') IN ('shared', 'project')
+              AND p.id IS NOT NULL
+              AND (p.is_personal = false OR p.owner_id = $3::uuid
+                   OR EXISTS (SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p.id AND pm.user_id = $3::uuid))
+            )
+          )
+        ORDER BY m.created_at ASC
+        LIMIT $5::integer
+      `;
+      params = [tenantId, memoryIds.slice(0, safeLimit), userId || null, safeContentLimit, safeLimit];
+    } else if (contextId) {
       query = `
         SELECT m.id, LEFT(m.content, $5::integer) AS content, m.category,
                CASE WHEN octet_length(m.metadata::text) <= 8192
@@ -1418,29 +1449,6 @@ Do these statements contradict each other? Analyze carefully.`;
       reminders: '#ef4444'
     };
     return colors[category as keyof typeof colors] || '#6b7280';
-  }
-
-  private async calculateMemoryEdge(memoryA: any, memoryB: any): Promise<GraphEdge | null> {
-    if (!this.embeddingProvider) return null;
-
-    // Calculate semantic similarity if embeddings exist
-    let similarity = 0;
-    try {
-      // This would require embedding lookups - simplified for now
-      similarity = this.textSimilarity(memoryA.content, memoryB.content);
-    } catch (error) {
-      similarity = 0;
-    }
-
-    if (similarity < 0.3) return null; // Too weak to visualize
-
-    return {
-      source: memoryA.id,
-      target: memoryB.id,
-      weight: similarity,
-      type: memoryA.category === memoryB.category ? 'categorical' : 'similarity',
-      label: similarity > 0.8 ? 'strong' : similarity > 0.6 ? 'moderate' : 'weak'
-    };
   }
 
   private detectClusters(nodes: GraphNode[], edges: GraphEdge[]): GraphCluster[] {

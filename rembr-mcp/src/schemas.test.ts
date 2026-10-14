@@ -627,6 +627,28 @@ describe('validateToolInput — tool coverage completeness (REM-248)', () => {
   })
 })
 
+describe('set_memory_visibility audience target', () => {
+  const MEMORY_ID = 'a5d8463a-7e30-423d-8fc3-aede3d8ffd0c'
+  const PROJECT_ID = 'b5d8463a-7e30-423d-8fc3-aede3d8ffd0c'
+
+  it('requires a project target only for project visibility', () => {
+    expect(validateToolInput('set_memory_visibility', {
+      memory_id: MEMORY_ID,
+      visibility: 'project',
+      project_id: PROJECT_ID
+    }).success).toBe(true)
+    expect(validateToolInput('set_memory_visibility', {
+      memory_id: MEMORY_ID,
+      visibility: 'project'
+    }).success).toBe(false)
+    expect(validateToolInput('set_memory_visibility', {
+      memory_id: MEMORY_ID,
+      visibility: 'shared',
+      project_id: PROJECT_ID
+    }).success).toBe(false)
+  })
+})
+
 // ─── RAD-7: mcporter Quote-Stripping ─────────────────────────────────────────
 describe('RAD-7: UUID and enum quote tolerance (mcporter extra-quoting fix)', () => {
   const VALID_UUID = 'a5d8463a-7e30-423d-8fc3-aede3d8ffd0c'
@@ -729,6 +751,62 @@ describe('RAD-7: UUID and enum quote tolerance (mcporter extra-quoting fix)', ()
       })
       expect(result.success).toBe(false)
     })
+  })
+})
+
+describe('generate_context_graph embedding edges', () => {
+  const MEMORY_IDS = [
+    'a5d8463a-7e30-423d-8fc3-aede3d8ffd0c',
+    'b5d8463a-7e30-423d-8fc3-aede3d8ffd0c'
+  ]
+
+  it('accepts exact memory IDs and a cosine threshold', () => {
+    const result = validateToolInput('generate_context_graph', {
+      memory_ids: MEMORY_IDS,
+      min_edge_weight: 0.68
+    })
+    expect(result.success).toBe(true)
+  })
+
+  it('accepts semantic hierarchy requests with an optional cluster ID', () => {
+    expect(validateToolInput('generate_context_graph', { cluster_algorithm: 'semantic' }).success).toBe(true)
+    expect(validateToolInput('generate_context_graph', {
+      cluster_algorithm: 'semantic',
+      cluster_id: MEMORY_IDS[0],
+      filter_query: 'fixture topic'
+    }).success).toBe(true)
+    expect(validateToolInput('generate_context_graph', {
+      cluster_algorithm: 'semantic',
+      filter_query: 'x'.repeat(201)
+    }).success).toBe(false)
+  })
+
+  it('rejects invalid memory IDs and thresholds', () => {
+    expect(validateToolInput('generate_context_graph', { memory_ids: ['not-a-uuid'] }).success).toBe(false)
+    expect(validateToolInput('generate_context_graph', { memory_ids: MEMORY_IDS, min_edge_weight: 1.1 }).success).toBe(false)
+  })
+
+  it('accepts up to 300 memory IDs', () => {
+    const memoryIds = Array.from(
+      { length: 300 },
+      (_, index) => `550e8400-e29b-41d4-a716-${index.toString().padStart(12, '0')}`
+    )
+
+    expect(validateToolInput('generate_context_graph', { memory_ids: memoryIds }).success).toBe(true)
+    expect(validateToolInput('generate_context_graph', { memory_ids: [...memoryIds, MEMORY_IDS[0]] }).success).toBe(false)
+  })
+})
+
+describe('list_memories console page size', () => {
+  it('accepts up to 300 memories', () => {
+    expect(validateToolInput('list_memories', { limit: 300 }).success).toBe(true)
+    expect(validateToolInput('list_memories', { limit: 301 }).success).toBe(false)
+  })
+
+  it('accepts bounded pagination offsets', () => {
+    expect(validateToolInput('list_memories', { limit: 50, offset: 50 }).success).toBe(true)
+    expect(validateToolInput('list_memories', { offset: -1 }).success).toBe(false)
+    expect(validateToolInput('list_memories', { offset: 1_000_001 }).success).toBe(false)
   })
 })
 

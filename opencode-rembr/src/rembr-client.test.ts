@@ -136,6 +136,19 @@ describe("convenience wrappers", () => {
     })
   })
 
+  it("recent maps source-aware ordering to memory/list", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(toolResult(1, "results")))
+    const client = new RembrClient({ url: "https://rembr.test/mcp", apiKey: "k", fetchImpl })
+
+    await client.recent(50, "source_created_at")
+
+    const body = JSON.parse(fetchImpl.mock.calls[0][1].body)
+    expect(body.params).toEqual({
+      name: "memory",
+      arguments: { operation: "list", limit: 50, sort_by: "source_created_at" },
+    })
+  })
+
   it("forget maps to memory/delete", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(toolResult(1, "deleted")))
     const client = new RembrClient({ url: "https://rembr.test/mcp", apiKey: "k", fetchImpl })

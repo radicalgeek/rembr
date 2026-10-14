@@ -1,7 +1,7 @@
 {
   "name": "rembr",
-  "description": "Persistent cross-session memory for Claude Code, backed by Rembr: MCP memory tools, session-start recall injection, and trigger-phrase auto-capture.",
-  "version": "0.1.0",
+  "description": "Persistent cross-session memory for Claude Code, backed by Rembr: MCP tools, first-prompt semantic recall or session restoration, and automatic capture.",
+  "version": "0.3.4",
   "author": {
     "name": "Mark @ radicalgeek"
   },

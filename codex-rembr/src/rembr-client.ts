@@ -184,6 +184,11 @@ export class RembrClient {
     })
   }
 
+  /** List recent memories using native or source-aware ordering. */
+  recent(limit = 50, sortBy: "created_at" | "source_created_at" = "source_created_at"): Promise<string> {
+    return this.callTool("memory", { operation: "list", limit, sort_by: sortBy })
+  }
+
   /** Delete a memory by id. */
   forget(id: string): Promise<string> {
     return this.callTool("memory", { operation: "delete", id })

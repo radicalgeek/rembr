@@ -184,6 +184,11 @@ export class RembrClient {
     })
   }
 
+  /** List the newest memories for compact session-continuity fallback context. */
+  recent(limit = 5, sortBy: "created_at" | "source_created_at" = "created_at"): Promise<string> {
+    return this.callTool("memory", { operation: "list", limit, sort_by: sortBy })
+  }
+
   /** Delete a memory by id. */
   forget(id: string): Promise<string> {
     return this.callTool("memory", { operation: "delete", id })

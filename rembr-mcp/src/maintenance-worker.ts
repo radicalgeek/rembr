@@ -1,6 +1,7 @@
 import { MemoryDatabase } from './database.js';
 import { MemoryMaintenanceService } from './memory-maintenance-service.js';
 import {
+  AzureOpenAIEmbeddingProvider,
   EmbeddingProvider,
   OllamaEmbeddingProvider,
   OpenAICompatibleEmbeddingProvider
@@ -15,6 +16,17 @@ function createEmbeddingProvider(): EmbeddingProvider {
   const provider = process.env.EMBEDDING_PROVIDER || 'ollama';
   const model = process.env.EMBEDDING_MODEL || process.env.OLLAMA_EMBEDDING_MODEL || 'nomic-embed-text';
   const dimensions = parsePositiveInt(process.env.EMBEDDING_DIMENSIONS, 768);
+
+  if (provider === 'azure') {
+    const endpoint = process.env.AZURE_OPENAI_ENDPOINT || '';
+    const deployment = process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT || model;
+    const apiKey = process.env.AZURE_OPENAI_API_KEY || '';
+    const apiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-10-21';
+    if (!endpoint || !apiKey) {
+      throw new Error('EMBEDDING_PROVIDER=azure requires AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY');
+    }
+    return new AzureOpenAIEmbeddingProvider(endpoint, deployment, apiKey, apiVersion, dimensions);
+  }
 
   if (provider === 'openai-compatible') {
     const baseUrl = process.env.EMBEDDING_BASE_URL || process.env.LM_STUDIO_BASE_URL || 'http://localhost:1234/v1';
@@ -40,6 +52,10 @@ class MaintenanceWorker {
   private readonly contradictionBatchSize = parsePositiveInt(process.env.MAINTENANCE_CONTRADICTION_BATCH_SIZE, 3);
   private readonly evolutionBatchSize = parsePositiveInt(process.env.MAINTENANCE_EVOLUTION_BATCH_SIZE, 2);
   private readonly cleanupBatchSize = parsePositiveInt(process.env.MAINTENANCE_CLEANUP_BATCH_SIZE, 10);
+  private readonly relationshipEnabled = process.env.MAINTENANCE_RELATIONSHIP_ENABLED !== 'false';
+  private readonly contradictionEnabled = process.env.MAINTENANCE_CONTRADICTION_ENABLED !== 'false';
+  private readonly evolutionEnabled = process.env.MEMORY_EVOLUTION_ENABLED !== 'false';
+  private readonly cleanupEnabled = process.env.MAINTENANCE_CLEANUP_ENABLED !== 'false';
   private readonly relationshipMinConfidence = Number.parseFloat(process.env.MAINTENANCE_RELATIONSHIP_MIN_CONFIDENCE || '0.65');
   private readonly contradictionMinConfidence = Number.parseFloat(process.env.MAINTENANCE_CONTRADICTION_MIN_CONFIDENCE || '0.7');
   private readonly evolutionMinConfidence = Number.parseFloat(process.env.MAINTENANCE_EVOLUTION_MIN_CONFIDENCE || '0.85');
@@ -53,9 +69,13 @@ class MaintenanceWorker {
       enqueueLimit: this.enqueueLimit,
       batchSize: this.batchSize,
       relationshipBatchSize: this.relationshipBatchSize,
+      relationshipEnabled: this.relationshipEnabled,
       contradictionBatchSize: this.contradictionBatchSize,
+      contradictionEnabled: this.contradictionEnabled,
       evolutionBatchSize: this.evolutionBatchSize,
+      evolutionEnabled: this.evolutionEnabled,
       cleanupBatchSize: this.cleanupBatchSize,
+      cleanupEnabled: this.cleanupEnabled,
       embeddingProvider: this.embeddingProvider.name,
       embeddingModel: this.embeddingProvider.model
     });
@@ -113,29 +133,45 @@ class MaintenanceWorker {
       for (const tenant of tenants) {
         const missing = await this.service.enqueueMissingEmbeddingJobs(tenant.tenant_id, this.enqueueLimit);
         const stale = await this.service.enqueueStaleEmbeddingJobs(tenant.tenant_id, this.enqueueLimit);
-        const relationships = await this.service.enqueueRelationshipInferenceJobs(tenant.tenant_id, this.enqueueLimit);
-        const contradictions = await this.service.enqueueContradictionDetectionJobs(tenant.tenant_id, this.enqueueLimit);
-        const evolution = await this.service.enqueueMemoryEvolutionJobs(tenant.tenant_id, this.enqueueLimit);
-        const cleanup = await this.service.enqueueExpiredMemoryCleanupJobs(tenant.tenant_id, this.enqueueLimit);
+        const relationships = this.relationshipEnabled
+          ? await this.service.enqueueRelationshipInferenceJobs(tenant.tenant_id, this.enqueueLimit)
+          : { job_type: 'relationship_inference' as const, created: 0 };
+        const contradictions = this.contradictionEnabled
+          ? await this.service.enqueueContradictionDetectionJobs(tenant.tenant_id, this.enqueueLimit)
+          : { job_type: 'contradiction_detection' as const, created: 0 };
+        const evolution = this.evolutionEnabled
+          ? await this.service.enqueueMemoryEvolutionJobs(tenant.tenant_id, this.enqueueLimit)
+          : { job_type: 'memory_evolution' as const, created: 0 };
+        const cleanup = this.cleanupEnabled
+          ? await this.service.enqueueExpiredMemoryCleanupJobs(tenant.tenant_id, this.enqueueLimit)
+          : { job_type: 'cleanup' as const, created: 0 };
         const expiredSnapshots = await this.service.cleanExpiredSnapshots(tenant.tenant_id, this.enqueueLimit);
         const processedMissing = await this.service.processEmbeddingBackfillBatch(tenant.tenant_id, this.batchSize);
         const processedStale = await this.service.processStaleEmbeddingBatch(tenant.tenant_id, this.batchSize);
-        const processedRelationships = await this.service.processRelationshipInferenceBatch(
-          tenant.tenant_id,
-          this.relationshipBatchSize,
-          this.relationshipMinConfidence
-        );
-        const processedContradictions = await this.service.processContradictionDetectionBatch(
-          tenant.tenant_id,
-          this.contradictionBatchSize,
-          this.contradictionMinConfidence
-        );
-        const processedEvolution = await this.service.processMemoryEvolutionBatch(
-          tenant.tenant_id,
-          this.evolutionBatchSize,
-          this.evolutionMinConfidence
-        );
-        const processedCleanup = await this.service.processCleanupBatch(tenant.tenant_id, this.cleanupBatchSize);
+        const processedRelationships = this.relationshipEnabled
+          ? await this.service.processRelationshipInferenceBatch(
+              tenant.tenant_id,
+              this.relationshipBatchSize,
+              this.relationshipMinConfidence
+            )
+          : { claimed: 0, succeeded: 0, failed: 0, processed: 0, added: 0 };
+        const processedContradictions = this.contradictionEnabled
+          ? await this.service.processContradictionDetectionBatch(
+              tenant.tenant_id,
+              this.contradictionBatchSize,
+              this.contradictionMinConfidence
+            )
+          : { claimed: 0, succeeded: 0, failed: 0, processed: 0, added: 0 };
+        const processedEvolution = this.evolutionEnabled
+          ? await this.service.processMemoryEvolutionBatch(
+              tenant.tenant_id,
+              this.evolutionBatchSize,
+              this.evolutionMinConfidence
+            )
+          : { claimed: 0, succeeded: 0, failed: 0, processed: 0, added: 0, deleted: 0 };
+        const processedCleanup = this.cleanupEnabled
+          ? await this.service.processCleanupBatch(tenant.tenant_id, this.cleanupBatchSize)
+          : { claimed: 0, succeeded: 0, failed: 0, processed: 0, deleted: 0 };
         const health = await this.service.getHealth(tenant.tenant_id);
 
         jobsCreated += missing.created + stale.created + relationships.created + contradictions.created + evolution.created + cleanup.created;

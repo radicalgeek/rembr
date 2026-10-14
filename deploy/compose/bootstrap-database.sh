@@ -109,6 +109,8 @@ MIGRATIONS=(
   027-memory-maintenance-jobs.sql
   028-repair-vector-indexes.sql
   029-memory-evolution-jobs.sql
+  # Runs before 030 so the security boundary migration grants rembr_app access.
+  034-semantic-cluster-hierarchy.sql
 )
 
 for filename in "${MIGRATIONS[@]}"; do

@@ -38,10 +38,22 @@ test('generates a scoped non-expiring agent-first bootstrap transaction', () => 
   assert.match(sql, /existing_project_owner IS NOT NULL/)
   assert.match(sql, /NULL,\s*'agent_bootstrap'/)
   assert.match(sql, /'memory:read', 'memory:write', 'context:manage', 'snapshot:manage'/)
-  assert.match(sql, /bootstrap_tenant_id, existing_plan, 1000, 10000, 5/)
-  assert.match(sql, /plan = existing_plan/)
+  // Plan limits come from the canonical per-plan catalogue (free defaults shown).
+  assert.match(sql, /CASE existing_plan[\s\S]*ELSE 1000/)
+  assert.match(sql, /WHEN 'pro' THEN 25000/)
+  assert.match(sql, /ON CONFLICT \(tenant_id\) DO UPDATE/)
   assert.match(sql, /COMMIT;/)
   assert.doesNotMatch(sql, /ON CONFLICT \(email\) DO UPDATE/)
+})
+
+test('honours TENANT_PLAN for new tenants and rejects unknown plans', () => {
+  const { sql, message } = buildBootstrap({ ...environment, TENANT_PLAN: 'pro' }, syntheticKey)
+  assert.match(sql, /'pro', 'unclaimed', TRUE/)
+  assert.match(message, /Plan: pro/)
+  assert.throws(
+    () => buildBootstrap({ ...environment, TENANT_PLAN: 'platinum' }, syntheticKey),
+    /TENANT_PLAN/,
+  )
 })
 
 test('rejects unsafe bootstrap metadata before generating a credential', () => {

@@ -1,5 +1,9 @@
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
-GRANT CONNECT ON DATABASE rembr TO rembr_app;
+SELECT format(
+  'GRANT CONNECT ON DATABASE %I TO rembr_app',
+  pg_catalog.current_database()
+)
+\gexec
 GRANT USAGE ON SCHEMA public TO rembr_app;
 
 -- The schema includes authentication, agent-signup, OAuth, plan and tenant

@@ -41,13 +41,14 @@ import {
   applyBudgetTemplate,
   BUDGET_TEMPLATES,
 } from './budget-management.js';
-import { AdvancedAnalyticsService } from './advanced-analytics-service.js';
+import { AdvancedAnalyticsService, type ContradictionResult } from './advanced-analytics-service.js';
+import { SemanticClusterService } from './semantic-cluster-service.js';
 import { RalphRLMService, type RLMSessionStatus, type IterationOutcome, type ACStatus } from './ralph-rlm.js';
 import { AnalyticsReportingService, type CustomReportConfig, type Granularity, type ReportFormat } from './analytics-reporting.js';
 import { EnhancedSearchService, type AdvancedFilter, type ExportFormat as SearchExportFormat } from './enhanced-search.js';
 import { PIINLPEngine, type SensitivityLevel as NLPSensitivity, type RedactionMode as NLPRedactionMode } from './pii-nlp-engine.js';
 import { ContextSnapshotTimelineService } from './context-snapshot-timeline.js';
-import { EmbeddingProvider, OllamaEmbeddingProvider, OpenAICompatibleEmbeddingProvider } from './ollama-provider.js';
+import { EmbeddingProvider, OllamaEmbeddingProvider, OpenAICompatibleEmbeddingProvider, AzureOpenAIEmbeddingProvider } from './ollama-provider.js';
 import { validateToolInput } from './schemas.js';
 import { AuthService, verifyApiKey, verifyOAuthToken, AuthResult } from './auth.js';
 import { getMetrics, trackHttpRequest, trackMemoryOperation, trackAuthentication, trackMcpToolCall, trackMcpToolError, trackSearchOperation, updateEmbeddingBacklog } from './metrics.js';
@@ -244,6 +245,7 @@ function formatBytes(bytes: number): string {
 function addPaginationToResponse(data: {
   items: unknown[];
   limit?: number;
+  offset?: number;
   totalAvailable?: number;  // Optional for backward compatibility, but should be provided
   startTime: number;
   suggestedFilters?: string[];
@@ -254,6 +256,7 @@ function addPaginationToResponse(data: {
   metadata: {
     returned: number;
     total_available: number;  // Always present (uses items.length as fallback)
+    offset: number;
     execution_time_ms: number;
   };
   pagination?: {
@@ -262,11 +265,11 @@ function addPaginationToResponse(data: {
   };
   related_tools?: string[];  // REM-68
 } {
-  const { items, limit, totalAvailable, startTime, suggestedFilters, relatedTools } = data;
+  const { items, limit, offset = 0, totalAvailable, startTime, suggestedFilters, relatedTools } = data;
   const executionTimeMs = Date.now() - startTime;
   
   // Use provided totalAvailable, or fallback to items.length (REM-68)
-  const total = totalAvailable !== undefined ? totalAvailable : items.length;
+  const total = totalAvailable !== undefined ? totalAvailable : offset + items.length;
   const hasMore = limit !== undefined && items.length >= limit;
 
   const response: any = {
@@ -275,6 +278,7 @@ function addPaginationToResponse(data: {
     metadata: {
       returned: items.length,
       total_available: total,  // Always present (REM-68)
+      offset,
       execution_time_ms: executionTimeMs
     }
   };
@@ -553,7 +557,17 @@ class RembrServer {
         const embeddingStart = Date.now();
         health.embedding_provider = embeddingProvider;
 
-        if (embeddingProvider === 'openai-compatible') {
+        if (embeddingProvider === 'azure') {
+          const available = await this.embeddingProvider?.isAvailable() ?? false;
+          health.embeddings = available;
+          health.embedding_latency_ms = Date.now() - embeddingStart;
+          health.embedding_models = available && this.embeddingProvider?.model
+            ? [this.embeddingProvider.model]
+            : [];
+          health.ollama = null;
+          health.ollama_latency_ms = null;
+          health.ollama_models = [];
+        } else if (embeddingProvider === 'openai-compatible') {
           const embeddingBaseUrl = process.env.EMBEDDING_BASE_URL || process.env.LM_STUDIO_BASE_URL || 'http://localhost:1234/v1';
           const embeddingRes = await fetchWithDeadline(
             `${embeddingBaseUrl.replace(/\/$/, '')}/models`,
@@ -1516,7 +1530,17 @@ class RembrServer {
       const model = process.env.EMBEDDING_MODEL || process.env.OLLAMA_EMBEDDING_MODEL || 'nomic-embed-text';
       const dimensions = parseInt(process.env.EMBEDDING_DIMENSIONS || '768', 10);
 
-      if (provider === 'openai-compatible') {
+      if (provider === 'azure') {
+        const endpoint = process.env.AZURE_OPENAI_ENDPOINT || '';
+        const deployment = process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT || model;
+        const apiKey = process.env.AZURE_OPENAI_API_KEY || '';
+        const apiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-10-21';
+        if (!endpoint || !apiKey) {
+          throw new Error('EMBEDDING_PROVIDER=azure requires AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY');
+        }
+        console.log(`🔮 Initializing Azure OpenAI embedding provider: ${endpoint} (${deployment}, ${dimensions} dims)`);
+        this.embeddingProvider = new AzureOpenAIEmbeddingProvider(endpoint, deployment, apiKey, apiVersion, dimensions);
+      } else if (provider === 'openai-compatible') {
         const baseUrl = process.env.EMBEDDING_BASE_URL || process.env.LM_STUDIO_BASE_URL || 'http://localhost:1234/v1';
         console.log(`🔮 Initializing OpenAI-compatible embedding provider (${model})`);
         this.embeddingProvider = new OpenAICompatibleEmbeddingProvider(baseUrl, model, dimensions);
@@ -1699,6 +1723,7 @@ class RembrServer {
     
     // Create advanced analytics service for Week 14 features
     const analyticsService = new AdvancedAnalyticsService(this.db, this.embeddingProvider);
+    const semanticClusterService = new SemanticClusterService(this.db);
 
     let attachmentService: AttachmentService | null = null;
     const getAttachmentService = () => {
@@ -1794,7 +1819,7 @@ class RembrServer {
             },
             min_similarity: {
               type: 'number',
-              description: 'Minimum similarity score for semantic search (default 0.7)',
+              description: 'Minimum similarity score for semantic search (default 0.5)',
               minimum: 0,
               maximum: 1
             },
@@ -1834,6 +1859,11 @@ class RembrServer {
               description: 'Maximum number of memories (default 10)',
               minimum: 1,
               maximum: 50
+            },
+            sort_by: {
+              type: 'string',
+              enum: ['created_at', 'source_created_at'],
+              description: 'Sort by insertion time (default) or source timestamp metadata'
             }
           }
         }
@@ -1918,7 +1948,7 @@ class RembrServer {
             },
             min_similarity: {
               type: 'number',
-              description: 'Minimum similarity score (default 0.7)',
+              description: 'Minimum similarity score (default 0.5)',
               minimum: 0,
               maximum: 1
             },
@@ -2304,6 +2334,16 @@ class RembrServer {
               type: 'string',
               description: 'Optional: generate graph for specific context only'
             },
+            cluster_id: {
+              type: 'string',
+              description: 'Optional semantic cluster to expand when cluster_algorithm is semantic'
+            },
+            memory_ids: {
+              type: 'array',
+              items: { type: 'string' },
+              maxItems: 300,
+              description: 'Optional exact memory IDs for a bounded similarity graph'
+            },
             include_relationships: {
               type: 'boolean',
               description: 'Include semantic relationship edges (default true)'
@@ -2392,6 +2432,10 @@ class RembrServer {
               type: 'string',
               enum: ['personal', 'shared', 'project'],
               description: 'New visibility scope'
+            },
+            project_id: {
+              type: 'string',
+              description: 'Required target project ID for project visibility'
             }
           },
           required: ['memory_id', 'visibility']
@@ -3481,6 +3525,9 @@ class RembrServer {
           if (legacyName) {
             effectiveName = legacyName;
             isConsolidatedCall = true;
+            if (name === 'memory' && operation === 'set_visibility' && args?.id && !args?.memory_id) {
+              args = { ...args, memory_id: args.id };
+            }
             if (name === 'contradictions' && legacyName === 'detect_memory_contradictions') {
               args = {
                 ...args,
@@ -3855,9 +3902,12 @@ class RembrServer {
 
           case 'list_memories': {
             const limit = args?.limit as number;
+            const offset = (args?.offset as number) || 0;
             const memories = await memoryService.listMemories(
               limit,
-              args?.category as string
+              args?.category as string,
+              args?.sort_by as 'created_at' | 'source_created_at' | undefined,
+              offset,
             );
 
             const duration = (Date.now() - startTime) / 1000;
@@ -3873,6 +3923,8 @@ class RembrServer {
             // Format with pagination metadata (REM-38)
             const memoriesFormatted = memories.map(m => ({
               id: m.id,
+              project_id: m.project_id,
+              visibility: m.visibility,
               content: m.content,
               category: m.category,
               metadata: m.metadata,
@@ -3882,6 +3934,7 @@ class RembrServer {
             const responseData = addPaginationToResponse({
               items: memoriesFormatted,
               limit,
+              offset,
               startTime,
               suggestedFilters: memories.length === limit ? ['Add category filter', 'Adjust limit'] : undefined
             });
@@ -5335,12 +5388,31 @@ case 'context_analytics': {
           case 'generate_context_graph': {
             trackMcpToolCall('generate_context_graph', 'success');
 
+            if (args?.cluster_algorithm === 'semantic') {
+              const hierarchy = await semanticClusterService.getView(
+                tenantId,
+                args?.cluster_id as string | undefined,
+                args?.min_edge_weight as number,
+                args?.filter_query as string | undefined,
+                projectId,
+                userId,
+              );
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({ success: true, semantic_hierarchy: hierarchy }, null, 2)
+                }]
+              };
+            }
+
             const graph = await analyticsService.generateContextGraph(
               tenantId,
               args?.context_id as string,
               args?.include_relationships !== false,
               projectId,
               userId,
+              args?.min_edge_weight as number,
+              args?.memory_ids as string[] | undefined
             );
 
             return {
@@ -5407,6 +5479,7 @@ case 'context_analytics': {
           case 'set_memory_visibility': {
             const memoryId = args?.memory_id as string;
             const visibility = args?.visibility as string;
+            const targetProjectId = args?.project_id as string | undefined;
 
             if (!userId) {
               return {
@@ -5417,17 +5490,55 @@ case 'context_analytics': {
                 isError: true
               };
             }
+            if (projectId && visibility === 'shared') {
+              return {
+                content: [{ type: 'text', text: JSON.stringify({
+                  success: false,
+                  error: 'A project-scoped credential cannot create tenant-shared visibility'
+                }) }],
+                isError: true
+              };
+            }
+            if (projectId && visibility === 'project' && targetProjectId !== projectId) {
+              return {
+                content: [{ type: 'text', text: JSON.stringify({
+                  success: false,
+                  error: 'Target project is outside the credential scope'
+                }) }],
+                isError: true
+              };
+            }
             
             const result = await this.db.query(`
               UPDATE memories m
-              SET visibility = $1,
-                  user_id = CASE WHEN $1 = 'personal' THEN $4::uuid ELSE m.user_id END,
+              SET visibility = $1::varchar,
+                  user_id = CASE WHEN $1::varchar = 'personal' THEN $4::uuid ELSE m.user_id END,
+                  project_id = CASE
+                    WHEN $1::varchar = 'project' THEN $6::uuid
+                    WHEN $1::varchar = 'shared' THEN NULL
+                    ELSE m.project_id
+                  END,
                   updated_at = NOW()
               WHERE m.id = $2 AND m.tenant_id = $3
                 AND ($5::uuid IS NULL OR m.project_id = $5::uuid)
-                AND (m.user_id IS NULL OR m.user_id = $4::uuid)
-              RETURNING id, content, visibility, user_id
-            `, [visibility, memoryId, tenantId, userId, projectId || null], tenantId);
+                AND m.user_id = $4::uuid
+                AND (
+                  $1::varchar <> 'project'
+                  OR EXISTS (
+                    SELECT 1 FROM projects p
+                    WHERE p.id = $6::uuid AND p.tenant_id = $3
+                      AND p.is_personal = TRUE
+                      AND (
+                        p.owner_id = $4::uuid
+                        OR EXISTS (
+                          SELECT 1 FROM project_members pm
+                          WHERE pm.project_id = p.id AND pm.user_id = $4::uuid
+                        )
+                      )
+                  )
+                )
+              RETURNING id, content, visibility, user_id, project_id
+            `, [visibility, memoryId, tenantId, userId, projectId || null, targetProjectId || null], tenantId);
             const duration = (Date.now() - startTime) / 1000;
             
             if (result.rows.length === 0) {
@@ -5458,6 +5569,7 @@ case 'context_analytics': {
                     memory: {
                       id: result.rows[0].id,
                       visibility: result.rows[0].visibility,
+                      project_id: result.rows[0].project_id,
                       content: result.rows[0].content.substring(0, 100) + '...'
                     }
                   }, null, 2)

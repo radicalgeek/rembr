@@ -151,14 +151,14 @@ describe('Context Analytics Service', () => {
     it('should detect old unused context', async () => {
       await testPool.query(`
         INSERT INTO context_analytics_events (tenant_id, session_id, event_type, event_data, token_count, created_at)
-        VALUES ($1, $2, 'usage_snapshot', $3, 2000, NOW() - INTERVAL '48 hours')
+        VALUES ($1, $2, 'usage_snapshot', $3, 2000, NOW() - INTERVAL '49 hours')
       `, [TEST_TENANT_ID, TEST_SESSION_ID, JSON.stringify({ category: 'old_project', token_count: 2000 })]);
 
       const waste = await detectStaleContext(testPool, TEST_TENANT_ID, TEST_SESSION_ID);
 
       expect(waste).toHaveLength(1);
       expect(waste[0].type).toBe('stale_context');
-      expect(waste[0].description).toContain('48 hours');
+      expect(waste[0].description).toContain('49 hours');
       expect(waste[0].severity).toBe('medium');
       expect(waste[0].location).toBe('old_project');
     });

@@ -1,5 +1,7 @@
-// Security boundary for the single-tenant Rembr console.
+// Security boundary for the static and hosted-session Rembr consoles.
 import crypto from "node:crypto"
+
+export const SESSION_COOKIE_NAME = "__Host-rembr_console"
 
 const READ_OPERATIONS = Object.freeze({
   memory: new Set(["list"]),
@@ -7,6 +9,7 @@ const READ_OPERATIONS = Object.freeze({
   stats: new Set(["usage", "embeddings"]),
   context: new Set(["list"]),
   snapshot: new Set(["list"]),
+  graph: new Set(["generate"]),
 })
 
 const WRITE_OPERATIONS = Object.freeze({
@@ -22,6 +25,7 @@ function boundedInteger(value, fallback, minimum, maximum) {
 }
 
 export function loadConfig(env = process.env) {
+  const authMode = env.REMBR_CONSOLE_AUTH_MODE === "session" ? "session" : "static"
   const mode = env.REMBR_CONSOLE_MODE === "read-write" ? "read-write" : "read-only"
   const config = {
     url: env.REMBR_URL || "http://localhost:3000/mcp",
@@ -29,10 +33,20 @@ export function loadConfig(env = process.env) {
     authToken: env.REMBR_CONSOLE_AUTH_TOKEN || undefined,
     host: env.HOST || "127.0.0.1",
     port: boundedInteger(env.PORT, 8080, 1, 65535),
+    logFile: env.REMBR_LOG || undefined,
     timeoutMs: boundedInteger(env.REMBR_TIMEOUT_MS, 30_000, 1_000, 120_000),
     maxBodyBytes: boundedInteger(env.REMBR_CONSOLE_MAX_BODY_BYTES, 65_536, 1_024, 1_048_576),
     maxResponseBytes: boundedInteger(env.REMBR_CONSOLE_MAX_RESPONSE_BYTES, 2_097_152, 65_536, 8_388_608),
+    authMode,
     mode,
+    sessionIdleMs: boundedInteger(env.REMBR_CONSOLE_SESSION_IDLE_MS, 30 * 60_000, 60_000, 24 * 60 * 60_000),
+    sessionAbsoluteMs: boundedInteger(env.REMBR_CONSOLE_SESSION_ABSOLUTE_MS, 8 * 60 * 60_000, 5 * 60_000, 7 * 24 * 60 * 60_000),
+    sessionMaximum: boundedInteger(env.REMBR_CONSOLE_SESSION_MAXIMUM, 100, 1, 10_000),
+    loginWindowMs: boundedInteger(env.REMBR_CONSOLE_LOGIN_WINDOW_MS, 60_000, 10_000, 60 * 60_000),
+    loginMaximum: boundedInteger(env.REMBR_CONSOLE_LOGIN_MAXIMUM, 5, 1, 100),
+    loginGlobalMaximum: boundedInteger(env.REMBR_CONSOLE_LOGIN_GLOBAL_MAXIMUM, 100, 1, 10_000),
+    memoryPageSize: 50,
+    trustProxy: env.REMBR_CONSOLE_TRUST_PROXY === "true",
     allowedOrigins: (env.REMBR_CONSOLE_ALLOWED_ORIGINS || "")
       .split(",")
       .map((origin) => origin.trim())
@@ -47,12 +61,17 @@ export function loadConfig(env = process.env) {
   } catch {
     errors.push("REMBR_URL must be a valid URL")
   }
-  if (!config.apiKey) errors.push("REMBR_API_KEY is required")
-  if (!config.authToken || Buffer.byteLength(config.authToken) < 32) {
-    errors.push("REMBR_CONSOLE_AUTH_TOKEN must contain at least 32 bytes")
+  if (config.authMode === "static") {
+    if (!config.apiKey) errors.push("REMBR_API_KEY is required")
+    if (!config.authToken || Buffer.byteLength(config.authToken) < 32) {
+      errors.push("REMBR_CONSOLE_AUTH_TOKEN must contain at least 32 bytes")
+    }
+    if (config.apiKey && config.authToken && config.apiKey === config.authToken) {
+      errors.push("REMBR_CONSOLE_AUTH_TOKEN must be distinct from REMBR_API_KEY")
+    }
   }
-  if (config.apiKey && config.authToken && config.apiKey === config.authToken) {
-    errors.push("REMBR_CONSOLE_AUTH_TOKEN must be distinct from REMBR_API_KEY")
+  if (config.authMode === "session" && config.sessionAbsoluteMs < config.sessionIdleMs) {
+    errors.push("REMBR_CONSOLE_SESSION_ABSOLUTE_MS must be at least the idle timeout")
   }
   config.configurationError = errors.length ? errors.join("; ") : undefined
   return config
@@ -74,6 +93,91 @@ export function authenticateConsoleRequest(config, authorization) {
   return { ok: true }
 }
 
+function parseCookies(header) {
+  if (typeof header !== "string" || header.length > 8_192) return new Map()
+  return new Map(header.split(";").map((part) => {
+    const separator = part.indexOf("=")
+    if (separator < 1) return ["", ""]
+    return [part.slice(0, separator).trim(), part.slice(separator + 1).trim()]
+  }).filter(([name]) => name))
+}
+
+export function sessionCookie(value, maximumAgeSeconds) {
+  return `${SESSION_COOKIE_NAME}=${value}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maximumAgeSeconds}`
+}
+
+export function clearedSessionCookie() {
+  return sessionCookie("", 0)
+}
+
+export function createSessionStore(config, now = () => Date.now()) {
+  const sessions = new Map()
+
+  function sweep() {
+    const current = now()
+    for (const [id, session] of sessions) {
+      if (current - session.lastSeenAt >= config.sessionIdleMs || current - session.createdAt >= config.sessionAbsoluteMs) {
+        sessions.delete(id)
+      }
+    }
+  }
+
+  return {
+    create(apiKey) {
+      sweep()
+      if (sessions.size >= config.sessionMaximum) return null
+      const id = crypto.randomBytes(32).toString("base64url")
+      const timestamp = now()
+      sessions.set(id, { apiKey, createdAt: timestamp, lastSeenAt: timestamp })
+      return id
+    },
+    resolve(cookieHeader) {
+      sweep()
+      const id = parseCookies(cookieHeader).get(SESSION_COOKIE_NAME)
+      if (!id) return null
+      const session = sessions.get(id)
+      if (!session) return null
+      session.lastSeenAt = now()
+      return { id, apiKey: session.apiKey }
+    },
+    destroy(cookieHeader) {
+      const id = parseCookies(cookieHeader).get(SESSION_COOKIE_NAME)
+      return id ? sessions.delete(id) : false
+    },
+    size() {
+      sweep()
+      return sessions.size
+    },
+  }
+}
+
+export function createLoginLimiter(config, now = () => Date.now()) {
+  const attempts = new Map()
+  let globalAttempts = []
+  return {
+    consume(clientId) {
+      const current = now()
+      globalAttempts = globalAttempts.filter((timestamp) => current - timestamp < config.loginWindowMs)
+      if (globalAttempts.length >= config.loginGlobalMaximum) return false
+      for (const [key, timestamps] of attempts) {
+        const recentForKey = timestamps.filter((timestamp) => current - timestamp < config.loginWindowMs)
+        if (recentForKey.length) attempts.set(key, recentForKey)
+        else attempts.delete(key)
+      }
+      const recent = (attempts.get(clientId) ?? []).filter((timestamp) => current - timestamp < config.loginWindowMs)
+      if (recent.length >= config.loginMaximum) {
+        attempts.set(clientId, recent)
+        return false
+      }
+      if (!attempts.has(clientId) && attempts.size >= 1_000) return false
+      recent.push(current)
+      attempts.set(clientId, recent)
+      globalAttempts.push(current)
+      return true
+    },
+  }
+}
+
 export function isOriginAllowed(config, origin, host) {
   if (!origin) return true
   if (config.allowedOrigins.includes(origin)) return true
@@ -93,8 +197,12 @@ function validateArguments(tool, args) {
     return "args must be an object"
   }
   if (Object.keys(args).length > 24) return "too many arguments"
-  if (args.limit !== undefined && (!Number.isSafeInteger(args.limit) || args.limit < 1 || args.limit > 100)) {
-    return "limit must be an integer from 1 to 100"
+  const maximumLimit = tool === "memory" && args.operation === "list" ? 300 : 100
+  if (args.limit !== undefined && (!Number.isSafeInteger(args.limit) || args.limit < 1 || args.limit > maximumLimit)) {
+    return `limit must be an integer from 1 to ${maximumLimit}`
+  }
+  if (args.offset !== undefined && (!Number.isSafeInteger(args.offset) || args.offset < 0 || args.offset > 1_000_000)) {
+    return "offset must be an integer from 0 to 1000000"
   }
   if (tool === "search" && (typeof args.query !== "string" || args.query.length < 1 || args.query.length > 8_192)) {
     return "search query must contain 1 to 8192 characters"
@@ -153,7 +261,7 @@ async function readBoundedResponse(response, maximumBytes) {
 }
 
 /** Forward one narrowly authorised MCP tools/call to Rembr. */
-export async function callRembr(config, tool, args) {
+export async function callRembr(config, tool, args, apiKey = config.apiKey) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), config.timeoutMs)
   try {
@@ -162,7 +270,7 @@ export async function callRembr(config, tool, args) {
       headers: {
         "content-type": "application/json",
         accept: "application/json, text/event-stream",
-        "x-api-key": config.apiKey,
+        "x-api-key": apiKey,
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
@@ -173,7 +281,11 @@ export async function callRembr(config, tool, args) {
       signal: controller.signal,
       redirect: "error",
     })
-    if (!response.ok) return { ok: false, error: `Rembr returned HTTP ${response.status}` }
+    if (!response.ok) {
+      const text = await readBoundedResponse(response, config.maxResponseBytes).catch(() => "")
+      const detail = clientSafeMessage(text, "")
+      return { ok: false, error: `Rembr returned HTTP ${response.status}${detail ? `: ${detail}` : ""}`, upstreamStatus: response.status }
+    }
     const declaredLength = Number(response.headers.get("content-length") || 0)
     if (declaredLength > config.maxResponseBytes) return { ok: false, error: "Rembr response exceeded the console limit" }
     const body = await readBoundedResponse(response, config.maxResponseBytes)
@@ -201,9 +313,13 @@ export async function callRembr(config, tool, args) {
 }
 
 export async function handleApiCall(config, body, request = {}) {
-  const authentication = authenticateConsoleRequest(config, request.authorization)
-  if (!authentication.ok) {
-    return { status: authentication.status, payload: { ok: false, error: authentication.error } }
+  if (config.authMode === "session") {
+    if (!request.apiKey) return { status: 401, payload: { ok: false, error: "Authentication required" } }
+  } else {
+    const authentication = authenticateConsoleRequest(config, request.authorization)
+    if (!authentication.ok) {
+      return { status: authentication.status, payload: { ok: false, error: authentication.error } }
+    }
   }
   let parsed
   try {
@@ -217,6 +333,7 @@ export async function handleApiCall(config, body, request = {}) {
   }
   const argumentError = validateArguments(tool, args)
   if (argumentError) return { status: 400, payload: { ok: false, error: argumentError } }
-  const result = await callRembr(config, tool, args)
-  return { status: result.ok ? 200 : 502, payload: result }
+  const result = await callRembr(config, tool, args, request.apiKey ?? config.apiKey)
+  const status = result.ok ? 200 : [401, 403].includes(result.upstreamStatus) ? 401 : 502
+  return { status, payload: { ok: result.ok, ...(result.text ? { text: result.text } : {}), ...(result.error ? { error: result.error } : {}) } }
 }

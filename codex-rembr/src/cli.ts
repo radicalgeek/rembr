@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // stdio entry point: `codex-rembr` (configure as a stdio MCP server).
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import { createServer, loadBridgeConfig } from "./server.js"
+import { loadBridgeConfig } from "./bridge-config.js"
+import { createServer } from "./server.js"
 
 async function main() {
   const config = loadBridgeConfig()

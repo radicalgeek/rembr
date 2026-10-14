@@ -1,7 +1,7 @@
 {
   "name": "rembr-console",
-  "version": "0.1.0",
-  "description": "Single-tenant, self-hosted web console for Rembr — a pure MCP client with zero runtime dependencies.",
+  "version": "0.1.1",
+  "description": "Self-hosted Rembr web console with static and per-user API-key session modes.",
   "type": "module",
   "main": "server.mjs",
   "bin": {

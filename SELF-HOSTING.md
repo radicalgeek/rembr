@@ -44,23 +44,69 @@ origin agents use and set `OAUTH_AUDIENCE` to that exact origin plus `/mcp`
 (for example, `https://memory.example/mcp`) so OAuth tokens remain bound to the
 agent-facing resource.
 
-- Console: http://localhost:8080 (enter `REMBR_CONSOLE_AUTH_TOKEN` in the login control)
+- Console: http://localhost:8080 (enter `REMBR_CONSOLE_AUTH_TOKEN` in the login control;
+  set `CONSOLE_PORT` when that host port is already in use)
 - MCP endpoint: http://localhost:3000/mcp (`x-api-key` header)
 - Health: http://localhost:3000/health
 
 ### Embeddings
 
-Search quality depends on an embedding provider. Two options:
+Search quality depends on an embedding provider. Three options:
 
 - **Local Ollama** (default): start with `--profile ollama` and pull `nomic-embed-text`
   once. Fully local, no external calls.
 - **An unauthenticated OpenAI-compatible endpoint** (for example a local LM Studio
   or trusted gateway): set `EMBEDDING_PROVIDER=openai-compatible` plus
   `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS` in `.env`.
-  Direct API-key-authenticated embedding providers are not supported by this
-  self-host profile.
+  The generic `openai-compatible` provider sends no credentials; use the Azure
+  provider below for API-key-authenticated endpoints.
+- **Azure OpenAI**: set `EMBEDDING_PROVIDER=azure` plus `AZURE_OPENAI_ENDPOINT`,
+  `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`, and
+  `AZURE_OPENAI_API_VERSION`. Azure uses deployment-based URLs and an `api-key`
+  header rather than the OpenAI `/v1` + bearer shape, and accepts a native
+  `dimensions` parameter — set `EMBEDDING_DIMENSIONS=768` so a `text-embedding-3-*`
+  deployment returns vectors matching the default schema. For Azure text
+  generation, set `TEXT_GENERATION_PROVIDER=azure` and `AZURE_OPENAI_TEXT_DEPLOYMENT`.
 
 Embeddings are generated server-side — agents and the console only ever send text.
+
+### Background maintenance
+
+The maintenance worker is an opt-in Compose profile (`--profile maintenance`). It
+always backfills missing and stale embeddings and deletes expired context
+snapshots. The MCP server embeds new memories itself when they are stored, so the
+worker is not needed for every new memory; it picks up memories left without an
+embedding (for example after the inline attempts fail) and re-embeds stale ones,
+even when all optional job flags are `false`. Its optional job types are relationship inference, contradiction
+detection, memory evolution review (these can use an OpenAI-compatible chat
+endpoint), and expired-memory cleanup. In this stack every optional job type
+defaults to off; enable the ones you want explicitly in `.env`:
+
+```bash
+TEXT_GENERATION_PROVIDER=openai-compatible
+LM_STUDIO_BASE_URL=http://your-openai-compatible-host:4000/v1
+LM_STUDIO_MODEL=qwen3
+MAINTENANCE_RELATIONSHIP_ENABLED=true
+MAINTENANCE_CONTRADICTION_ENABLED=true
+MEMORY_EVOLUTION_ENABLED=true
+MEMORY_EVOLUTION_ASSESSMENT_ENABLED=true
+MAINTENANCE_CLEANUP_ENABLED=true
+```
+
+The `LM_STUDIO_*` names are kept for backwards compatibility; the endpoint can be
+OpenAI or any local/provider gateway that implements the OpenAI chat completions API.
+
+- Relationship inference and contradiction detection add relationship records.
+- Memory evolution is proposal-only. It records an audit decision (keep, rewrite,
+  archive, supersede, or prune) and never changes the memory itself. Without
+  `MEMORY_EVOLUTION_ASSESSMENT_ENABLED=true` it records `keep` without calling a model.
+  `MEMORY_EVOLUTION_APPLY_ENABLED` is reserved and currently has no effect.
+- Cleanup permanently deletes memories whose retention period has expired.
+
+The worker binary itself runs a job type unless its flag is exactly `false`, so a
+deployment that runs it outside this Compose file should set each flag explicitly.
+For example, a historical import can keep embedding backfill active while leaving
+relationship inference, contradiction detection, evolution, and cleanup disabled.
 
 ## Optional Jev relationship inference
 
@@ -170,6 +216,12 @@ credential without revoking an earlier key. A matching email already owned by a
 claimed or non-agent tenant fails closed. Keys are stored as SHA-256 hashes; the
 plaintext is printed once and never persisted.
 
+Set `TENANT_PLAN=pro` (or another supported plan: free, pro, team, business,
+enterprise) to assign explicit plan limits to a new workspace. Set
+`REQUIRE_NO_ACTIVE_KEYS=true` to fail when the tenant already holds an active
+key. If `API_KEY_SECRET` is available, new keys use HMAC-SHA256; otherwise the
+script retains legacy SHA-256 compatibility.
+
 ## Upgrading an existing Compose volume
 
 1. Back up `rembr-pgdata` and stop MCP/console writers.
@@ -211,8 +263,16 @@ database credential.
   `REMBR_BIND_ADDRESS` with equivalent firewall controls.
 - The console requires its own bearer token and defaults to read-only. Set
   `REMBR_CONSOLE_MODE=read-write` only when its create/delete controls are required.
+- The console can instead run in hosted session mode (`REMBR_CONSOLE_AUTH_MODE=session`),
+  where each user signs in with their own API key and the console holds it in a
+  bounded server-side session. `REMBR_API_KEY` and `REMBR_CONSOLE_AUTH_TOKEN` are then
+  unused. Session mode is opt-in: put the console behind TLS, set
+  `REMBR_CONSOLE_ALLOWED_ORIGINS` to its exact public origin, and see
+  `rembr-console/README.md` for session lifetime and login-throttle settings.
 - The engine exposes `/health` for process liveness, `/ready` for bounded
   dependency-aware readiness, and `/metrics` for Prometheus; set
   `METRICS_SECRET` in production.
+- `RATE_LIMIT_DISABLED=true` bypasses all request quotas. Use it only on a trusted
+  private deployment; the default is `false`.
 - Back up the `rembr-pgdata` volume; memories, contexts, and snapshots all live in
   PostgreSQL.

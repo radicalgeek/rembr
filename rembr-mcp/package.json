@@ -42,7 +42,7 @@
     "@aws-sdk/s3-request-presigner": "^3.985.0",
     "@mcp-ui/server": "^6.1.0",
     "@modelcontextprotocol/ext-apps": "^1.0.1",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@types/express": "^4.17.21",
     "@types/pg": "^8.11.10",
     "express": "^4.18.2",
@@ -60,6 +60,7 @@
     "@types/node": "^24.2.0",
     "@vitest/coverage-v8": "^3.2.6",
     "@vitest/ui": "^3.2.6",
+    "patch-package": "^8.0.0",
     "typescript": "^5.9.3",
     "vitest": "^3.2.6"
   },

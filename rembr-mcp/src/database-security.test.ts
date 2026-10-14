@@ -41,11 +41,76 @@ describe('MemoryDatabase metadata filter binding', () => {
     expect(params).toContain(JSON.stringify({ 'project.tag': attackerValue }));
     expect(client.release).toHaveBeenCalledOnce();
   });
+
+  it('binds list pagination as limit and offset parameters', async () => {
+    const client = {
+      query: vi.fn(async () => ({ rows: [] })),
+      release: vi.fn(),
+    };
+    const db = Object.create(MemoryDatabase.prototype) as any;
+    db.pool = { connect: vi.fn(async () => client) };
+    db.readPool = null;
+
+    await db.getRecentMemories(
+      '550e8400-e29b-41d4-a716-446655440000',
+      50,
+      undefined,
+      undefined,
+      '11111111-1111-4111-8111-111111111111',
+      'source_created_at',
+      100,
+    );
+
+    const listCall = client.query.mock.calls.find(([sql]) => String(sql).includes('FROM memories m'))!;
+    expect(String(listCall[0])).toContain('LIMIT $3 OFFSET $4');
+    expect(listCall[1]).toEqual([
+      '550e8400-e29b-41d4-a716-446655440000',
+      '11111111-1111-4111-8111-111111111111',
+      50,
+      100,
+    ]);
+  });
 });
 
 describe('MemoryDatabase atomic storage and search quotas', () => {
   const tenantId = '550e8400-e29b-41d4-a716-446655440000';
   const projectId = '22222222-2222-4222-8222-222222222222';
+
+  it('defaults user-bound memory to personal and userless memory to shared', async () => {
+    const inserts: Array<{ sql: string; params: unknown[] }> = [];
+    const client = {
+      query: vi.fn(async (sql: string, params?: unknown[]) => {
+        if (sql.includes('FROM tenant_plans')) return { rows: [{ memory_limit: 10 }] };
+        if (sql.includes('AS stored_items')) return { rows: [{ stored_items: 0 }] };
+        if (sql.includes('INSERT INTO memories')) {
+          inserts.push({ sql, params: params || [] });
+          return { rows: [{ id: params?.[0] }] };
+        }
+        return { rows: [] };
+      }),
+      release: vi.fn(),
+    };
+    const db = Object.create(MemoryDatabase.prototype) as any;
+    db.pool = { connect: vi.fn(async () => client) };
+    db.readPool = null;
+
+    await db.createMemory(
+      '11111111-1111-4111-8111-111111111111', tenantId, projectId,
+      'personal fixture', 'facts', {}, 1, undefined,
+      '33333333-3333-4333-8333-333333333333',
+    );
+    await db.createMemory(
+      '44444444-4444-4444-8444-444444444444', tenantId, projectId,
+      'shared fixture', 'facts', {}, 1, undefined, undefined,
+    );
+
+    expect(inserts).toHaveLength(2);
+    for (const insert of inserts) {
+      expect(insert.sql).toContain("CASE WHEN $4::uuid IS NULL THEN 'shared' ELSE 'personal' END");
+    }
+    expect(inserts[0].params[3]).toBe('33333333-3333-4333-8333-333333333333');
+    expect(inserts[1].params[3]).toBeNull();
+  });
 
   it('serialises concurrent memory inserts so only the final quota slot is spent', async () => {
     let storedItems = 1;

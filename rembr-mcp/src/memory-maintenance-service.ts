@@ -109,10 +109,22 @@ export class MemoryMaintenanceService {
 
   async listActiveTenants(limit = 100): Promise<TenantMaintenanceTarget[]> {
     const result = await this.db.query(`
-      SELECT id::text AS tenant_id
-      FROM tenants
-      WHERE COALESCE(status, 'active') = 'active'
-      ORDER BY created_at ASC
+      SELECT t.id::text AS tenant_id
+      FROM tenants t
+      WHERE COALESCE(t.status, 'active') = 'active'
+         OR (
+           t.status = 'unclaimed'
+           AND t.created_by_agent IS TRUE
+           AND EXISTS (
+             SELECT 1
+             FROM api_keys k
+             WHERE k.tenant_id = t.id
+               AND k.purpose = 'agent_bootstrap'
+               AND k.revoked_at IS NULL
+               AND (k.expires_at IS NULL OR k.expires_at > NOW())
+           )
+         )
+      ORDER BY t.created_at ASC
       LIMIT $1
     `, [limit]);
 
@@ -1300,7 +1312,7 @@ Respond as JSON:
                 'last_action', 'rewrite',
                 'confidence', $4::numeric,
                 'reason', $5::text,
-                'previous_content', $6,
+                'previous_content', $6::text,
                 'job_id', $7::uuid
               )
             ),
@@ -1341,7 +1353,7 @@ Respond as JSON:
         TRUE,
         jsonb_build_object(
           'job_id', $7::uuid,
-          'previous_content', $6,
+          'previous_content', $6::text,
           'rewritten_content', $3,
           'embedding_marked_stale', EXISTS (SELECT 1 FROM stale_embedding)
         ),

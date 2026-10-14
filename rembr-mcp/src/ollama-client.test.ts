@@ -32,6 +32,9 @@ describe('OllamaClient', () => {
 
   beforeEach(() => {
     vi.unstubAllGlobals();
+    delete process.env.OLLAMA_HOST;
+    delete process.env.OLLAMA_EMBEDDING_MODEL;
+    delete process.env.OLLAMA_TEXT_MODEL;
     delete process.env.TEXT_GENERATION_PROVIDER;
     delete process.env.LM_STUDIO_BASE_URL;
     delete process.env.LM_STUDIO_MODEL;
@@ -43,6 +46,10 @@ describe('OllamaClient', () => {
     delete process.env.OPENAI_COMPATIBLE_MAX_TOKENS;
     delete process.env.TEXT_GENERATION_TIMEOUT_MS;
     delete process.env.OLLAMA_TEXT_HOST;
+    delete process.env.AZURE_OPENAI_ENDPOINT;
+    delete process.env.AZURE_OPENAI_API_KEY;
+    delete process.env.AZURE_OPENAI_API_VERSION;
+    delete process.env.AZURE_OPENAI_TEXT_DEPLOYMENT;
 
     // Reset singleton for each test
     (OllamaClient as any).instance = undefined;
@@ -209,6 +216,18 @@ describe('OllamaClient', () => {
           system: 'You are a helpful assistant'
         })
       );
+    });
+
+    it('should clear the timeout after successful text generation', async () => {
+      vi.useFakeTimers();
+      mockTextOllamaInstance.generate.mockResolvedValue({
+        response: 'Generated text response'
+      });
+
+      await client.generateText('test');
+
+      expect(vi.getTimerCount()).toBe(0);
+      vi.useRealTimers();
     });
 
     it('should respect custom generation options', async () => {
@@ -470,6 +489,81 @@ describe('OllamaClient', () => {
         choices: new Array(17).fill({ message: { content: 'value' } }),
       }), { headers: { 'content-type': 'application/json' } })));
       await expect(lmStudioClient.generateText('prompt')).rejects.toThrow('invalid response shape');
+    });
+
+    it('should generate text through Azure OpenAI with the GPT-5 request shape', async () => {
+      process.env.TEXT_GENERATION_PROVIDER = 'azure';
+      process.env.AZURE_OPENAI_ENDPOINT = 'https://example.openai.azure.com/';
+      process.env.AZURE_OPENAI_API_KEY = 'test-azure-key';
+      process.env.AZURE_OPENAI_API_VERSION = '2024-10-21';
+      process.env.AZURE_OPENAI_TEXT_DEPLOYMENT = 'gpt-5-mini';
+      (OllamaClient as any).instance = undefined;
+      const azureClient = OllamaClient.getInstance();
+
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          choices: [{ message: { content: 'Azure response' } }]
+        })
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const result = await azureClient.generateText('User question', 'System prompt', {
+        temperature: 0,
+        maxTokens: 220,
+        stopSequences: ['END']
+      });
+
+      expect(result).toBe('Azure response');
+      expect(azureClient.getTextProvider()).toBe('azure');
+      expect(fetchMock).toHaveBeenCalledWith(
+        'https://example.openai.azure.com/openai/deployments/gpt-5-mini/chat/completions?api-version=2024-10-21',
+        expect.objectContaining({
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'api-key': 'test-azure-key'
+          }
+        })
+      );
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body).toEqual({
+        messages: [
+          { role: 'system', content: 'System prompt' },
+          { role: 'user', content: 'User question' }
+        ],
+        stream: false,
+        temperature: 0,
+        max_completion_tokens: 220
+      });
+    });
+
+    it('should preserve stop sequences for non-GPT-5 Azure deployments', async () => {
+      process.env.TEXT_GENERATION_PROVIDER = 'azure';
+      process.env.AZURE_OPENAI_ENDPOINT = 'https://example.openai.azure.com';
+      process.env.AZURE_OPENAI_API_KEY = 'test-azure-key';
+      process.env.AZURE_OPENAI_TEXT_DEPLOYMENT = 'gpt-4o-mini';
+      (OllamaClient as any).instance = undefined;
+      const azureClient = OllamaClient.getInstance();
+
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          choices: [{ message: { content: 'Azure response' } }]
+        })
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      await azureClient.generateText('User question', undefined, {
+        maxTokens: 64,
+        stopSequences: ['END']
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.max_tokens).toBe(64);
+      expect(body.max_completion_tokens).toBeUndefined();
+      expect(body.stop).toEqual(['END']);
     });
   });
 

@@ -129,7 +129,7 @@ export function getConsolidatedTools(): Tool[] {
     // 1. MEMORY - Unified memory CRUD operations
     {
       name: 'memory',
-      description: 'Unified memory operations. Use operation parameter to: create (store new memory), get (retrieve by ID), update (modify existing), delete, list (recent memories), list_personal (private memories), set_visibility (public/private), ingest (bulk-ingest a document by chunking into multiple memories).',
+      description: 'Unified memory operations. Use operation parameter to: create (store new memory), get (retrieve by ID), update (modify existing), delete, list (recent memories), list_personal (private memories), set_visibility (personal/shared/project), ingest (bulk-ingest a document by chunking into multiple memories).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -169,13 +169,22 @@ export function getConsolidatedTools(): Tool[] {
             type: 'number',
             description: '[list] Maximum number of results (default 10)',
             minimum: 1,
-            maximum: 50
+            maximum: 300
+          },
+          sort_by: {
+            type: 'string',
+            enum: ['created_at', 'source_created_at'],
+            description: '[list] Order by insertion time (default) or valid metadata.source_created_at with insertion-time fallback'
           },
           // set_visibility params
           visibility: {
             type: 'string',
-            enum: ['public', 'private'],
+            enum: ['personal', 'shared', 'project'],
             description: '[set_visibility] New visibility setting'
+          },
+          project_id: {
+            type: 'string',
+            description: '[set_visibility] Required target project ID for project visibility'
           },
           // ingest params
           title: {
@@ -227,7 +236,7 @@ export function getConsolidatedTools(): Tool[] {
           },
           min_similarity: {
             type: 'number',
-            description: '[query/similar] Minimum similarity score (default 0.7)',
+            description: '[query/similar] Minimum similarity score (default 0.5)',
             minimum: 0,
             maximum: 1
           },
@@ -423,7 +432,7 @@ export function getConsolidatedTools(): Tool[] {
     // 6. GRAPH - Unified graph operations
     {
       name: 'graph',
-      description: 'Unified graph operations. Use operation parameter to: get (memory relationship graph), generate (context graph), insights (context insights), infer (infer relationships), compare (compare snapshots), explore (traverse relationship graph from a specific memory).',
+      description: 'Unified graph operations. Use operation parameter to: get (memory relationship graph), generate (embedding-similarity graph), insights (context insights), infer (infer relationships), compare (compare snapshots), explore (traverse relationship graph from a specific memory).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -436,6 +445,36 @@ export function getConsolidatedTools(): Tool[] {
           context_id: {
             type: 'string',
             description: '[get/generate/insights] Context ID'
+          },
+          cluster_id: {
+            type: 'string',
+            description: '[generate] Semantic cluster ID to expand when cluster_algorithm is semantic'
+          },
+          filter_query: {
+            type: 'string',
+            maxLength: 200,
+            description: '[generate] Literal text filter applied to memories within semantic clusters'
+          },
+          memory_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            maxItems: 300,
+            description: '[generate] Exact memory IDs to include in the embedding-similarity graph'
+          },
+          include_relationships: {
+            type: 'boolean',
+            description: '[generate] Include embedding-similarity edges (default true)'
+          },
+          min_edge_weight: {
+            type: 'number',
+            minimum: 0,
+            maximum: 1,
+            description: '[generate] Minimum cosine similarity for an edge (default 0.68)'
+          },
+          cluster_algorithm: {
+            type: 'string',
+            enum: ['category', 'semantic', 'temporal'],
+            description: '[generate] Use semantic for the persisted cross-category bubble hierarchy'
           },
           // get/explore params
           depth: {

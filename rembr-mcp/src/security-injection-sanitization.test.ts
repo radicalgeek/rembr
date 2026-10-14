@@ -76,6 +76,14 @@ describe('schema size, type and object-shape limits', () => {
     if (result.success) expect((result.data as any).limit).toBe(10);
   });
 
+  it('list_memories: accepts only supported sort modes', () => {
+    const valid = validateToolInput('list_memories', { sort_by: 'source_created_at' });
+    expect(valid.success).toBe(true);
+    if (valid.success) expect((valid.data as any).sort_by).toBe('source_created_at');
+
+    expect(validateToolInput('list_memories', { sort_by: 'metadata.created_at DESC' }).success).toBe(false);
+  });
+
   it('rejects content exceeding 100,000 characters', () => {
     expect(validateToolInput('store_memory', {
       content: 'a'.repeat(100_001),
