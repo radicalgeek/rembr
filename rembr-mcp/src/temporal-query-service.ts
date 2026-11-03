@@ -179,12 +179,12 @@ export class TemporalQueryService {
   ): Promise<MemoryVersion[]> {
     const query = `
       SELECT 
-        content, 
-        category, 
-        valid_from, 
-        valid_until,
-        metadata, 
-        updated_at,
+        m.content,
+        m.category,
+        m.valid_from,
+        m.valid_until,
+        m.metadata,
+        m.updated_at,
         CASE 
           WHEN valid_until IS NULL THEN 'current'
           ELSE 'historical'

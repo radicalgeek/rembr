@@ -9,9 +9,9 @@ import type { MemoryDatabase } from './database.js';
 
 // Mock AWS SDK
 vi.mock('@aws-sdk/client-s3', () => ({
-  S3Client: vi.fn().mockImplementation(() => ({
+  S3Client: vi.fn().mockImplementation(function () { return ({
     send: vi.fn()
-  })),
+  }); }),
   PutObjectCommand: vi.fn(),
   GetObjectCommand: vi.fn(),
   DeleteObjectCommand: vi.fn(),
@@ -58,7 +58,7 @@ describe('AttachmentService', () => {
       send: vi.fn()
     };
 
-    (S3Client as any).mockImplementation(() => mockS3Client);
+    (S3Client as any).mockImplementation(function () { return mockS3Client; });
 
     // Create service
     service = new AttachmentService(

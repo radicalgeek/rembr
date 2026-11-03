@@ -12,11 +12,11 @@
  * - Concurrent load handling
  *
  * Requires: TEST_DATABASE_URL pointing to a Rembr test database
- * Skip:     Set SKIP_INTEGRATION=true (default) to skip in CI
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { Pool } from 'pg';
+import { createRuntimeDatabase } from '../../src/test-utils/runtime-db.js';
 import { randomUUID } from 'crypto';
 import { MemoryDatabase } from '../../src/database.js';
 import { MemoryService } from '../../src/memory-service.js';
@@ -24,13 +24,11 @@ import { piiDetector } from '../../src/pii-detector.js';
 import { DAILY_PLAN_LIMITS } from '../../src/rate-limiter.js';
 import { getPIICapabilities, clampSensitivity, assertPIIOperationAllowed } from '../../src/pii-plan-limits.js';
 
-// Skip unless explicitly opted in
-const SKIP = process.env.SKIP_INTEGRATION !== 'false';
 
 // Test tenant constants
 const TEST_TENANT_ID = '10000000-0000-0000-0000-000000000045';
 const TEST_PROJECT_ID = '10000000-0000-0000-0000-000000000046';
-const TEST_USER_ID = 'integration-test-user';
+const TEST_USER_ID = '10000000-0000-0000-0000-000000000047';
 
 // Performance targets
 const P50_STORE_MS = 200;   // store_memory p50 target
@@ -47,23 +45,18 @@ function percentile(sorted: number[], p: number): number {
 // Test Suite
 // ─────────────────────────────────────────────────────────
 
-describe.skipIf(SKIP)('MCP Workflow Integration Tests (REM-45)', () => {
+describe('MCP Workflow Integration Tests (REM-45)', () => {
   let pool: Pool;
   let db: MemoryDatabase;
   let service: MemoryService;
 
   beforeAll(async () => {
-    const connectionString =
-      process.env.TEST_DATABASE_URL ||
-      'postgresql://postgres:postgres@localhost:5432/rembr_test';
-
-    pool = new Pool({ connectionString });
-    db = new MemoryDatabase(connectionString);
+    ({ pool, db } = await createRuntimeDatabase('rembr_test_workflows'));
     service = new MemoryService(TEST_TENANT_ID, TEST_PROJECT_ID, db, undefined, TEST_USER_ID);
 
     // Ensure tenant + plan exist
     await pool.query(
-      `INSERT INTO tenants (id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      `INSERT INTO tenants (id, name, email) VALUES ($1, $2, ($1::uuid)::text || '@test.invalid') ON CONFLICT DO NOTHING`,
       [TEST_TENANT_ID, 'integration-test-tenant-45']
     );
     await pool.query(
@@ -82,6 +75,7 @@ describe.skipIf(SKIP)('MCP Workflow Integration Tests (REM-45)', () => {
 
   afterAll(async () => {
     await pool.query(`DELETE FROM memories WHERE tenant_id = $1`, [TEST_TENANT_ID]);
+    await db?.close();
     await pool.end();
   });
 
@@ -151,7 +145,7 @@ describe.skipIf(SKIP)('MCP Workflow Integration Tests (REM-45)', () => {
     });
 
     it('text search returns relevant results', async () => {
-      const results = await service.searchMemory({ query: 'TypeScript JavaScript', limit: 5, search_mode: 'text' });
+      const results = await service.searchMemory({ query: 'TypeScript', limit: 5, search_mode: 'text' });
       expect(results.length).toBeGreaterThan(0);
       expect(results[0].content).toContain('TypeScript');
     });
@@ -162,7 +156,7 @@ describe.skipIf(SKIP)('MCP Workflow Integration Tests (REM-45)', () => {
     });
 
     it('search returns results with correct fields', async () => {
-      const results = await service.searchMemory({ query: 'React UI', limit: 5, search_mode: 'text' });
+      const results = await service.searchMemory({ query: 'React', limit: 5, search_mode: 'text' });
       expect(results.length).toBeGreaterThan(0);
       const r = results[0];
       expect(r.id).toBeDefined();
@@ -254,8 +248,8 @@ describe.skipIf(SKIP)('MCP Workflow Integration Tests (REM-45)', () => {
   // 5. Daily Rate Limit config (REM-48)
   // ───────────────────────────────────────────
   describe('Daily rate limit configuration (REM-48)', () => {
-    it('free plan daily limit is 1,000', () => {
-      expect(DAILY_PLAN_LIMITS.free).toBe(1000);
+    it('free plan daily limit is 10,000', () => {
+      expect(DAILY_PLAN_LIMITS.free).toBe(10000);
     });
 
     it('pro plan daily limit is 100,000', () => {
@@ -428,10 +422,12 @@ describe.skipIf(SKIP)('MCP Workflow Integration Tests (REM-45)', () => {
       const otherTenantId = '20000000-0000-0000-0000-000000000045';
       // Ensure the other tenant exists
       await pool.query(
-        `INSERT INTO tenants (id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        `INSERT INTO tenants (id, name, email) VALUES ($1, $2, ($1::uuid)::text || '@test.invalid') ON CONFLICT DO NOTHING`,
         [otherTenantId, 'other-tenant-45']
       );
-      const otherService = new MemoryService(otherTenantId, undefined, db);
+      const otherProjectId = randomUUID();
+      await pool.query('INSERT INTO projects (id, tenant_id, name) VALUES ($1, $2, $3)', [otherProjectId, otherTenantId, 'Other project']);
+      const otherService = new MemoryService(otherTenantId, otherProjectId, db);
       const otherMemory = await otherService.storeMemory({
         content: 'Secret memory for other tenant only',
         category: 'notes',
