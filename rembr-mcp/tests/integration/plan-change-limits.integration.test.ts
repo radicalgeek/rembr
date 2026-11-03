@@ -5,7 +5,6 @@
  * immediately enforced. Tests run against a real PostgreSQL test database.
  *
  * Requires: TEST_DATABASE_URL pointing to a Rembr test database
- * Skip:     Set SKIP_INTEGRATION !== 'false' (default) to skip in CI
  *
  * Covers:
  *   - Upgrade: Free → Pro limits expand immediately
@@ -15,17 +14,21 @@
  *   - Edge: exactly at limit after downgrade → no rejection
  *   - Edge: 1 memory over limit after downgrade → rejected
  *   - Search limit enforcement after downgrade
- *   - Plan changes via direct DB update (simulates Stripe webhook effect)
+ *   - Plan changes via direct DB update
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import { Pool } from 'pg';
+import { createRuntimeDatabase } from '../../src/test-utils/runtime-db.js';
 import { randomUUID } from 'crypto';
 import { MemoryDatabase } from '../../src/database.js';
 import { MemoryService } from '../../src/memory-service.js';
 
-// Skip unless explicitly opted in (set SKIP_INTEGRATION=false)
-const SKIP = process.env.SKIP_INTEGRATION !== 'false';
+
+// Exercise database compaction without depending on an external text model.
+vi.mock('../../src/ollama-client.js', () => ({
+  OllamaClient: { getInstance: () => ({ generateText: async () => 'Consolidated seeded memories' }) },
+}));
 
 // Plan limits (mirrors database.ts planLimits — single source of truth is DB layer)
 const PLAN_LIMITS = {
@@ -40,7 +43,7 @@ type PlanTier = keyof typeof PLAN_LIMITS;
 
 // ─── Test helpers ──────────────────────────────────────────────────────────────
 
-/** Update tenant_plans directly (simulates Stripe webhook updating the DB) */
+/** Update tenant_plans directly */
 async function setTenantPlan(pool: Pool, tenantId: string, plan: PlanTier): Promise<void> {
   const limits = PLAN_LIMITS[plan];
   await pool.query(
@@ -58,16 +61,13 @@ async function setTenantPlan(pool: Pool, tenantId: string, plan: PlanTier): Prom
 
 /** Seed exactly N memories for a tenant (bypasses limit check — used to set up over-limit state) */
 async function seedMemories(pool: Pool, tenantId: string, projectId: string, count: number): Promise<string[]> {
-  const ids: string[] = [];
-  for (let i = 0; i < count; i++) {
-    const id = randomUUID();
-    await pool.query(
-      `INSERT INTO memories (id, tenant_id, project_id, content, category, created_at)
-       VALUES ($1, $2, $3, $4, 'general', NOW())`,
-      [id, tenantId, projectId, `Seeded memory ${i + 1} of ${count}`]
-    );
-    ids.push(id);
-  }
+  const result = await pool.query(
+    `INSERT INTO memories (id, tenant_id, project_id, content, category, created_at)
+     SELECT gen_random_uuid(), $1, $2, 'Shared background context for seeded integration test memory number ' || i || ' of ' || $3, 'general', NOW()
+     FROM generate_series(1, $3::integer) AS i RETURNING id`,
+    [tenantId, projectId, count],
+  );
+  const ids = result.rows.map(row => row.id);
   return ids;
 }
 
@@ -87,7 +87,7 @@ async function deleteAllMemories(pool: Pool, tenantId: string): Promise<void> {
 
 // ─── Test Suite ────────────────────────────────────────────────────────────────
 
-describe.skipIf(SKIP)('Plan Change Limit Enforcement (REM-89)', () => {
+describe('Plan Change Limit Enforcement (REM-89)', () => {
   let pool: Pool;
   let db: MemoryDatabase;
 
@@ -102,23 +102,23 @@ describe.skipIf(SKIP)('Plan Change Limit Enforcement (REM-89)', () => {
   async function makeService(tenantId: string): Promise<{ service: MemoryService; projectId: string }> {
     // Ensure tenant exists
     await pool.query(
-      `INSERT INTO tenants (id, name, plan) VALUES ($1, 'REM-89 Test Tenant', 'free')
+      `INSERT INTO tenants (id, name, email, plan) VALUES ($1, 'REM-89 Test Tenant', ($1::uuid)::text || '@test.invalid', 'free')
        ON CONFLICT (id) DO NOTHING`,
       [tenantId]
     );
     // Default plan entry
     await setTenantPlan(pool, tenantId, 'free');
 
-    const service = new MemoryService(db, tenantId, 'test-user');
     // Create default project
     const projectResult = await pool.query(
-      `INSERT INTO projects (id, tenant_id, name, is_default)
-       VALUES ($1, $2, 'Default', true)
-       ON CONFLICT (tenant_id, is_default) DO UPDATE SET id = EXCLUDED.id
+      `INSERT INTO projects (id, tenant_id, name)
+       VALUES ($1, $2, 'Default')
+       ON CONFLICT (id) DO NOTHING
        RETURNING id`,
       [randomUUID(), tenantId]
     );
     const projectId = projectResult.rows[0].id;
+    const service = new MemoryService(tenantId, projectId, db);
     return { service, projectId };
   }
 
@@ -126,23 +126,20 @@ describe.skipIf(SKIP)('Plan Change Limit Enforcement (REM-89)', () => {
     await pool.query('DELETE FROM memories WHERE tenant_id = $1', [tenantId]);
     await pool.query('DELETE FROM projects WHERE tenant_id = $1', [tenantId]);
     await pool.query('DELETE FROM tenant_plans WHERE tenant_id = $1', [tenantId]);
-    await pool.query('DELETE FROM audit_log WHERE tenant_id = $1', [tenantId]);
+    await pool.query('DELETE FROM audit_logs WHERE tenant_id = $1', [tenantId]);
     await pool.query('DELETE FROM tenants WHERE id = $1', [tenantId]);
   }
 
   beforeAll(async () => {
-    const connectionString =
-      process.env.TEST_DATABASE_URL ||
-      'postgresql://postgres:postgres@localhost:5432/rembr_test';
-    pool = new Pool({ connectionString });
-    db = new MemoryDatabase(pool);
+    ({ pool, db } = await createRuntimeDatabase('rembr_test_limits'));
   });
 
   afterAll(async () => {
     // Clean up all test tenants
     await pool.query(
-      `DELETE FROM tenants WHERE id LIKE '89000000-0000-0000-0000-%'`
+      `DELETE FROM tenants WHERE id::text LIKE '89000000-0000-0000-0000-%'`
     );
+    await db?.close();
     await pool.end();
   });
 
@@ -500,10 +497,10 @@ describe.skipIf(SKIP)('Plan Change Limit Enforcement (REM-89)', () => {
 
         expect(result.success).toBe(true);
         expect(result.initial_count).toBe(1500);
-        expect(result.final_count).toBeLessThanOrEqualTo(PLAN_LIMITS.free.memory);
+        expect(result.final_count).toBeLessThanOrEqual(PLAN_LIMITS.free.memory);
 
         const actualCount = await getMemoryCount(pool, tenantId);
-        expect(actualCount).toBeLessThanOrEqualTo(PLAN_LIMITS.free.memory);
+        expect(actualCount).toBeLessThanOrEqual(PLAN_LIMITS.free.memory);
       } finally {
         await teardownTenant(tenantId);
       }
@@ -526,7 +523,7 @@ describe.skipIf(SKIP)('Plan Change Limit Enforcement (REM-89)', () => {
 
         // Verify audit log row exists with correct action
         const audit = await pool.query(
-          `SELECT action, details FROM audit_log WHERE id = $1`,
+          `SELECT type AS action, metadata AS details FROM audit_logs WHERE id = $1`,
           [result.audit_log_id]
         );
         expect(audit.rows).toHaveLength(1);
@@ -554,11 +551,11 @@ describe.skipIf(SKIP)('Plan Change Limit Enforcement (REM-89)', () => {
         const { compactMemories, isCompactionNeeded } = await import('../../src/optimization/compaction-service.js');
 
         const needed = await isCompactionNeeded(pool, tenantId);
-        expect(needed).toBe(true);
+        expect(needed.needed).toBe(true);
 
         const result = await compactMemories(pool, tenantId, PLAN_LIMITS.pro.memory);
         expect(result.success).toBe(true);
-        expect(await getMemoryCount(pool, tenantId)).toBeLessThanOrEqualTo(PLAN_LIMITS.pro.memory);
+        expect(await getMemoryCount(pool, tenantId)).toBeLessThanOrEqual(PLAN_LIMITS.pro.memory);
       } finally {
         await teardownTenant(tenantId);
       }
@@ -586,7 +583,7 @@ describe.skipIf(SKIP)('Plan Change Limit Enforcement (REM-89)', () => {
         const result = await compactMemories(pool, tenantId, PLAN_LIMITS.free.memory);
 
         expect(result.success).toBe(true);
-        expect(await getMemoryCount(pool, tenantId)).toBeLessThanOrEqualTo(PLAN_LIMITS.free.memory);
+        expect(await getMemoryCount(pool, tenantId)).toBeLessThanOrEqual(PLAN_LIMITS.free.memory);
 
         // Pending-embedding memories should still exist (compaction preserves unembedded rows)
         const remaining = await pool.query(
@@ -594,7 +591,7 @@ describe.skipIf(SKIP)('Plan Change Limit Enforcement (REM-89)', () => {
           [pendingIds, tenantId]
         );
         // Some may have been compacted away but the operation should not throw
-        expect(parseInt(remaining.rows[0].count)).toBeGreaterThanOrEqualTo(0);
+        expect(parseInt(remaining.rows[0].count)).toBeGreaterThanOrEqual(0);
       } finally {
         await teardownTenant(tenantId);
       }
@@ -615,27 +612,18 @@ describe.skipIf(SKIP)('Plan Change Limit Enforcement (REM-89)', () => {
         const { compactMemories } = await import('../../src/optimization/compaction-service.js');
         const result = await compactMemories(pool, tenantId, PLAN_LIMITS.free.memory, {
           priority_strategy: 'lowest_relevance',
+          max_group_size: 10,
         });
 
         expect(result.success).toBe(true);
         expect(result.initial_count).toBe(10000);
-        expect(result.final_count).toBeLessThanOrEqualTo(PLAN_LIMITS.free.memory);
+        expect(result.final_count).toBeLessThanOrEqual(PLAN_LIMITS.free.memory);
 
         const actualCount = await getMemoryCount(pool, tenantId);
-        expect(actualCount).toBeLessThanOrEqualTo(PLAN_LIMITS.free.memory);
+        expect(actualCount).toBeLessThanOrEqual(PLAN_LIMITS.free.memory);
       } finally {
         await teardownTenant(tenantId);
       }
     });
-  });
-
-  // ─── Stripe billing integration (TODO — requires Stripe test mode + UI) ──────
-
-  describe('Stripe billing integration (TODO — requires Stripe test mode)', () => {
-    it.todo('Upgrade via Stripe checkout (card 4242424242424242): plan change propagates to tenant_plans');
-    it.todo('Downgrade via Stripe portal: limits enforced within one webhook delivery');
-    it.todo('Failed payment (card 4000000000000002): grace period applied, limits not yet reduced');
-    it.todo('Stripe webhook failure during plan change: limits unchanged, retry succeeds');
-    it.todo('Stripe subscription.deleted event: tenant reverts to free plan limits');
   });
 });

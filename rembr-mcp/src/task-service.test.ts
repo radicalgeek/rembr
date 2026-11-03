@@ -302,6 +302,13 @@ describe('Task Service (REM-70)', () => {
         priority: 'low',
       });
 
+      // Separate the fixture timestamp from this update without relying on
+      // wall-clock delays or JavaScript's millisecond truncation of PG timestamps.
+      const previous = await testPool.query(
+        "UPDATE tasks SET updated_at = NOW() - INTERVAL '1 minute' WHERE id = $1 RETURNING updated_at",
+        [created.id],
+      );
+
       const updated = await service.updateTask(created.id, {
         title: 'Updated Title',
         description: 'Updated Description',
@@ -313,7 +320,7 @@ describe('Task Service (REM-70)', () => {
       expect(updated.description).toBe('Updated Description');
       expect(updated.status).toBe('in_progress');
       expect(updated.priority).toBe('high');
-      expect(updated.updated_at.getTime()).toBeGreaterThan(created.updated_at.getTime());
+      expect(updated.updated_at.getTime()).toBeGreaterThan(previous.rows[0].updated_at.getTime());
     });
 
     it('should set in_progress_at when transitioning to in_progress', async () => {

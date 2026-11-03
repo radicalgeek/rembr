@@ -35,7 +35,7 @@ const mockTask = {
 
 vi.mock('./task-service.js', () => {
   return {
-    TaskService: vi.fn().mockImplementation(() => ({
+    TaskService: vi.fn().mockImplementation(function () { return ({
       createTask: vi.fn().mockResolvedValue({ ...mockTask, id: 'task-new' }),
       getTask: vi.fn().mockResolvedValue(mockTask),
       updateTask: vi.fn().mockImplementation((_id, updates) =>
@@ -48,7 +48,7 @@ vi.mock('./task-service.js', () => {
         limit: 50,
         offset: 0,
       }),
-    })),
+    }); }),
   };
 });
 
@@ -237,9 +237,9 @@ describe('task_dependencies', () => {
     });
     // Override getTask to return task with a dependency
     const { TaskService } = await import('./task-service.js');
-    (TaskService as any).mockImplementationOnce(() => ({
+    (TaskService as any).mockImplementationOnce(function () { return ({
       getTask: vi.fn().mockResolvedValue({ ...mockTask, depends_on_task_ids: ['task-upstream'] }),
-    }));
+    }); });
     const result: any = await handleTaskDependencies(
       mockPool, { operation: 'blocked_by', task_id: 'task-1' }
     );

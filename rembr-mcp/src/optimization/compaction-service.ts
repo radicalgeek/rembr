@@ -14,6 +14,9 @@ export interface CompactionCandidate {
   content: string;
   category: string;
   tags: string[];
+  project_id?: string;
+  user_id?: string;
+  visibility?: string;
   relevance_score?: number;
   created_at: Date;
   embedding?: number[];
@@ -105,16 +108,13 @@ export async function compactMemories(
 
     // 2. Fetch all memories with embeddings
     const memoriesResult = await pool.query<CompactionCandidate>(
-      `SELECT 
-        id, 
-        content, 
-        category, 
-        tags, 
-        relevance_score, 
-        created_at,
-        embedding
-      FROM memories 
-      WHERE tenant_id = $1
+      `SELECT
+        m.id, m.content, m.category, m.project_id, m.user_id, m.visibility,
+        ARRAY(SELECT jsonb_array_elements_text(CASE WHEN jsonb_typeof(m.metadata->'tags') = 'array' THEN m.metadata->'tags' ELSE '[]'::jsonb END)) AS tags,
+        m.relevance_score, m.created_at, e.embedding
+      FROM memories m
+      LEFT JOIN memory_embeddings e ON e.memory_id = m.id
+      WHERE m.tenant_id = $1
       ORDER BY ${getPriorityOrderClause(priority_strategy)}`,
       [tenantId]
     );
@@ -156,11 +156,9 @@ export async function compactMemories(
         if (removedCount >= memoriesToRemove) break;
 
         // We'll merge N memories into 1, removing N-1
-        const willRemove = group.length - 1;
-        if (removedCount + willRemove <= memoriesToRemove) {
-          mergeGroups.push(group);
-          removedCount += willRemove;
-        }
+        const selected = group.slice(0, memoriesToRemove - removedCount + 1);
+        mergeGroups.push(selected);
+        removedCount += selected.length - 1;
       }
     }
 
@@ -205,7 +203,8 @@ export async function compactMemories(
     logger.info(`[Compaction] Complete: ${initialCount} → ${finalCount} (target: ${targetLimit})`);
 
     return {
-      success: true,
+      success: dry_run || finalCount <= targetLimit,
+      ...(!dry_run && finalCount > targetLimit ? { error: 'Compaction reduced memory count but did not reach the target limit.' } : {}),
       initial_count: initialCount,
       final_count: finalCount,
       target_limit: targetLimit,
@@ -224,13 +223,13 @@ export async function compactMemories(
 function getPriorityOrderClause(strategy: string): string {
   switch (strategy) {
     case 'oldest':
-      return 'created_at ASC';
+      return 'm.created_at ASC';
     case 'lowest_relevance':
-      return 'COALESCE(relevance_score, 0.0) ASC, created_at ASC';
+      return 'COALESCE(m.relevance_score, 0.0) ASC, m.created_at ASC';
     case 'largest':
-      return 'LENGTH(content) DESC';
+      return 'LENGTH(m.content) DESC';
     default:
-      return 'COALESCE(relevance_score, 0.0) ASC, created_at ASC';
+      return 'COALESCE(m.relevance_score, 0.0) ASC, m.created_at ASC';
   }
 }
 
@@ -241,7 +240,7 @@ function groupByCategory(memories: CompactionCandidate[]): Record<string, Compac
   const groups: Record<string, CompactionCandidate[]> = {};
 
   for (const memory of memories) {
-    const category = memory.category || 'uncategorized';
+    const category = JSON.stringify([memory.category || 'uncategorized', memory.project_id || null, memory.visibility || 'shared', memory.user_id || null]);
     if (!groups[category]) {
       groups[category] = [];
     }
@@ -358,20 +357,23 @@ async function mergeMemoryGroup(
 
   // Create merged memory
   const insertResult = await pool.query(
-    `INSERT INTO memories (tenant_id, content, category, tags, metadata)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO memories (id, tenant_id, content, category, metadata, project_id, user_id, visibility)
+     VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7)
      RETURNING id`,
     [
       tenantId,
       mergedContent,
       category,
-      Array.from(new Set(group.flatMap(m => m.tags || []))), // Union of all tags
       {
+        tags: Array.from(new Set(group.flatMap(m => m.tags || []))),
         compacted: true,
         original_count: group.length,
         original_ids: originalIds,
         compaction_date: new Date().toISOString(),
       },
+      group[0].project_id || null,
+      group[0].user_id || null,
+      group[0].visibility || 'shared',
     ]
   );
 
@@ -449,12 +451,12 @@ async function logCompactionAudit(
   result: Omit<CompactionResult, 'success' | 'audit_log_id'>
 ): Promise<string> {
   const auditResult = await pool.query(
-    `INSERT INTO audit_log (
+    `INSERT INTO audit_logs (
       tenant_id,
-      action,
+      type,
       resource_type,
       resource_id,
-      details,
+      metadata,
       created_at
     ) VALUES ($1, $2, $3, $4, $5, NOW())
     RETURNING id`,

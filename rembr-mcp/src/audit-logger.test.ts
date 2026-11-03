@@ -20,7 +20,7 @@ describe('AuditLogger Tamper-Resistance (REM-251)', () => {
   beforeEach(async () => {
     // Use test database
     pool = new Pool({
-      connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rembr_test'
+      connectionString: process.env.TEST_DATABASE_URL || process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rembr_test'
     })
 
     auditLogger = new AuditLogger(pool)

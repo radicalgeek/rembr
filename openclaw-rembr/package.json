@@ -47,6 +47,12 @@
     "@types/node": "^24.13.3",
     "openclaw": "^2026.6.5",
     "typescript": "^5.9.3",
-    "vitest": "^1.6.1"
+    "vitest": "^5.1.0"
+  },
+  "overrides": {
+    "@modelcontextprotocol/sdk": "^1.30.4",
+    "zod": "^4.6.6",
+    "undici": "^8.12.3",
+    "minimatch": "^11.0.4"
   }
 }

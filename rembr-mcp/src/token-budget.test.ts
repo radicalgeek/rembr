@@ -110,7 +110,7 @@ describe('Token Budget Utilities', () => {
     beforeAll(async () => {
       // Use test database
       pool = new Pool({
-        connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rembr_test'
+        connectionString: process.env.TEST_DATABASE_URL || process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rembr_test'
       });
       testTenantId = '550e8400-e29b-41d4-a716-446655440000'; // Valid UUID format
       otherTenantId = '660e8400-e29b-41d4-a716-446655440001'; // Different UUID for negative tests

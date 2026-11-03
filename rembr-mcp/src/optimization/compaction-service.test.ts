@@ -41,9 +41,9 @@ describe('Memory Compaction Service', () => {
   beforeAll(async () => {
     // Enable pgvector extension
     await testPool.query(`CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public`);
-    
+
     // Set tenant context
-    
+
     // Create tables if not exist
     await testPool.query(`
       CREATE TABLE IF NOT EXISTS memories (
@@ -51,15 +51,23 @@ describe('Memory Compaction Service', () => {
         tenant_id UUID NOT NULL,
         content TEXT NOT NULL,
         category TEXT,
-        tags TEXT[] DEFAULT '{}',
+        project_id UUID,
+        user_id UUID,
+        visibility TEXT DEFAULT 'shared',
+
         relevance_score FLOAT,
-        embedding vector(1536),
+
         metadata JSONB DEFAULT '{}'::jsonb,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
-    
+
+    await testPool.query(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS project_id UUID, ADD COLUMN IF NOT EXISTS user_id UUID, ADD COLUMN IF NOT EXISTS visibility TEXT DEFAULT 'shared'`);
+    await testPool.query(`CREATE TABLE IF NOT EXISTS memory_embeddings (
+      memory_id UUID PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+      embedding vector(1536)
+    )`);
     await testPool.query(`
       CREATE TABLE IF NOT EXISTS tenant_plans (
         tenant_id UUID PRIMARY KEY,
@@ -71,22 +79,22 @@ describe('Memory Compaction Service', () => {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
-    
+
     await testPool.query(`
-      CREATE TABLE IF NOT EXISTS audit_log (
+      CREATE TABLE IF NOT EXISTS audit_logs (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         tenant_id UUID NOT NULL,
-        action TEXT NOT NULL,
+        type TEXT NOT NULL,
         resource_type TEXT,
         resource_id UUID,
-        details JSONB DEFAULT '{}'::jsonb,
+        metadata JSONB DEFAULT '{}'::jsonb,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
   });
 
   afterAll(async () => {
-    await testPool.query('DELETE FROM audit_log WHERE tenant_id = $1', [TEST_TENANT_ID]);
+    await testPool.query('DELETE FROM audit_logs WHERE tenant_id = $1', [TEST_TENANT_ID]);
     await testPool.query('DELETE FROM memories WHERE tenant_id = $1', [TEST_TENANT_ID]);
     await testPool.query('DELETE FROM tenant_plans WHERE tenant_id = $1', [TEST_TENANT_ID]);
     await testPool.end();
@@ -94,7 +102,7 @@ describe('Memory Compaction Service', () => {
 
   beforeEach(async () => {
     // Clean up before each test
-    await testPool.query('DELETE FROM audit_log WHERE tenant_id = $1', [TEST_TENANT_ID]);
+    await testPool.query('DELETE FROM audit_logs WHERE tenant_id = $1', [TEST_TENANT_ID]);
     await testPool.query('DELETE FROM memories WHERE tenant_id = $1', [TEST_TENANT_ID]);
     await testPool.query('DELETE FROM tenant_plans WHERE tenant_id = $1', [TEST_TENANT_ID]);
   });
@@ -120,7 +128,7 @@ describe('Memory Compaction Service', () => {
   describe('isCompactionNeeded', () => {
     it('should return false when no plan limit exists', async () => {
       const result = await isCompactionNeeded(testPool, TEST_TENANT_ID);
-      
+
       expect(result.needed).toBe(false);
       expect(result.limit).toBeNull();
     });
@@ -141,7 +149,7 @@ describe('Memory Compaction Service', () => {
       }
 
       const result = await isCompactionNeeded(testPool, TEST_TENANT_ID);
-      
+
       expect(result.needed).toBe(false);
       expect(result.currentCount).toBe(5);
       expect(result.limit).toBe(10);
@@ -163,7 +171,7 @@ describe('Memory Compaction Service', () => {
       }
 
       const result = await isCompactionNeeded(testPool, TEST_TENANT_ID);
-      
+
       expect(result.needed).toBe(true);
       expect(result.currentCount).toBe(10);
       expect(result.limit).toBe(5);
@@ -245,14 +253,14 @@ describe('Memory Compaction Service', () => {
 
     it('should merge tags from original memories', async () => {
       await testPool.query(
-        `INSERT INTO memories (tenant_id, content, category, tags)
+        `INSERT INTO memories (tenant_id, content, category, metadata)
          VALUES ($1, $2, $3, $4)`,
-        [TEST_TENANT_ID, 'Memory 1', 'notes', ['tag1', 'tag2']]
+        [TEST_TENANT_ID, 'Memory 1', 'notes', { tags: ['tag1', 'tag2'] }]
       );
       await testPool.query(
-        `INSERT INTO memories (tenant_id, content, category, tags)
+        `INSERT INTO memories (tenant_id, content, category, metadata)
          VALUES ($1, $2, $3, $4)`,
-        [TEST_TENANT_ID, 'Memory 2', 'notes', ['tag2', 'tag3']]
+        [TEST_TENANT_ID, 'Memory 2', 'notes', { tags: ['tag2', 'tag3'] }]
       );
 
       const options: CompactionOptions = {
@@ -276,19 +284,19 @@ describe('Memory Compaction Service', () => {
       const embeddingB = Array.from({ length: 1536 }, (_, i) => (i % 2 === 0 ? 0 : 1));
       const embeddingStrA = '[' + embeddingA.join(',') + ']';
       const embeddingStrB = '[' + embeddingB.join(',') + ']';
-      
+
       // Group A: 2 similar memories
       for (let i = 0; i < 2; i++) {
         await testPool.query(
-          'INSERT INTO memories (tenant_id, content, category, embedding) VALUES ($1, $2, $3, $4::vector)',
+          `WITH m AS (INSERT INTO memories (tenant_id, content, category) VALUES ($1, $2, $3) RETURNING id) INSERT INTO memory_embeddings (memory_id, embedding) SELECT id, $4::vector FROM m`,
           [TEST_TENANT_ID, `Note A ${i}`, 'notes', embeddingStrA]
         );
       }
-      
+
       // Group B: 2 similar memories
       for (let i = 0; i < 2; i++) {
         await testPool.query(
-          'INSERT INTO memories (tenant_id, content, category, embedding) VALUES ($1, $2, $3, $4::vector)',
+          `WITH m AS (INSERT INTO memories (tenant_id, content, category) VALUES ($1, $2, $3) RETURNING id) INSERT INTO memory_embeddings (memory_id, embedding) SELECT id, $4::vector FROM m`,
           [TEST_TENANT_ID, `Note B ${i}`, 'notes', embeddingStrB]
         );
       }
@@ -307,13 +315,44 @@ describe('Memory Compaction Service', () => {
 
       // Verify audit log
       const auditResult = await testPool.query(
-        'SELECT * FROM audit_log WHERE id = $1',
+        'SELECT * FROM audit_logs WHERE id = $1',
         [result.audit_log_id]
       );
 
       expect(auditResult.rows).toHaveLength(1);
-      expect(auditResult.rows[0].action).toBe('memory_compaction');
+      expect(auditResult.rows[0].type).toBe('memory_compaction');
       expect(auditResult.rows[0].resource_type).toBe('memories');
+    });
+
+    it('reports a partial reduction when the group size cannot reach the target', async () => {
+      await testPool.query(`INSERT INTO memories (tenant_id, content, category)
+        SELECT $1, 'Repeated memory for compaction', 'notes' FROM generate_series(1, 10)`, [TEST_TENANT_ID]);
+      const result = await compactMemories(testPool, TEST_TENANT_ID, 1, { max_group_size: 5 });
+      expect(result.success).toBe(false);
+      expect(result.initial_count).toBe(10);
+      expect(result.final_count).toBe(2);
+      expect(result.error).toContain('did not reach');
+    });
+
+    it('preserves project and audience boundaries during merging', async () => {
+      const projectA = 'a1000000-0000-4000-8000-000000000001';
+      const projectB = 'b1000000-0000-4000-8000-000000000001';
+      const owner = 'c1000000-0000-4000-8000-000000000001';
+      for (const [project, visibility, user] of [[projectA, 'shared', null], [projectA, 'personal', owner], [projectB, 'shared', null]]) {
+        await testPool.query(`INSERT INTO memories (tenant_id, project_id, visibility, user_id, content, category, metadata)
+          SELECT $1, $2::uuid, $3, $4::uuid, 'Repeated memory for compaction', 'notes', '{"tags":["retained"]}'::jsonb
+          FROM generate_series(1, 2)`, [TEST_TENANT_ID, project, visibility, user]);
+      }
+      const result = await compactMemories(testPool, TEST_TENANT_ID, 3);
+      expect(result.success).toBe(true);
+      const rows = await testPool.query('SELECT project_id, visibility, user_id, metadata FROM memories WHERE tenant_id = $1', [TEST_TENANT_ID]);
+      expect(rows.rows).toHaveLength(3);
+      expect(rows.rows).toEqual(expect.arrayContaining([
+        expect.objectContaining({ project_id: projectA, visibility: 'shared', user_id: null }),
+        expect.objectContaining({ project_id: projectA, visibility: 'personal', user_id: owner }),
+        expect.objectContaining({ project_id: projectB, visibility: 'shared', user_id: null }),
+      ]));
+      expect(rows.rows.every(row => row.metadata.tags.includes('retained'))).toBe(true);
     });
 
     it('should use lowest_relevance priority strategy by default', async () => {
@@ -385,7 +424,7 @@ describe('Memory Compaction Service', () => {
       const result = await compactMemories(testPool, TEST_TENANT_ID, 1, options);
 
       expect(result.merged_groups.length).toBeGreaterThan(0);
-      
+
       for (const group of result.merged_groups) {
         expect(group.compression_ratio).toBeGreaterThanOrEqual(2);
         expect(group.compression_ratio).toBe(group.original_memory_ids.length);

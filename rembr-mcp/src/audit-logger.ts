@@ -125,8 +125,8 @@ export class AuditLogger {
          event_type, resource_type, resource_id, action_result, error_message,
          payload_before, payload_after, query_parameters, session_id, request_id, metadata,
          type, user_identifier, provider, success)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                $7, COALESCE($18, 'unknown'), COALESCE($19, 'mcp'), $10 = 'success')
+        VALUES ($1, $2, $3, $4, $5, $6, $7::text, $8, $9, $10::text, $11, $12, $13, $14, $15, $16, $17,
+                $7::text, COALESCE($18, 'unknown'), COALESCE($19, 'mcp'), $10::text = 'success')
       `;
 
       await this.db.query(query, [
