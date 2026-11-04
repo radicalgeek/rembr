@@ -175,3 +175,55 @@ describe("digest and cursor helpers", () => {
     expect(resumeCursor(5, 10)).toBe(5)
   })
 })
+
+describe("nested and incomplete private spans", () => {
+  it.each([
+    ["left <private>outer <private>inner</private>hidden-tail</private> right", "left  right"],
+    ["left <PrIvAtE>outer <PRIVATE>inner</PRIVATE>hidden-tail</pRiVaTe> right", "left  right"],
+    ["left <private>outer <private>inner</private>hidden-tail", "left "],
+    ["left <private>outer <private>unclosed-inner", "left "],
+  ])("redacts the complete private region: %s", (input, expected) => {
+    expect(stripPrivate(input)).toBe(expected)
+  })
+})
+
+
+describe("private spans across Codex transcript paths", () => {
+  it.each([
+    "keep <private>outer <private>inner</private>NESTED_CANARY</private> end",
+    "keep <private>UNCLOSED_CANARY",
+    `keep <private>${"LONG_CANARY ".repeat(100)}</private> end`,
+  ])("redacts before truncation in messages, tool calls and tool output", (text) => {
+    const records: CodexRecord[] = [
+      { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text }] } },
+      { type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text }] } },
+      { type: "response_item", payload: { type: "function_call", name: "fixture", arguments: JSON.stringify({ [text]: text }) } },
+      { type: "response_item", payload: { type: "function_call_output", output: text } },
+    ]
+    const lines = extractLines(records)
+    expect(lines).toHaveLength(4)
+    for (const line of lines) {
+      expect(line).not.toContain("CANARY")
+      expect(line).not.toMatch(/private/i)
+      expect(line).toContain("keep")
+    }
+  })
+})
+
+describe("private spans across same-message text fragments", () => {
+  it.each(["user", "assistant"])("keeps %s private state across fragments but resets it for the next message", (role) => {
+    const lines = extractLines([
+      { type: "response_item", payload: { type: "message", role, content: [
+        { type: "input_text", text: "public-before <private>" },
+        { type: "output_text", text: "CROSS_PART_CANARY</private> public-after" },
+        { type: "input_text", text: "<private>UNCLOSED_CANARY" },
+      ] } },
+      { type: "response_item", payload: { type: "message", role, content: [{ type: "input_text", text: "next-message-public" }] } },
+    ] as CodexRecord[])
+    const digest = lines.join("\n")
+    expect(digest).not.toContain("CANARY")
+    expect(digest).toContain("public-before")
+    expect(digest).toContain("public-after")
+    expect(digest).toContain("next-message-public")
+  })
+})

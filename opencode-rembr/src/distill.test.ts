@@ -12,6 +12,7 @@ import {
   parseModelRef,
   readCursor,
   stripPrivate,
+  stripPrivateDeep,
   OBSERVER_PROMPT,
   writeCursor,
   type SessionMessage,
@@ -101,6 +102,66 @@ describe("private spans in tool parts", () => {
     const output = `${"a".repeat(250)}<private>${"fixture-secret ".repeat(20)}</private>tail`
     const lines = extractLines(toolMessage({}, output))
     expect(lines.join("\n")).not.toContain("fixture-secret")
+  })
+
+  it("redacts nested mixed-case spans in every text and tool path", () => {
+    const text = "keep <PrIvAtE>outer <private>inner</private>NESTED_CANARY</PRIVATE> end"
+    const lines = extractLines([
+      { info: { role: "user" }, parts: [{ type: "text", text }] },
+      { info: { role: "assistant" }, parts: [{ type: "text", text }] },
+      ...toolMessage({ text }, text),
+    ])
+    expect(lines).toHaveLength(4)
+    for (const line of lines) {
+      expect(line).not.toContain("CANARY")
+      expect(line).not.toMatch(/private/i)
+      expect(line).toContain("keep")
+      expect(line).toContain("end")
+    }
+  })
+
+  it("drops private object keys and values before input and output truncation", () => {
+    const value = { "public<private>KEY_CANARY</private>key": { safe: "kept", value: "<private>VALUE_CANARY</private>visible" } }
+    const lines = extractLines(toolMessage(value, value))
+    expect(lines).toHaveLength(2)
+    for (const line of lines) {
+      expect(line).not.toContain("CANARY")
+      expect(line).toContain("publickey")
+      expect(line).toContain("kept")
+      expect(line).toContain("visible")
+    }
+  })
+
+  it.each(["object", "array"])("omits over-depth %s subtrees without exposing raw private values", (kind) => {
+    let deep: unknown = { "<private>DEEP_KEY_CANARY</private>": "<private>DEEP_VALUE_CANARY</private>" }
+    for (let i = 0; i < 23; i++) deep = kind === "array" ? [deep] : { x: deep }
+    const value = { before: "safe-before", deep, after: "safe-after" }
+    expect(stripPrivateDeep(value)).toEqual(expect.objectContaining({ before: "safe-before", after: "safe-after" }))
+    const lines = extractLines(toolMessage(value, value))
+    expect(lines).toHaveLength(2)
+    for (const line of lines) {
+      expect(line).not.toContain("CANARY")
+      expect(line).not.toMatch(/private/i)
+      expect(line).toContain("safe-before")
+      expect(line).toContain("[omitted]")
+    }
+  })
+
+  it("fails closed when private spans cross object fields", () => {
+    const value = { "<private>": "CROSS_FIELD_CANARY</private>" }
+    for (const line of extractLines(toolMessage(value, value))) {
+      expect(line).not.toContain("CANARY")
+      expect(line).toContain("[omitted]")
+    }
+  })
+
+  it("bounds cyclic values without a raw fallback", () => {
+    const value: Record<string, unknown> = { text: "keep <private>CYCLE_CANARY</private> end" }
+    value.self = value
+    for (const line of extractLines(toolMessage(value, value))) {
+      expect(line).not.toContain("CANARY")
+      expect(line).toContain("keep")
+    }
   })
 
   it("drops an unclosed private span to the end", () => {
@@ -194,5 +255,35 @@ describe("parseModelRef", () => {
     expect(parseModelRef("")).toBeUndefined()
     expect(parseModelRef("no-slash")).toBeUndefined()
     expect(parseModelRef("trailing/")).toBeUndefined()
+  })
+})
+
+describe("nested and incomplete private spans", () => {
+  it.each([
+    ["left <private>outer <private>inner</private>hidden-tail</private> right", "left  right"],
+    ["left <PrIvAtE>outer <PRIVATE>inner</PRIVATE>hidden-tail</pRiVaTe> right", "left  right"],
+    ["left <private>outer <private>inner</private>hidden-tail", "left "],
+    ["left <private>outer <private>unclosed-inner", "left "],
+  ])("redacts the complete private region: %s", (input, expected) => {
+    expect(stripPrivate(input)).toBe(expected)
+  })
+})
+
+
+describe("private spans across same-message text fragments", () => {
+  it.each(["user", "assistant"])("keeps %s private state across fragments but resets it for the next message", (role) => {
+    const lines = extractLines([
+      { info: { role }, parts: [
+        { type: "text", text: "public-before <private>" },
+        { type: "text", text: "CROSS_PART_CANARY</private> public-after" },
+        { type: "text", text: "<private>UNCLOSED_CANARY" },
+      ] },
+      { info: { role }, parts: [{ type: "text", text: "next-message-public" }] },
+    ])
+    const digest = lines.join("\n")
+    expect(digest).not.toContain("CANARY")
+    expect(digest).toContain("public-before")
+    expect(digest).toContain("public-after")
+    expect(digest).toContain("next-message-public")
   })
 })

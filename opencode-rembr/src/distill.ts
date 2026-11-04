@@ -86,19 +86,48 @@ export function logLine(config: DistillConfig, msg: string): void {
   }
 }
 
-export function stripPrivate(text: string): string {
-  // An unclosed span runs to the end: never let a missing tag expose content.
-  return text.replace(/<private>[\s\S]*?(?:<\/private>|$)/gi, "")
+export function stripPrivate(text: string, state = { depth: 0 }): string {
+  // Track nesting so an inner closing tag cannot expose the outer span.
+  // Any unmatched opening tag suppresses the remainder of the string.
+  let depth = state.depth
+  let cursor = 0
+  let result = ""
+  const tags = /<\/?private>/gi
+  for (const match of text.matchAll(tags)) {
+    if (depth === 0) result += text.slice(cursor, match.index)
+    if (match[0][1] === "/") depth = Math.max(0, depth - 1)
+    else depth++
+    cursor = match.index + match[0].length
+  }
+  if (depth === 0) result += text.slice(cursor)
+  state.depth = depth
+  return result
 }
 
-/** Strip private spans from every string inside a tool input or output. */
+const OMITTED_TOOL_VALUE = "[omitted]"
+
+/** Bound traversal before serialisation; deep or unsupported values fail closed. */
+function boundedToolValue(value: unknown, depth: number): unknown {
+  if (depth > 20) return OMITTED_TOOL_VALUE
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value
+  if (Array.isArray(value)) return value.map((item) => boundedToolValue(item, depth + 1))
+  if (typeof value !== "object") return OMITTED_TOOL_VALUE
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, boundedToolValue(item, depth + 1)]),
+  )
+}
+
+/** Redact values and property names, including spans crossing JSON fields. */
 export function stripPrivateDeep(value: unknown, depth = 0): unknown {
   if (typeof value === "string") return stripPrivate(value)
-  if (depth > 20 || value === null || typeof value !== "object") return value
-  if (Array.isArray(value)) return value.map((item) => stripPrivateDeep(item, depth + 1))
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, stripPrivateDeep(item, depth + 1)]),
-  )
+  try {
+    const serialised = JSON.stringify(boundedToolValue(value, depth))
+    // Redaction may cross key/value boundaries and leave invalid JSON. Never
+    // fall back to the original object or its raw string representation.
+    return JSON.parse(stripPrivate(serialised)) as unknown
+  } catch {
+    return OMITTED_TOOL_VALUE
+  }
 }
 
 export function looksLikeSecret(text: string): boolean {
@@ -127,7 +156,7 @@ function summarizeValue(value: unknown, max: number): string {
   try {
     s = typeof value === "string" ? value : JSON.stringify(value)
   } catch {
-    s = String(value)
+    return OMITTED_TOOL_VALUE
   }
   return (s ?? "").replace(/\s+/g, " ").trim().slice(0, max)
 }
@@ -142,10 +171,11 @@ export function extractLines(messages: SessionMessage[]): string[] {
   const lines: string[] = []
   for (const message of messages) {
     const role = message.info?.role === "assistant" ? "ASSISTANT" : "USER"
+    const textPrivateState = { depth: 0 }
     for (const part of message.parts ?? []) {
       if (part.synthetic) continue
       if (part.type === "text" && typeof part.text === "string") {
-        const text = stripPrivate(part.text).trim()
+        const text = stripPrivate(part.text, textPrivateState).trim()
         if (text) lines.push(`${role}: ${text}`)
       } else if (part.type === "tool") {
         // Strip before truncating: a cut can remove the closing tag.

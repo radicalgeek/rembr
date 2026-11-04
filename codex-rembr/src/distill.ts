@@ -103,8 +103,22 @@ export function logLine(config: DistillConfig, msg: string): void {
   }
 }
 
-export function stripPrivate(text: string): string {
-  return text.replace(/<private>[\s\S]*?<\/private>/gi, "")
+export function stripPrivate(text: string, state = { depth: 0 }): string {
+  // Track nesting so an inner closing tag cannot expose the outer span.
+  // Any unmatched opening tag suppresses the remainder of the string.
+  let depth = state.depth
+  let cursor = 0
+  let result = ""
+  const tags = /<\/?private>/gi
+  for (const match of text.matchAll(tags)) {
+    if (depth === 0) result += text.slice(cursor, match.index)
+    if (match[0][1] === "/") depth = Math.max(0, depth - 1)
+    else depth++
+    cursor = match.index + match[0].length
+  }
+  if (depth === 0) result += text.slice(cursor)
+  state.depth = depth
+  return result
 }
 
 export function looksLikeSecret(text: string): boolean {
@@ -116,10 +130,11 @@ function compact(text: string, max: number): string {
 }
 
 function textContent(content: CodexPayload["content"]): string {
+  const state = { depth: 0 }
   return (content ?? [])
     .filter((part) => ["input_text", "output_text"].includes(part.type ?? "") && typeof part.text === "string")
     .map((part) => part.text)
-    .map((text) => stripPrivate(text ?? ""))
+    .map((text) => stripPrivate(text ?? "", state))
     .join("\n")
 }
 

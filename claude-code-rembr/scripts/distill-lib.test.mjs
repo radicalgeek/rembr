@@ -239,3 +239,63 @@ describe("buildDistillerArgs", () => {
     expect(args).not.toContain("--mcp-config")
   })
 })
+
+describe("nested and incomplete private spans", () => {
+  it.each([
+    ["left <private>outer <private>inner</private>hidden-tail</private> right", "left  right"],
+    ["left <PrIvAtE>outer <PRIVATE>inner</PRIVATE>hidden-tail</pRiVaTe> right", "left  right"],
+    ["left <private>outer <private>inner</private>hidden-tail", "left "],
+    ["left <private>outer <private>unclosed-inner", "left "],
+  ])("redacts the complete private region: %s", (input, expected) => {
+    expect(stripPrivate(input)).toBe(expected)
+  })
+})
+
+
+describe("private spans across Claude transcript paths", () => {
+  it.each([
+    "keep <private>outer <private>inner</private>NESTED_CANARY</private> end",
+    "keep <private>UNCLOSED_CANARY",
+    `keep <private>${"LONG_CANARY ".repeat(100)}</private> end`,
+  ])("redacts text, tool property names/values and output before truncation", (text) => {
+    const { lines } = extractLines([
+      { type: "user", message: { content: text } },
+      { type: "assistant", message: { content: [
+        { type: "text", text },
+        { type: "tool_use", name: "fixture", input: { [text]: { value: text } } },
+      ] } },
+      { type: "user", message: { content: [{ type: "tool_result", content: [{ type: "text", text }] }] } },
+    ])
+    expect(lines).toHaveLength(4)
+    for (const line of lines) {
+      expect(line).not.toContain("CANARY")
+      expect(line).not.toMatch(/private/i)
+      expect(line).toContain("keep")
+    }
+  })
+
+  it("does not stringify raw input when JSON serialisation fails", () => {
+    const input = { toString: () => "<private>FALLBACK_CANARY</private>" }
+    input.self = input
+    const { lines } = extractLines([{ type: "assistant", message: { content: [{ type: "tool_use", name: "fixture", input }] } }])
+    expect(lines).toEqual(["TOOL CALL fixture: [omitted]"])
+  })
+})
+
+describe("private spans across same-message text fragments", () => {
+  it.each(["user", "assistant"])("keeps %s private state across fragments but resets it for the next message", (type) => {
+    const { lines } = extractLines([
+      { type, message: { content: [
+        { type: "text", text: "public-before <private>" },
+        { type: "text", text: "CROSS_PART_CANARY</private> public-after" },
+        { type: "text", text: "<private>UNCLOSED_CANARY" },
+      ] } },
+      { type, message: { content: [{ type: "text", text: "next-message-public" }] } },
+    ])
+    const digest = lines.join("\n")
+    expect(digest).not.toContain("CANARY")
+    expect(digest).toContain("public-before")
+    expect(digest).toContain("public-after")
+    expect(digest).toContain("next-message-public")
+  })
+})

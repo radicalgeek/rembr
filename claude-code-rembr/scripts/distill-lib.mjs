@@ -87,8 +87,22 @@ export function log(config, msg) {
   }
 }
 
-export function stripPrivate(text) {
-  return text.replace(/<private>[\s\S]*?<\/private>/gi, "")
+export function stripPrivate(text, state = { depth: 0 }) {
+  // Track nesting so an inner closing tag cannot expose the outer span.
+  // Any unmatched opening tag suppresses the remainder of the string.
+  let depth = state.depth
+  let cursor = 0
+  let result = ""
+  const tags = /<\/?private>/gi
+  for (const match of text.matchAll(tags)) {
+    if (depth === 0) result += text.slice(cursor, match.index)
+    if (match[0][1] === "/") depth = Math.max(0, depth - 1)
+    else depth++
+    cursor = match.index + match[0].length
+  }
+  if (depth === 0) result += text.slice(cursor)
+  state.depth = depth
+  return result
 }
 
 export function looksLikeSecret(text) {
@@ -100,9 +114,9 @@ function summarizeToolInput(value) {
   try {
     s = JSON.stringify(value)
   } catch {
-    s = String(value)
+    return "[omitted]"
   }
-  return (s ?? "").replace(/\s+/g, " ").slice(0, 200)
+  return stripPrivate(s ?? "").replace(/\s+/g, " ").slice(0, 200)
 }
 
 /**
@@ -120,6 +134,7 @@ export function extractLines(records, excludeCwd = []) {
     // Subagent work is distilled through the main thread's tool calls and results, not its own turns.
     if (rec?.isSidechain) continue
     const content = rec?.message?.content
+    const textPrivateState = { depth: 0 }
     if (rec?.type === "user") {
       if (typeof content === "string") {
         const text = stripPrivate(content).trim()
@@ -127,7 +142,7 @@ export function extractLines(records, excludeCwd = []) {
       } else if (Array.isArray(content)) {
         for (const block of content) {
           if (block?.type === "text") {
-            const text = stripPrivate(block.text ?? "").trim()
+            const text = stripPrivate(block.text ?? "", textPrivateState).trim()
             if (text) lines.push(`USER: ${text}`)
           } else if (block?.type === "tool_result") {
             const inner = block.content
@@ -147,7 +162,7 @@ export function extractLines(records, excludeCwd = []) {
     } else if (rec?.type === "assistant" && Array.isArray(content)) {
       for (const block of content) {
         if (block?.type === "text") {
-          const text = stripPrivate(block.text ?? "").trim()
+          const text = stripPrivate(block.text ?? "", textPrivateState).trim()
           if (text) lines.push(`ASSISTANT: ${text}`)
         } else if (block?.type === "tool_use") {
           lines.push(`TOOL CALL ${block.name ?? "?"}: ${summarizeToolInput(block.input)}`)
