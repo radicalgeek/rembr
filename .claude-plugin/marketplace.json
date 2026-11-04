@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "rembr",
-      "description": "Persistent cross-session memory for Claude Code backed by Rembr: bundled MCP server, session-start recall injection, trigger-phrase auto-capture, and /rembr:remember + /rembr:recall skills.",
+      "description": "Persistent cross-session memory for Claude Code backed by Rembr: bundled MCP server, first-prompt semantic recall or session restoration, trigger capture, and manual skills.",
       "source": "./claude-code-rembr"
     }
   ]

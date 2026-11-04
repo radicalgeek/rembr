@@ -62,6 +62,9 @@ describe("console HTTP boundary", () => {
     expect(response.status).toBe(200)
     expect(response.headers["content-security-policy"]).toContain("frame-ancestors 'none'")
     expect(response.headers["x-content-type-options"]).toBe("nosniff")
+    expect(response.headers["cache-control"]).toBe("no-store")
+    expect((await request(server, { path: "/app.js" })).headers["cache-control"]).toBe("no-store")
+    expect((await request(server, { path: "/styles.css" })).headers["cache-control"]).toBe("no-store")
   })
 
   it("requires bearer authentication and an allowed origin", async () => {

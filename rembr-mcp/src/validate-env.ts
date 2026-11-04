@@ -47,7 +47,13 @@ const OPTIONAL_ENV_VARS: EnvVar[] = [
   { name: 'OPENAI_COMPATIBLE_TEXT_BASE_URL', required: false, description: 'OpenAI-compatible text generation base URL', sensitive: false },
   { name: 'OPENAI_COMPATIBLE_TEXT_MODEL', required: false, description: 'OpenAI-compatible text generation model id', sensitive: false },
   { name: 'OPENAI_COMPATIBLE_API_KEY', required: false, description: 'OpenAI-compatible text generation bearer token', sensitive: true },
-  { name: 'TEXT_GENERATION_TIMEOUT_MS', required: false, description: 'Text generation timeout in milliseconds (default: 60000 for Ollama, 180000 for OpenAI-compatible)', sensitive: false },
+  // Azure OpenAI provider (EMBEDDING_PROVIDER=azure and/or TEXT_GENERATION_PROVIDER=azure)
+  { name: 'AZURE_OPENAI_ENDPOINT', required: false, description: 'Azure OpenAI resource endpoint, e.g. https://my-resource.openai.azure.com', sensitive: false },
+  { name: 'AZURE_OPENAI_API_KEY', required: false, description: 'Azure OpenAI API key (sent as the api-key header)', sensitive: true },
+  { name: 'AZURE_OPENAI_API_VERSION', required: false, description: 'Azure OpenAI REST API version (default: 2024-10-21)', sensitive: false },
+  { name: 'AZURE_OPENAI_EMBEDDING_DEPLOYMENT', required: false, description: 'Azure deployment name for embeddings (e.g. text-embedding-3-small)', sensitive: false },
+  { name: 'AZURE_OPENAI_TEXT_DEPLOYMENT', required: false, description: 'Azure deployment name for text generation (e.g. gpt-5-mini)', sensitive: false },
+  { name: 'TEXT_GENERATION_TIMEOUT_MS', required: false, description: 'Text generation timeout in milliseconds (default: 60000 for Ollama, 180000 for OpenAI-compatible/Azure)', sensitive: false },
   { name: 'PORT', required: false, description: 'HTTP server port (default: 3000)', sensitive: false },
   { name: 'NODE_ENV', required: false, description: 'Node environment (development|production)', sensitive: false },
   { name: 'PUBLIC_URL', required: false, description: 'Public-facing URL of the service', sensitive: false },
@@ -149,12 +155,28 @@ export function validateEnvironment(): void {
 
   // Log what's configured (without values)
   if (process.env.NODE_ENV !== 'test') {
+    const embeddingProvider = process.env.EMBEDDING_PROVIDER || 'ollama';
+    const textProvider = process.env.TEXT_GENERATION_PROVIDER || (process.env.LM_STUDIO_BASE_URL ? 'openai-compatible' : 'ollama');
     console.log('✓ Environment validation passed');
     console.log(`  Database: ${hasDbUrl ? 'DATABASE_URL' : 'DB_HOST'}`);
     console.log(`  Redis: ${process.env.REDIS_URL ? 'REDIS_URL' : process.env.REDIS_HOST ? 'REDIS_HOST' : 'not configured (in-memory fallback)'}`);
-    console.log(`  Ollama: ${process.env.OLLAMA_HOST || 'http://localhost:11434 (default)'}`);
-    console.log(`  Text generation: ${process.env.TEXT_GENERATION_PROVIDER || (process.env.LM_STUDIO_BASE_URL ? 'openai-compatible' : 'ollama')} @ ${process.env.LM_STUDIO_BASE_URL || process.env.OPENAI_COMPATIBLE_TEXT_BASE_URL || process.env.OLLAMA_TEXT_HOST || process.env.OLLAMA_HOST || 'http://localhost:11434 (default)'}`);
-    console.log(`  Admin: ${process.env.ADMIN_API_KEY ? '✓ protected (ADMIN_API_KEY)' : '✗ ADMIN_API_KEY missing (startup should have failed)'}`);
+    if (embeddingProvider === 'ollama' || textProvider === 'ollama') {
+      console.log(`  Ollama: ${process.env.OLLAMA_HOST || 'http://localhost:11434 (default)'}`);
+    }
+    if (embeddingProvider === 'azure' || textProvider === 'azure') {
+      const deployments = [
+        embeddingProvider === 'azure' ? `embedding deployment: ${process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT || 'unset'}` : '',
+        textProvider === 'azure' ? `text deployment: ${process.env.AZURE_OPENAI_TEXT_DEPLOYMENT || 'unset'}` : '',
+      ].filter(Boolean).join(', ');
+      console.log(`  Azure OpenAI: ${process.env.AZURE_OPENAI_ENDPOINT || 'unset'} (${deployments})`);
+    }
+    const textTarget = textProvider === 'ollama'
+      ? (process.env.OLLAMA_TEXT_HOST || process.env.OLLAMA_HOST || 'http://localhost:11434 (default)')
+      : textProvider === 'azure'
+        ? ''
+        : (process.env.LM_STUDIO_BASE_URL || process.env.OPENAI_COMPATIBLE_TEXT_BASE_URL || 'unset');
+    console.log(`  Text generation: ${textProvider}${textTarget ? ` @ ${textTarget}` : ''}`);
+    console.log(`  Admin:${process.env.ADMIN_API_KEY ? '✓ protected (ADMIN_API_KEY)' : '✗ ADMIN_API_KEY missing (startup should have failed)'}`);
     console.log(`  Metrics: ${process.env.METRICS_SECRET ? '✓ protected' : '⚠️  unprotected (set METRICS_SECRET)'}`);
   }
 }

@@ -384,6 +384,8 @@ AS $load$
     AND target_memory.pii_detected IS NOT TRUE
 $load$;
 
+-- 032 replaces this with a different return type, so a rerun must drop it first.
+DROP FUNCTION IF EXISTS rembr_shadow_get_relationship_budget(UUID, UUID);
 CREATE OR REPLACE FUNCTION rembr_shadow_get_relationship_budget(
   p_tenant_id UUID,
   p_project_id UUID

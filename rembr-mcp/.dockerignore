@@ -12,6 +12,5 @@ playwright-report
 *.tsbuildinfo
 tests
 manifests-*
-patches
 Dockerfile*
 README.md

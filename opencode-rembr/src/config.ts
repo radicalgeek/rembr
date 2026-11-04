@@ -28,21 +28,34 @@ export interface RembrConfig {
   autoRemember: boolean
   /** Max memories injected at session start. 0 disables recall injection. */
   maxRecall: number
-  /** Minimum similarity score for recall (server default 0.7). */
+  /** Minimum similarity score for recall (server default 0.5). */
   minSimilarity: number
   /** Category used for auto-captured session summaries. */
   captureCategory: MemoryCategory
   /** Request timeout in milliseconds. */
   timeoutMs: number
+  /** Register the full Rembr MCP server unless the user already configured it. */
+  registerMcp: boolean
 }
 
 export const DEFAULT_CONFIG: RembrConfig = {
   url: "https://rembr.ai/mcp",
   autoRemember: true,
   maxRecall: 10,
-  minSimilarity: 0.7,
+  minSimilarity: 0.5,
   captureCategory: "conversations",
   timeoutMs: 15000,
+  registerMcp: true,
+}
+
+/**
+ * OpenCode config directory: `$XDG_CONFIG_HOME/opencode` when the variable is
+ * set and non-empty, otherwise `~/.config/opencode`.
+ */
+function opencodeConfigDir(env: Record<string, string | undefined>): string {
+  const xdg = env.XDG_CONFIG_HOME
+  if (xdg) return join(xdg, "opencode")
+  return join(homedir(), ".config", "opencode")
 }
 
 function readJsonFile(path: string): Record<string, unknown> {
@@ -78,6 +91,7 @@ function pick(source: Record<string, unknown>): Partial<RembrConfig> {
     out.captureCategory = source.captureCategory as MemoryCategory
   }
   if (typeof source.timeoutMs === "number") out.timeoutMs = source.timeoutMs
+  if (typeof source.registerMcp === "boolean") out.registerMcp = source.registerMcp
   return out
 }
 
@@ -90,8 +104,12 @@ export interface LoadConfigInput {
 }
 
 /**
- * Precedence (lowest to highest): defaults, ~/.config/opencode/rembr.json,
- * <worktree>/.opencode/rembr.json, REMBR_* env vars, plugin options.
+ * Precedence (lowest to highest): defaults, ~/.rembr/config.json,
+ * ~/.config/opencode/rembr.json, <worktree>/.opencode/rembr.json, REMBR_* env
+ * vars, plugin options.
+ *
+ * ~/.rembr/config.json is the shared cross-harness file, read first so an
+ * OpenCode-specific file still wins for anyone who already has one.
  */
 export function loadConfig(input: LoadConfigInput = {}): RembrConfig {
   const env = input.env ?? process.env
@@ -105,10 +123,13 @@ export function loadConfig(input: LoadConfigInput = {}): RembrConfig {
   if (maxRecall !== undefined) fromEnv.maxRecall = maxRecall
   const minSimilarity = parseNum(env.REMBR_MIN_SIMILARITY)
   if (minSimilarity !== undefined) fromEnv.minSimilarity = minSimilarity
+  const registerMcp = parseBool(env.REMBR_REGISTER_MCP)
+  if (registerMcp !== undefined) fromEnv.registerMcp = registerMcp
 
   return {
     ...DEFAULT_CONFIG,
-    ...pick(readJsonFile(join(homedir(), ".config", "opencode", "rembr.json"))),
+    ...pick(readJsonFile(join(env.REMBR_STATE_DIR ?? join(homedir(), ".rembr"), "config.json"))),
+    ...pick(readJsonFile(join(opencodeConfigDir(env), "rembr.json"))),
     ...(input.worktree ? pick(readJsonFile(join(input.worktree, ".opencode", "rembr.json"))) : {}),
     ...fromEnv,
     ...pick(input.options ?? {}),

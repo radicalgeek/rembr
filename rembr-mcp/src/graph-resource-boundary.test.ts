@@ -19,15 +19,19 @@ function largeMemoryRows(count = 10_000) {
 describe('graph resource boundaries', () => {
   it('bounds advanced graph SQL, nodes, content and pair work for a 10k context', async () => {
     const query = vi.fn().mockResolvedValue({ rows: largeMemoryRows() });
-    const service = new AdvancedAnalyticsService({ query } as any, {} as any);
-    const edge = vi.spyOn(service as any, 'calculateMemoryEdge').mockResolvedValue(null);
+    const getEmbeddingSimilarityEdges = vi.fn().mockResolvedValue([]);
+    const service = new AdvancedAnalyticsService({ query, getEmbeddingSimilarityEdges } as any, {} as any);
 
     const graph = await service.generateContextGraph(tenantId, contextId, true);
 
     expect(graph.nodes).toHaveLength(100);
     expect(graph.nodes[0].content).toHaveLength(2_048);
     expect(graph.nodes[0].metadata).toEqual({});
-    expect(edge).toHaveBeenCalledTimes(485);
+    // Edge detection is a single bounded pgvector query over at most the
+    // displayed node IDs, not per-pair application-side comparisons.
+    expect(getEmbeddingSimilarityEdges).toHaveBeenCalledTimes(1);
+    expect(getEmbeddingSimilarityEdges.mock.calls[0][0]).toBe(tenantId);
+    expect(getEmbeddingSimilarityEdges.mock.calls[0][1]).toHaveLength(100);
     expect(graph).toMatchObject({ truncated: true, returned_count: 100, total_count: 10_000 });
     const [sql, params] = query.mock.calls[0];
     expect(sql).toMatch(/LEFT\(m\.content, \$5::integer\)/);

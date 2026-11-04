@@ -107,6 +107,35 @@ describe('createRateLimitMiddleware', () => {
     expect(headers['X-RateLimit-Remaining']).toBeDefined();
     expect(headers['X-RateLimit-Window']).toBe('60s');
   });
+
+  it('bypasses all rate limiting when RATE_LIMIT_DISABLED=true', async () => {
+    vi.resetModules();
+    const previous = process.env.RATE_LIMIT_DISABLED;
+    process.env.RATE_LIMIT_DISABLED = 'true';
+    try {
+      const { createRateLimitMiddleware, checkDailyTenantQuota, checkTransportRateLimit } = await import('./rate-limiter.js');
+      const mw = createRateLimitMiddleware('free');
+      const headers: Record<string, string | number> = {};
+      let nextCalled = false;
+
+      const req = { path: '/mcp', headers: { 'x-api-key': 'test-key' }, socket: {} } as any;
+      const res = {
+        setHeader: (k: string, v: string | number) => { headers[k] = v; },
+        status: () => ({ json: () => {} })
+      } as any;
+      const next = () => { nextCalled = true; };
+
+      await mw(req, res, next);
+      expect(nextCalled).toBe(true);
+      expect(headers['X-RateLimit-Limit']).toBeUndefined();
+      await expect(checkTransportRateLimit(req, 'free')).resolves.toMatchObject({ allowed: true, count: 0 });
+      await expect(checkDailyTenantQuota('tenant-1', 'free')).resolves.toMatchObject({ allowed: true, count: 0 });
+    } finally {
+      if (previous === undefined) delete process.env.RATE_LIMIT_DISABLED;
+      else process.env.RATE_LIMIT_DISABLED = previous;
+      vi.resetModules();
+    }
+  });
 });
 
 describe('atomic Redis rate-limit accounting', () => {

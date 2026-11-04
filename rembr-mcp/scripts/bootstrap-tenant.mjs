@@ -8,9 +8,9 @@
 //   node rembr-mcp/scripts/bootstrap-tenant.mjs \
 //     | docker compose exec -T postgres psql -U rembr -d rembr
 //
-// The key is shown once and stored only as a SHA-256 hash (matching the
-// engine's api_keys verification: key_hash = sha256 hex, key_prefix = first
-// 20 chars).
+// The key is shown once and stored only as a hash. API_KEY_SECRET enables the
+// engine's preferred HMAC-SHA256 format; otherwise the legacy SHA-256 format
+// is used for compatibility.
 
 import crypto from "node:crypto"
 import { pathToFileURL } from "node:url"
@@ -18,9 +18,14 @@ import { pathToFileURL } from "node:url"
 const ALPHANUMERIC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 function randomAlphanumeric(length) {
-  const bytes = crypto.randomBytes(length)
   let out = ""
-  for (let i = 0; i < length; i++) out += ALPHANUMERIC[bytes[i] % ALPHANUMERIC.length]
+  const unbiasedLimit = 256 - (256 % ALPHANUMERIC.length)
+  while (out.length < length) {
+    const bytes = crypto.randomBytes(length - out.length)
+    for (const byte of bytes) {
+      if (byte < unbiasedLimit) out += ALPHANUMERIC[byte % ALPHANUMERIC.length]
+    }
+  }
   return out
 }
 
@@ -33,6 +38,14 @@ function boundedValue(value, label, maxLength) {
 }
 
 const encoded = (value) => Buffer.from(value, "utf8").toString("base64")
+
+const planLimits = {
+  free: { memory: 1000, search: 10000, project: 5 },
+  pro: { memory: 25000, search: 250000, project: 25 },
+  team: { memory: 250000, search: 2500000, project: 999 },
+  business: { memory: 1000000, search: 10000000, project: 999 },
+  enterprise: { memory: 2147483647, search: 2147483647, project: 2147483647 },
+}
 
 export function buildBootstrap(environment = process.env, suppliedApiKey) {
   const tenantName = boundedValue(
@@ -55,11 +68,24 @@ export function buildBootstrap(environment = process.env, suppliedApiKey) {
     throw new Error("TENANT_EMAIL must be a valid canonical email address")
   }
 
+  const tenantPlan = (environment.TENANT_PLAN || "free").toLowerCase()
+  if (!Object.hasOwn(planLimits, tenantPlan)) {
+    throw new Error(`TENANT_PLAN must be one of: ${Object.keys(planLimits).join(", ")}`)
+  }
+  const limits = planLimits[tenantPlan]
+  const requireNoActiveKeys = ["true", "1", "yes", "on"].includes(
+    String(environment.REQUIRE_NO_ACTIVE_KEYS || "").toLowerCase(),
+  )
+
   const apiKey = suppliedApiKey || `mb_live_${randomAlphanumeric(64)}`
   if (!/^mb_live_[A-Za-z0-9]{64}$/.test(apiKey)) {
     throw new Error("generated bootstrap credential has an invalid format")
   }
-  const keyHash = crypto.createHash("sha256").update(apiKey).digest("hex")
+  const apiKeySecret = environment.API_KEY_SECRET
+  const hashAlgorithm = apiKeySecret ? "hmac-sha256" : "sha256"
+  const keyHash = apiKeySecret
+    ? crypto.createHmac("sha256", apiKeySecret).update(apiKey).digest("hex")
+    : crypto.createHash("sha256").update(apiKey).digest("hex")
   const keyPrefix = apiKey.slice(0, 20)
   const tenantNameEncoded = encoded(tenantName)
   const tenantEmailEncoded = encoded(tenantEmail)
@@ -109,7 +135,7 @@ BEGIN
     INSERT INTO tenants (name, email, plan, status, created_by_agent)
     VALUES (
       bootstrap_tenant_name, bootstrap_tenant_email,
-      'free', 'unclaimed', TRUE
+      '${tenantPlan}', 'unclaimed', TRUE
     )
     RETURNING id, plan INTO bootstrap_tenant_id, existing_plan;
   END IF;
@@ -145,6 +171,15 @@ BEGIN
     RAISE EXCEPTION 'generated self-host bootstrap credential already exists';
   END IF;
 
+  IF ${requireNoActiveKeys ? "TRUE" : "FALSE"} AND EXISTS (
+    SELECT 1 FROM api_keys
+    WHERE tenant_id = bootstrap_tenant_id
+      AND revoked_at IS NULL
+      AND (expires_at IS NULL OR expires_at > NOW())
+  ) THEN
+    RAISE EXCEPTION 'self-host bootstrap tenant already has an active API key';
+  END IF;
+
   INSERT INTO api_keys (
     tenant_id, project_id, user_id, key_hash, key_prefix, hash_algorithm,
     name, expires_at, purpose, capabilities
@@ -154,7 +189,7 @@ BEGIN
     NULL,
     '${keyHash}',
     '${keyPrefix}',
-    'sha256',
+    '${hashAlgorithm}',
     bootstrap_key_name,
     NULL,
     'agent_bootstrap',
@@ -166,21 +201,39 @@ BEGIN
   INSERT INTO tenant_plans (
     tenant_id, plan, memory_limit, search_limit_daily, project_limit
   ) VALUES (
-    bootstrap_tenant_id, existing_plan, 1000, 10000, 5
+    bootstrap_tenant_id,
+    existing_plan,
+    CASE existing_plan
+      WHEN 'free' THEN ${planLimits.free.memory}
+      WHEN 'pro' THEN ${planLimits.pro.memory}
+      WHEN 'team' THEN ${planLimits.team.memory}
+      WHEN 'business' THEN ${planLimits.business.memory}
+      WHEN 'enterprise' THEN ${planLimits.enterprise.memory}
+      ELSE ${planLimits.free.memory}
+    END,
+    CASE existing_plan
+      WHEN 'free' THEN ${planLimits.free.search}
+      WHEN 'pro' THEN ${planLimits.pro.search}
+      WHEN 'team' THEN ${planLimits.team.search}
+      WHEN 'business' THEN ${planLimits.business.search}
+      WHEN 'enterprise' THEN ${planLimits.enterprise.search}
+      ELSE ${planLimits.free.search}
+    END,
+    CASE existing_plan
+      WHEN 'free' THEN ${planLimits.free.project}
+      WHEN 'pro' THEN ${planLimits.pro.project}
+      WHEN 'team' THEN ${planLimits.team.project}
+      WHEN 'business' THEN ${planLimits.business.project}
+      WHEN 'enterprise' THEN ${planLimits.enterprise.project}
+      ELSE ${planLimits.free.project}
+    END
   )
-  ON CONFLICT (tenant_id) DO NOTHING;
-
-  IF NOT EXISTS (
-    SELECT 1
-    FROM tenant_plans
-    WHERE tenant_id = bootstrap_tenant_id
-      AND plan = existing_plan
-      AND memory_limit = 1000
-      AND search_limit_daily = 10000
-      AND project_limit = 5
-  ) THEN
-    RAISE EXCEPTION 'self-host bootstrap tenant has incompatible plan limits';
-  END IF;
+  ON CONFLICT (tenant_id) DO UPDATE SET
+    plan = EXCLUDED.plan,
+    memory_limit = EXCLUDED.memory_limit,
+    search_limit_daily = EXCLUDED.search_limit_daily,
+    project_limit = EXCLUDED.project_limit,
+    updated_at = CURRENT_TIMESTAMP;
 END
 $rembr_self_host_bootstrap$;
 COMMIT;
@@ -193,7 +246,7 @@ Rembr API key (shown once — store it now):
 
 Use it as REMBR_API_KEY for the console, agent plugins, and MCP clients
 (x-api-key header). It is a non-expiring, userless agent_bootstrap credential
-for the unclaimed workspace "${tenantName}" <${tenantEmail}>.
+for the unclaimed workspace "${tenantName}" <${tenantEmail}>. Plan: ${tenantPlan}.
 `
 
   return { sql, message }

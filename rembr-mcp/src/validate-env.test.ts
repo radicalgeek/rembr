@@ -45,3 +45,61 @@ describe('production OAuth resource configuration', () => {
     expect(() => validateEnvironment()).toThrow('exit:1');
   });
 });
+
+describe('startup provider summary', () => {
+  const apiKey = 'fixture-azure-key-0123456789-not-printed';
+  let logSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.stubEnv('NODE_ENV', 'development');
+    vi.stubEnv('DATABASE_URL', 'postgresql://rembr_app:fixture@database/rembr');
+    vi.stubEnv('JWT_SECRET', strong('jwt'));
+    vi.stubEnv('ADMIN_API_KEY', strong('admin'));
+    vi.stubEnv('API_KEY_SECRET', strong('apikey'));
+    vi.stubEnv('EMBEDDING_PROVIDER', '');
+    vi.stubEnv('TEXT_GENERATION_PROVIDER', '');
+    vi.stubEnv('OLLAMA_HOST', '');
+    vi.stubEnv('OLLAMA_TEXT_HOST', '');
+    vi.stubEnv('LM_STUDIO_BASE_URL', '');
+    vi.stubEnv('AZURE_OPENAI_ENDPOINT', '');
+    vi.stubEnv('AZURE_OPENAI_API_KEY', '');
+    vi.stubEnv('AZURE_OPENAI_EMBEDDING_DEPLOYMENT', '');
+    vi.stubEnv('AZURE_OPENAI_TEXT_DEPLOYMENT', '');
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('unexpected exit');
+    }) as never);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  const output = () => logSpy.mock.calls.map(call => call.join(' ')).join('\n');
+
+  it('shows the Ollama URL and no Azure details for the default providers', () => {
+    validateEnvironment();
+    expect(output()).toContain('Ollama: http://localhost:11434 (default)');
+    expect(output()).not.toContain('Azure OpenAI');
+  });
+
+  it('shows Azure endpoint and deployments without an Ollama URL when azure is selected', () => {
+    vi.stubEnv('EMBEDDING_PROVIDER', 'azure');
+    vi.stubEnv('TEXT_GENERATION_PROVIDER', 'azure');
+    vi.stubEnv('AZURE_OPENAI_ENDPOINT', 'https://fixture-resource.openai.azure.com');
+    vi.stubEnv('AZURE_OPENAI_API_KEY', apiKey);
+    vi.stubEnv('AZURE_OPENAI_EMBEDDING_DEPLOYMENT', 'fixture-embedding');
+    vi.stubEnv('AZURE_OPENAI_TEXT_DEPLOYMENT', 'fixture-text');
+
+    validateEnvironment();
+    const text = output();
+    expect(text).toContain('Azure OpenAI: https://fixture-resource.openai.azure.com (embedding deployment: fixture-embedding, text deployment: fixture-text)');
+    expect(text).toContain('Text generation: azure');
+    expect(text).not.toContain('Ollama:');
+    expect(text).not.toContain('localhost:11434');
+    expect(text).not.toContain(apiKey);
+  });
+});

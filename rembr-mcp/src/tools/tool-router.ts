@@ -162,6 +162,12 @@ export function validateMemoryOperation(args: Record<string, unknown>): { valid:
       if (!args.id || !args.visibility) {
         return { valid: false, error: 'set_visibility operation requires id and visibility' };
       }
+      if (args.visibility === 'project' && !args.project_id) {
+        return { valid: false, error: 'set_visibility project visibility requires project_id' };
+      }
+      if (args.visibility !== 'project' && args.project_id) {
+        return { valid: false, error: 'set_visibility project_id is only valid for project visibility' };
+      }
       break;
     case 'list':
     case 'list_personal':
@@ -302,17 +308,21 @@ export function validateSnapshotOperation(args: Record<string, unknown>): { vali
 /**
  * Graph operation router
  */
-export type GraphOperation = 'get' | 'generate' | 'insights' | 'infer' | 'compare';
+export type GraphOperation = 'get' | 'generate' | 'insights' | 'infer' | 'compare' | 'explore';
 
 export function validateGraphOperation(args: Record<string, unknown>): { valid: boolean; error?: string } {
   const operation = args.operation as GraphOperation;
   
   switch (operation) {
     case 'get':
-    case 'generate':
     case 'insights':
       if (!args.context_id) {
         return { valid: false, error: `${operation} operation requires context_id` };
+      }
+      break;
+    case 'generate':
+      if (!args.context_id && !args.memory_ids && args.cluster_algorithm !== 'semantic') {
+        return { valid: false, error: 'generate operation requires context_id, memory_ids, or semantic clustering' };
       }
       break;
     case 'infer':
@@ -323,6 +333,11 @@ export function validateGraphOperation(args: Record<string, unknown>): { valid: 
     case 'compare':
       if (!args.snapshot_id_1 || !args.snapshot_id_2) {
         return { valid: false, error: 'compare operation requires snapshot_id_1 and snapshot_id_2' };
+      }
+      break;
+    case 'explore':
+      if (!args.memory_id) {
+        return { valid: false, error: 'explore operation requires memory_id' };
       }
       break;
     default:

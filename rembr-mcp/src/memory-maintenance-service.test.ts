@@ -55,6 +55,20 @@ describe('MemoryMaintenanceService scheduled batches', () => {
     delete process.env.SYSTEM_ONE_SHADOW_PROJECT_ID;
   });
 
+  it('maintains unclaimed agent workspaces only while their bootstrap key is active', async () => {
+    const db = createDb([[{ tenant_id: 'tenant-1' }]]);
+    const service = new MemoryMaintenanceService(db as any, 'worker-1');
+
+    const result = await service.listActiveTenants(25);
+
+    expect(result).toEqual([{ tenant_id: 'tenant-1' }]);
+    expect(db.query.mock.calls[0][0]).toContain("t.status = 'unclaimed'");
+    expect(db.query.mock.calls[0][0]).toContain("k.purpose = 'agent_bootstrap'");
+    expect(db.query.mock.calls[0][0]).toContain('k.revoked_at IS NULL');
+    expect(db.query.mock.calls[0][0]).toContain('k.expires_at > NOW()');
+    expect(db.query.mock.calls[0][1]).toEqual([25]);
+  });
+
   it('enqueues contradiction detection for one changed memory durably', async () => {
     const db = createDb([[{ id: 'job-1' }]]);
     const service = new MemoryMaintenanceService(db as any, 'worker-1');

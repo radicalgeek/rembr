@@ -3,6 +3,8 @@ FROM node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a5
 WORKDIR /app
 COPY package.json package-lock.json tsconfig.json ./
 RUN npm ci --ignore-scripts
+COPY patches ./patches
+RUN ./node_modules/.bin/patch-package
 
 COPY src ./src
 COPY scripts/apply-security-migration.mjs ./scripts/

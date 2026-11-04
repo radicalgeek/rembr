@@ -12,6 +12,8 @@ export interface Memory {
   id: string;
   tenant_id: string;
   project_id?: string;
+  user_id?: string;
+  visibility: 'personal' | 'shared' | 'project';
   content: string;
   category: string;
   metadata: Record<string, any>;
@@ -35,6 +37,12 @@ export interface MemoryEmbedding {
   created_at: Date;
 }
 
+export interface EmbeddingSimilarityEdge {
+  source: string;
+  target: string;
+  similarity: number;
+}
+
 export interface TenantPlan {
   tenant_id: string;
   plan: 'free' | 'pro' | 'team' | 'business' | 'enterprise';
@@ -42,6 +50,8 @@ export interface TenantPlan {
   search_limit_daily: number;
   project_limit: number;
 }
+
+export type MemorySortBy = 'created_at' | 'source_created_at';
 
 export interface Context {
   id: string;
@@ -283,6 +293,31 @@ export class MemoryDatabase {
           position INTEGER NOT NULL
         )
       `);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS semantic_clusters (
+          id UUID PRIMARY KEY,
+          tenant_id UUID NOT NULL,
+          parent_id UUID REFERENCES semantic_clusters(id) ON DELETE CASCADE,
+          level INTEGER NOT NULL CHECK (level >= 0),
+          label TEXT NOT NULL,
+          centroid vector(768) NOT NULL,
+          memory_count INTEGER NOT NULL CHECK (memory_count >= 0),
+          category_counts JSONB NOT NULL DEFAULT '{}',
+          is_leaf BOOLEAN NOT NULL DEFAULT FALSE,
+          source_embedding_count INTEGER,
+          source_embedding_at TIMESTAMPTZ,
+          algorithm_version INTEGER NOT NULL DEFAULT 2,
+          generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await client.query('ALTER TABLE semantic_clusters ADD COLUMN IF NOT EXISTS algorithm_version INTEGER NOT NULL DEFAULT 2');
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS semantic_cluster_members (
+          cluster_id UUID NOT NULL REFERENCES semantic_clusters(id) ON DELETE CASCADE,
+          memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+          PRIMARY KEY (cluster_id, memory_id)
+        )
+      `);
 
       // Create usage tracking table for rate limiting. Shape matches the
       // production schema (deploy/k8s/02-create-schema.sql) minus FKs to
@@ -325,10 +360,14 @@ export class MemoryDatabase {
       
       // Vector similarity index using HNSW (Hierarchical Navigable Small World)
       await client.query('CREATE INDEX IF NOT EXISTS idx_embeddings_vector ON memory_embeddings USING hnsw (embedding vector_cosine_ops)');
+      await client.query('CREATE INDEX IF NOT EXISTS idx_semantic_clusters_tenant_parent ON semantic_clusters(tenant_id, parent_id)');
+      await client.query('CREATE INDEX IF NOT EXISTS idx_semantic_cluster_members_memory ON semantic_cluster_members(memory_id)');
 
       // Enable Row-Level Security
       await client.query('ALTER TABLE memories ENABLE ROW LEVEL SECURITY');
       await client.query('ALTER TABLE memory_embeddings ENABLE ROW LEVEL SECURITY');
+      await client.query('ALTER TABLE semantic_clusters ENABLE ROW LEVEL SECURITY');
+      await client.query('ALTER TABLE semantic_cluster_members ENABLE ROW LEVEL SECURITY');
       await client.query('ALTER TABLE usage_daily ENABLE ROW LEVEL SECURITY');
 
       // Create RLS policies for memories (tenant isolation)
@@ -407,6 +446,44 @@ export class MemoryDatabase {
           WHERE memories.id = memory_embeddings.memory_id 
           AND memories.tenant_id::TEXT = current_setting('app.current_tenant', TRUE)
         ))
+      `);
+
+      await client.query('DROP POLICY IF EXISTS semantic_clusters_tenant_isolation ON semantic_clusters');
+      await client.query(`
+        CREATE POLICY semantic_clusters_tenant_isolation ON semantic_clusters
+        FOR ALL
+        USING (tenant_id::TEXT = current_setting('app.current_tenant', TRUE))
+        WITH CHECK (tenant_id::TEXT = current_setting('app.current_tenant', TRUE))
+      `);
+
+      await client.query('DROP POLICY IF EXISTS semantic_cluster_members_tenant_isolation ON semantic_cluster_members');
+      await client.query(`
+        CREATE POLICY semantic_cluster_members_tenant_isolation ON semantic_cluster_members
+        FOR ALL
+        USING (
+          EXISTS (
+            SELECT 1 FROM semantic_clusters
+            WHERE semantic_clusters.id = semantic_cluster_members.cluster_id
+              AND semantic_clusters.tenant_id::TEXT = current_setting('app.current_tenant', TRUE)
+          )
+          AND EXISTS (
+            SELECT 1 FROM memories
+            WHERE memories.id = semantic_cluster_members.memory_id
+              AND memories.tenant_id::TEXT = current_setting('app.current_tenant', TRUE)
+          )
+        )
+        WITH CHECK (
+          EXISTS (
+            SELECT 1 FROM semantic_clusters
+            WHERE semantic_clusters.id = semantic_cluster_members.cluster_id
+              AND semantic_clusters.tenant_id::TEXT = current_setting('app.current_tenant', TRUE)
+          )
+          AND EXISTS (
+            SELECT 1 FROM memories
+            WHERE memories.id = semantic_cluster_members.memory_id
+              AND memories.tenant_id::TEXT = current_setting('app.current_tenant', TRUE)
+          )
+        )
       `);
 
       // RLS for usage_daily
@@ -633,11 +710,14 @@ export class MemoryDatabase {
 
       // Include PII fields if provided
       const query = piiData
-        ? `INSERT INTO memories (id, tenant_id, project_id, user_id, content, category, metadata, relevance_score, pii_detected, pii_types, pii_confidence, pii_scanned_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+        ? `INSERT INTO memories (id, tenant_id, project_id, user_id, content, category, metadata, relevance_score, visibility, pii_detected, pii_types, pii_confidence, pii_scanned_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                   CASE WHEN $4::uuid IS NULL THEN 'shared' ELSE 'personal' END,
+                   $9, $10, $11, NOW())
            RETURNING *`
-        : `INSERT INTO memories (id, tenant_id, project_id, user_id, content, category, metadata, relevance_score)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        : `INSERT INTO memories (id, tenant_id, project_id, user_id, content, category, metadata, relevance_score, visibility)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                   CASE WHEN $4::uuid IS NULL THEN 'shared' ELSE 'personal' END)
            RETURNING *`;
 
       const params = piiData
@@ -750,6 +830,8 @@ export class MemoryDatabase {
     category?: string,
     projectId?: string,
     userId?: string,
+    sortBy: MemorySortBy = 'created_at',
+    offset: number = 0,
   ): Promise<Memory[]> {
     const client = await this.readDbPool.connect();
     try {
@@ -780,8 +862,17 @@ export class MemoryDatabase {
         params.push(category);
       }
 
-      query += ' ORDER BY m.created_at DESC LIMIT $' + (params.length + 1);
-      params.push(limit);
+      if (sortBy === 'source_created_at') {
+        query += ` ORDER BY CASE
+          WHEN m.metadata->>'source_created_at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?Z$'
+            AND pg_input_is_valid(m.metadata->>'source_created_at', 'timestamptz')
+          THEN (m.metadata->>'source_created_at')::timestamptz
+          ELSE m.created_at
+        END DESC, m.created_at DESC, m.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+      } else {
+        query += ` ORDER BY m.created_at DESC, m.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+      }
+      params.push(limit, offset);
 
       const result = await client.query(query, params);
 
@@ -1701,6 +1792,49 @@ export class MemoryDatabase {
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch {}
       throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async getEmbeddingSimilarityEdges(
+    tenantId: string,
+    memoryIds: string[],
+    minSimilarity: number = 0.68
+  ): Promise<EmbeddingSimilarityEdge[]> {
+    if (memoryIds.length < 2) return [];
+
+    const client = await this.readDbPool.connect();
+    try {
+      await client.query('BEGIN');
+      await this.setTenantContext(client, tenantId);
+
+      const result = await client.query(
+        `SELECT e1.memory_id AS source,
+                e2.memory_id AS target,
+                1 - (e1.embedding <=> e2.embedding) AS similarity
+         FROM memory_embeddings e1
+         JOIN memories m1 ON m1.id = e1.memory_id
+         JOIN memory_embeddings e2 ON e1.memory_id < e2.memory_id
+         JOIN memories m2 ON m2.id = e2.memory_id
+         WHERE m1.tenant_id = $1
+           AND m2.tenant_id = $1
+           AND e1.memory_id = ANY($2::uuid[])
+           AND e2.memory_id = ANY($2::uuid[])
+           AND 1 - (e1.embedding <=> e2.embedding) >= $3
+         ORDER BY similarity DESC, source, target`,
+        [tenantId, memoryIds, minSimilarity]
+      );
+
+      await client.query('COMMIT');
+      return result.rows.map((row: any) => ({
+        source: row.source,
+        target: row.target,
+        similarity: Number(row.similarity)
+      }));
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
     } finally {
       client.release();
     }

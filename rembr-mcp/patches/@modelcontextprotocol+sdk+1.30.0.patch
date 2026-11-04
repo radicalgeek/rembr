@@ -1,0 +1,50 @@
+diff --git a/node_modules/@modelcontextprotocol/sdk/dist/cjs/server/webStandardStreamableHttp.js b/node_modules/@modelcontextprotocol/sdk/dist/cjs/server/webStandardStreamableHttp.js
+index fc1e159..f8b0880 100644
+--- a/node_modules/@modelcontextprotocol/sdk/dist/cjs/server/webStandardStreamableHttp.js
++++ b/node_modules/@modelcontextprotocol/sdk/dist/cjs/server/webStandardStreamableHttp.js
+@@ -257,6 +257,8 @@ class WebStandardStreamableHTTPServerTransport {
+         // Create a ReadableStream with a controller we can use to push SSE events
+         const readable = new ReadableStream({
+             start: controller => {
++                // Establish the connection immediately and prevent proxy timeouts.
++                controller.enqueue(encoder.encode(': connected\n\n'));
+                 streamController = controller;
+             },
+             cancel: () => {
+@@ -468,7 +470,10 @@ class WebStandardStreamableHTTPServerTransport {
+             // The client MUST include an Accept header, listing both application/json and text/event-stream as supported content types.
+             // Accept is a comma-separated list, so a substring check is the intended semantics here (unlike Content-Type below).
+             // eslint-disable-next-line no-restricted-syntax
+-            if (!acceptHeader?.includes('application/json') || !acceptHeader.includes('text/event-stream')) {
++            // JSON-response transports do not require clients to accept an SSE response.
++            const requiresJson = !acceptHeader?.includes('application/json');
++            const requiresEventStream = !this._enableJsonResponse && !acceptHeader?.includes('text/event-stream');
++            if (requiresJson || requiresEventStream) {
+                 this.onerror?.(new Error('Not Acceptable: Client must accept both application/json and text/event-stream'));
+                 return this.createJsonErrorResponse(406, -32000, 'Not Acceptable: Client must accept both application/json and text/event-stream');
+             }
+diff --git a/node_modules/@modelcontextprotocol/sdk/dist/esm/server/webStandardStreamableHttp.js b/node_modules/@modelcontextprotocol/sdk/dist/esm/server/webStandardStreamableHttp.js
+index 469abcf..8b267f5 100644
+--- a/node_modules/@modelcontextprotocol/sdk/dist/esm/server/webStandardStreamableHttp.js
++++ b/node_modules/@modelcontextprotocol/sdk/dist/esm/server/webStandardStreamableHttp.js
+@@ -254,6 +254,8 @@ export class WebStandardStreamableHTTPServerTransport {
+         // Create a ReadableStream with a controller we can use to push SSE events
+         const readable = new ReadableStream({
+             start: controller => {
++                // Establish the connection immediately and prevent proxy timeouts.
++                controller.enqueue(encoder.encode(': connected\n\n'));
+                 streamController = controller;
+             },
+             cancel: () => {
+@@ -465,7 +467,10 @@ export class WebStandardStreamableHTTPServerTransport {
+             // The client MUST include an Accept header, listing both application/json and text/event-stream as supported content types.
+             // Accept is a comma-separated list, so a substring check is the intended semantics here (unlike Content-Type below).
+             // eslint-disable-next-line no-restricted-syntax
+-            if (!acceptHeader?.includes('application/json') || !acceptHeader.includes('text/event-stream')) {
++            // JSON-response transports do not require clients to accept an SSE response.
++            const requiresJson = !acceptHeader?.includes('application/json');
++            const requiresEventStream = !this._enableJsonResponse && !acceptHeader?.includes('text/event-stream');
++            if (requiresJson || requiresEventStream) {
+                 this.onerror?.(new Error('Not Acceptable: Client must accept both application/json and text/event-stream'));
+                 return this.createJsonErrorResponse(406, -32000, 'Not Acceptable: Client must accept both application/json and text/event-stream');
+             }

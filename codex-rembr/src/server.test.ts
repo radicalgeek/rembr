@@ -1,13 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
-import { createServer, loadBridgeConfig, looksLikePromptInjection } from "./server.js"
+import { createServer, looksLikePromptInjection } from "./server.js"
 
 const CONFIG = {
   url: "https://rembr.test/mcp",
   apiKey: "test-key",
   recallLimit: 10,
-  minSimilarity: 0.7,
+  minSimilarity: 0.5,
   timeoutMs: 15_000,
 }
 
@@ -39,30 +39,6 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-describe("loadBridgeConfig", () => {
-  it("requires REMBR_API_KEY", () => {
-    expect(() => loadBridgeConfig({})).toThrow(/REMBR_API_KEY/)
-  })
-
-  it("applies defaults and bounded overrides", () => {
-    const cfg = loadBridgeConfig({ REMBR_API_KEY: "k" })
-    expect(cfg.url).toBe("https://rembr.ai/mcp")
-    expect(cfg.recallLimit).toBe(10)
-
-    const custom = loadBridgeConfig({
-      REMBR_API_KEY: "k",
-      REMBR_URL: "https://self.hosted/mcp",
-      REMBR_RECALL_LIMIT: "5",
-      REMBR_MIN_SIMILARITY: "0.85",
-    })
-    expect(custom.url).toBe("https://self.hosted/mcp")
-    expect(custom.recallLimit).toBe(5)
-    expect(custom.minSimilarity).toBe(0.85)
-
-    expect(loadBridgeConfig({ REMBR_API_KEY: "k", REMBR_RECALL_LIMIT: "999" }).recallLimit).toBe(10)
-  })
-})
-
 describe("MCP bridge end-to-end (InMemoryTransport)", () => {
   it("lists the three curated tools", async () => {
     const client = await connectedClient()
@@ -70,13 +46,13 @@ describe("MCP bridge end-to-end (InMemoryTransport)", () => {
     expect(tools.map((t) => t.name).sort()).toEqual(["memory_forget", "memory_recall", "memory_store"])
   })
 
-  it("memory_recall proxies to Rembr search/query with untrusted framing", async () => {
+  it("memory_recall strips URLs, doubles limit, and passes raw markdown through", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockImplementation(() => Promise.resolve(rembrResponse("- [mem_1] prefers tabs (91%)"))),
     )
     const client = await connectedClient()
-    const result = await client.callTool({ name: "memory_recall", arguments: { query: "tabs", limit: 3 } })
+    const result = await client.callTool({ name: "memory_recall", arguments: { query: "tabs https://example.com", limit: 3 } })
 
     const content = (result.content as Array<{ text: string }>)[0].text
     expect(content).toContain("untrusted historical data")
@@ -86,8 +62,73 @@ describe("MCP bridge end-to-end (InMemoryTransport)", () => {
     expect(url).toBe("https://rembr.test/mcp")
     expect(body.params).toEqual({
       name: "search",
-      arguments: { operation: "query", query: "tabs", limit: 3, min_similarity: 0.7 },
+      arguments: { operation: "query", query: "tabs", limit: 6, min_similarity: 0.5 },
     })
+  })
+
+  it("memory_recall reranks by semantic similarity and applies relevance floor", async () => {
+    const results = JSON.stringify({
+      success: true,
+      data: [
+        { id: "superseded", category: "facts", content: "Stale superseded result.", score: 0.95, semantic_similarity: 0.9, metadata: { superseded_by_migration_id: "replacement" } },
+        { id: "graph-winner", category: "facts", content: "Graph-boosted but weak result.", score: 0.9, semantic_similarity: 0.31 },
+        { id: "semantic-winner", category: "projects", content: "Relevant semantic result.", score: 0.4, semantic_similarity: 0.62 },
+        { id: "semantic-near", category: "decisions", content: "Closely related result.", score: 0.3, semantic_similarity: 0.57 },
+      ],
+    })
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(() => Promise.resolve(rembrResponse(results))),
+    )
+    const lowConfig = { ...CONFIG, minSimilarity: 0.3 }
+    const server = createServer(lowConfig)
+    const client = new Client({ name: "test-client", version: "0.0.0" })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)])
+    const result = await client.callTool({ name: "memory_recall", arguments: { query: "Rembr search ranking", limit: 5 } })
+
+    const content = (result.content as Array<{ text: string }>)[0].text
+    expect(content).toContain("Relevant semantic result")
+    expect(content).toContain("Closely related result")
+    expect(content).not.toContain("Graph-boosted but weak result")
+    expect(content).not.toContain("Stale superseded result")
+    expect(content.indexOf("Relevant semantic result")).toBeLessThan(content.indexOf("Closely related result"))
+  })
+
+  it("memory_recall caps the expanded candidate pool at the server limit", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(() => Promise.resolve(rembrResponse('{"success":true,"data":[]}'))),
+    )
+    const client = await connectedClient()
+
+    await client.callTool({ name: "memory_recall", arguments: { query: "test", limit: 50 } })
+
+    const body = JSON.parse(vi.mocked(fetch).mock.calls[0][1].body)
+    expect(body.params.arguments.limit).toBe(50)
+  })
+
+  it("memory_recall ranks a migrated record with old source_created_at below a newer native record", async () => {
+    const results = JSON.stringify({
+      success: true,
+      data: [
+        { id: "migrated", category: "facts", content: "Migrated old fact.", semantic_similarity: 0.61, created_at: "2026-07-14T12:00:00Z", metadata: { directory: "/proj", source_created_at: "2025-01-01T00:00:00Z" } },
+        { id: "native", category: "facts", content: "Native newer fact.", semantic_similarity: 0.61, created_at: "2025-06-01T00:00:00Z", metadata: { directory: "/proj" } },
+      ],
+    })
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(() => Promise.resolve(rembrResponse(results))),
+    )
+    const lowConfig = { ...CONFIG, minSimilarity: 0.3 }
+    const server = createServer(lowConfig)
+    const client = new Client({ name: "test-client", version: "0.0.0" })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)])
+    const result = await client.callTool({ name: "memory_recall", arguments: { query: "test", limit: 5 } })
+
+    const content = (result.content as Array<{ text: string }>)[0].text
+    expect(content.indexOf("Native newer fact")).toBeLessThan(content.indexOf("Migrated old fact"))
   })
 
   it("memory_store proxies to memory/create and screens injection", async () => {

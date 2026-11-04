@@ -6,6 +6,9 @@ import {
   authenticateConsoleRequest,
   isOriginAllowed,
   ALLOWED_TOOLS,
+  createSessionStore,
+  createLoginLimiter,
+  sessionCookie,
 } from "./lib.mjs"
 
 const CONSOLE_TOKEN = "console-test-token-with-at-least-32-bytes"
@@ -59,6 +62,92 @@ describe("loadConfig", () => {
     expect(config).toMatchObject({ host: "0.0.0.0", port: 9000, mode: "read-write" })
     expect(config.configurationError).toBeUndefined()
   })
+
+  it("supports hosted sessions without a server-wide API key", () => {
+    const config = loadConfig({
+      REMBR_URL: "https://x.example/mcp",
+      REMBR_CONSOLE_AUTH_MODE: "session",
+      REMBR_CONSOLE_MODE: "read-write",
+    })
+    expect(config.authMode).toBe("session")
+    expect(config.mode).toBe("read-write")
+    expect(config.memoryPageSize).toBe(50)
+    expect(config.configurationError).toBeUndefined()
+  })
+
+  it("requires the absolute session lifetime to cover the idle lifetime", () => {
+    const config = loadConfig({
+      REMBR_CONSOLE_AUTH_MODE: "session",
+      REMBR_CONSOLE_SESSION_IDLE_MS: "600000",
+      REMBR_CONSOLE_SESSION_ABSOLUTE_MS: "300000",
+    })
+    expect(config.configurationError).toContain("must be at least the idle timeout")
+  })
+})
+
+describe("hosted session controls", () => {
+  const config = {
+    sessionIdleMs: 100,
+    sessionAbsoluteMs: 500,
+    sessionMaximum: 2,
+    loginWindowMs: 100,
+    loginMaximum: 2,
+    loginGlobalMaximum: 3,
+  }
+
+  it("keeps API keys server-side and enforces idle expiry and capacity", () => {
+    let time = 1_000
+    const sessions = createSessionStore(config, () => time)
+    const first = sessions.create("first-user-key")
+    const second = sessions.create("second-user-key")
+    expect(first).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    expect(sessions.create("third-user-key")).toBeNull()
+    expect(sessions.resolve(`other=x; __Host-rembr_console=${first}`)).toMatchObject({ apiKey: "first-user-key" })
+    time += 101
+    expect(sessions.resolve(`__Host-rembr_console=${first}`)).toBeNull()
+    expect(sessions.resolve(`__Host-rembr_console=${second}`)).toBeNull()
+    expect(sessions.size()).toBe(0)
+  })
+
+  it("enforces absolute expiry even while a session remains active", () => {
+    let time = 1_000
+    const sessions = createSessionStore({ ...config, sessionIdleMs: 1_000, sessionAbsoluteMs: 100 }, () => time)
+    const id = sessions.create("active-user-key")
+    time += 60
+    expect(sessions.resolve(`__Host-rembr_console=${id}`)).not.toBeNull()
+    time += 41
+    expect(sessions.resolve(`__Host-rembr_console=${id}`)).toBeNull()
+  })
+
+  it("uses a host-only secure cookie", () => {
+    const cookie = sessionCookie("opaque", 3600)
+    expect(cookie).toContain("__Host-rembr_console=opaque")
+    expect(cookie).toContain("Path=/")
+    expect(cookie).toContain("HttpOnly")
+    expect(cookie).toContain("Secure")
+    expect(cookie).toContain("SameSite=Strict")
+    expect(cookie).not.toContain("Domain=")
+  })
+
+  it("bounds login attempts per client window", () => {
+    let time = 1_000
+    const limiter = createLoginLimiter(config, () => time)
+    expect(limiter.consume("client")).toBe(true)
+    expect(limiter.consume("client")).toBe(true)
+    expect(limiter.consume("client")).toBe(false)
+    expect(limiter.consume("other")).toBe(true)
+    expect(limiter.consume("third")).toBe(false)
+    time += 101
+    expect(limiter.consume("client")).toBe(true)
+  })
+
+  it("caps tracked client identities even when they are all fresh", () => {
+    const limiter = createLoginLimiter({ ...config, loginMaximum: 2, loginGlobalMaximum: 2_000 }, () => 1_000)
+    for (let index = 0; index < 1_000; index += 1) {
+      expect(limiter.consume(`client-${index}`)).toBe(true)
+    }
+    expect(limiter.consume("client-over-cap")).toBe(false)
+  })
 })
 
 describe("console request authentication", () => {
@@ -79,6 +168,16 @@ describe("console request authentication", () => {
 })
 
 describe("handleApiCall", () => {
+  it("requires a resolved server-side session key in hosted mode", async () => {
+    const body = JSON.stringify({ tool: "memory", args: { operation: "list" } })
+    const missing = await handleApiCall({ ...CONFIG, authMode: "session" }, body)
+    expect(missing.status).toBe(401)
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled()
+    const allowed = await handleApiCall({ ...CONFIG, authMode: "session" }, body, { apiKey: "session-key" })
+    expect(allowed.status).toBe(200)
+    expect(vi.mocked(fetch).mock.calls[0][1].headers["x-api-key"]).toBe("session-key")
+  })
+
   it("authenticates before forwarding", async () => {
     expect((await handleApiCall(CONFIG, '{"tool":"memory","args":{"operation":"list"}}')).status).toBe(401)
     expect(vi.mocked(fetch)).not.toHaveBeenCalled()
@@ -88,11 +187,12 @@ describe("handleApiCall", () => {
     for (const [tool, operation] of [
       ["memory", "list"], ["search", "query"], ["stats", "usage"],
       ["stats", "embeddings"], ["context", "list"], ["snapshot", "list"],
+      ["graph", "generate"],
     ]) {
       const args = operation === "query" ? { operation, query: "x" } : { operation }
       expect((await handleApiCall(CONFIG, JSON.stringify({ tool, args }), REQUEST)).status).toBe(200)
     }
-    expect(new Set(ALLOWED_TOOLS)).toEqual(new Set(["memory", "search", "stats", "context", "snapshot"]))
+    expect(new Set(ALLOWED_TOOLS)).toEqual(new Set(["memory", "search", "stats", "context", "snapshot", "graph"]))
   })
 
   it("denies destructive or unknown operations in read-only mode", async () => {
@@ -125,6 +225,12 @@ describe("handleApiCall", () => {
     }), REQUEST)).status).toBe(400)
     expect((await handleApiCall(CONFIG, JSON.stringify({
       tool: "search", args: { operation: "query", query: "x".repeat(8_193) },
+    }), REQUEST)).status).toBe(400)
+    expect((await handleApiCall(CONFIG, JSON.stringify({
+      tool: "memory", args: { operation: "list", limit: 50, offset: 50 },
+    }), REQUEST)).status).toBe(200)
+    expect((await handleApiCall(CONFIG, JSON.stringify({
+      tool: "memory", args: { operation: "list", offset: -1 },
     }), REQUEST)).status).toBe(400)
   })
 

@@ -4,7 +4,7 @@ description: Store a fact, preference, decision, or learning in Rembr long-term 
 
 # Remember
 
-Store the information in Rembr using the `mcp__rembr__memory` tool with
+Store the information in Rembr using the `mcp__plugin_rembr_rembr__memory` tool with
 `operation: "create"`.
 
 Steps:
@@ -13,7 +13,7 @@ Steps:
 2. Pick the best category: `facts`, `preferences`, `decisions`, `patterns`,
    `workflows`, `insights`, `goals`, `reminders`, `projects`, `learning`,
    `conversations`, or `context`.
-3. Call `mcp__rembr__memory` with `operation: "create"`, `content`, `category`,
+3. Call `mcp__plugin_rembr_rembr__memory` with `operation: "create"`, `content`, `category`,
    and metadata such as the project name.
 4. Confirm briefly what was stored.
 
