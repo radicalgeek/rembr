@@ -1,6 +1,6 @@
 {
   "name": "@rembr/mcp-server",
-  "version": "1.12.0",
+  "version": "1.12.1",
   "description": "Context infrastructure for Recursive Language Models - Production-ready persistence layer for RLM agents",
   "main": "index.js",
   "scripts": {
