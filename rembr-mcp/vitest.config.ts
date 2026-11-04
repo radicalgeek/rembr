@@ -10,9 +10,6 @@ import { defineConfig } from 'vitest/config';
  *                               sequentially: they share one database.
  *   npm test                  — both (requires PostgreSQL)
  *
- * Live-service e2e tests gate themselves on env vars instead of being
- * excluded here: week14-features needs TEST_MCP_URL, multi-server needs
- * RUN_MULTI_SERVER_TESTS=true.
  */
 const INTEGRATION_TESTS = [
   'src/audit-logger.test.ts',
@@ -22,7 +19,6 @@ const INTEGRATION_TESTS = [
   'src/context-monitor.test.ts',
   'src/embedding-model-consistency.test.ts',
   'src/iteration-tracking.test.ts',
-  'src/multi-server.integration.test.ts',
   'src/optimization/compaction-service.test.ts',
   'src/pii-integration.test.ts',
   'src/plan-regeneration.test.ts',
@@ -43,6 +39,8 @@ export default defineConfig({
   test: {
     environment: 'node',
     globals: true,
+    // The default combined run must also serialize shared-database tests.
+    ...(suite !== 'unit' ? { fileParallelism: false } : {}),
     reporters: ['verbose', 'junit'],
     outputFile: {
       junit: './test-results.xml'

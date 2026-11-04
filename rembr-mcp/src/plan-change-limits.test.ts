@@ -8,11 +8,9 @@
  * Prerequisites (per task spec):
  *   - tenant_plan_limits table exists         ✅ (migration 015)
  *   - Memory compaction feature               ⚠️  RAD-73 (pending) — stubbed here
- *   - Stripe test mode configured             ⚠️  Stripe billing integration tests at bottom
  *
  * Test strategy:
  *   Unit/integration tests use Pool mocks so no real DB is needed.
- *   Stripe billing tests are tagged @stripe and skipped unless STRIPE_SECRET_KEY is set.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -406,39 +404,5 @@ describe('Edge cases', () => {
     const svc = new PlanEnforcementService(pool);
     const result = await svc.applyPlanChange(TENANT, 'free');
     expect(result.compactionNeeded).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Stripe billing integration (skipped unless STRIPE_SECRET_KEY set)
-// ---------------------------------------------------------------------------
-
-const HAS_STRIPE = !!process.env.STRIPE_SECRET_KEY;
-
-describe.skipIf(!HAS_STRIPE)('Stripe billing integration @stripe', () => {
-  // These require a real Stripe test key and a running staging environment.
-  // Run with: STRIPE_SECRET_KEY=sk_test_... vitest run plan-change-limits.test.ts
-
-  it('Upgrade via Stripe checkout → plan change propagates', async () => {
-    // 1. Create Stripe checkout session with pro price
-    // 2. Complete with test card 4242424242424242
-    // 3. Verify POST /api/billing/sync-subscription updates tenant_plan_limits
-    // Placeholder — implement when staging Stripe test mode is confirmed ready
-    expect(true).toBe(true);
-  });
-
-  it('Downgrade via Stripe portal → limits enforced', async () => {
-    // 1. Open billing portal session
-    // 2. Downgrade subscription
-    // 3. Verify webhook triggers plan change
-    // 4. Verify memory count enforcement
-    expect(true).toBe(true);
-  });
-
-  it('Failed payment (card 4000000000000002) → grace period active', async () => {
-    // 1. Attempt checkout with declined card
-    // 2. Verify subscription status is past_due (not cancelled)
-    // 3. Verify limits are not immediately reduced (grace period)
-    expect(true).toBe(true);
   });
 });

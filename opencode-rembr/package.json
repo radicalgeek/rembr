@@ -25,7 +25,7 @@
   "author": "Mark @ radicalgeek",
   "license": "MIT",
   "dependencies": {
-    "@opencode-ai/plugin": "^1.16.2"
+    "@opencode-ai/plugin": "^1.19.5"
   },
   "peerDependencies": {
     "@opencode/plugin": "^2.0.29"
@@ -39,6 +39,13 @@
     "@opencode/plugin": "2.0.29",
     "@types/node": "^24.2.0",
     "typescript": "^5.9.3",
-    "vitest": "^1.6.1"
+    "vitest": "^5.1.0"
+  },
+  "overrides": {
+    "glob": "^14.0.3",
+    "minimatch": "^11.0.4",
+    "zod": "^4.6.6",
+    "undici": "^8.12.3",
+    "toml": "^5.0.1"
   }
 }

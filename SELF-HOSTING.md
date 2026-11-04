@@ -276,3 +276,23 @@ database credential.
   private deployment; the default is `false`.
 - Back up the `rembr-pgdata` volume; memories, contexts, and snapshots all live in
   PostgreSQL.
+
+### OSS test and dependency checks
+
+Use Node.js 22.12+ or 24 for the development test runner. In `rembr-mcp`,
+`npm run test:unit` runs without external services. `npm run test:integration`
+requires a disposable PostgreSQL database with pgvector and a database owner
+account that can create the isolated test databases and the `rembr_app` role:
+
+```sh
+TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/rembr_test npm run test:integration
+```
+
+Use a dedicated test PostgreSQL instance. The tests create their own fixtures
+and schemas; the runtime workflow suites initialise separate `rembr_test_*`
+databases from the OSS schema and migrations. Model responses are deterministic
+test doubles, so no model endpoint, Stripe account or paid API key is required.
+`npm test` runs both suites sequentially. CI runs both suites and audits all
+production and development dependencies with `npm audit --audit-level=moderate`.
+The server tool partition checks run in the unit suite; causal, temporal and
+operational audit workflows run directly against PostgreSQL.

@@ -5,11 +5,11 @@ import { Ollama } from 'ollama';
 // Mock Ollama module
 vi.mock('ollama', () => {
   return {
-    Ollama: vi.fn().mockImplementation(() => ({
+    Ollama: vi.fn().mockImplementation(function () { return ({
       embeddings: vi.fn(),
       generate: vi.fn(),
       list: vi.fn()
-    }))
+    }); })
   };
 });
 

@@ -55,6 +55,7 @@ var RembrError = class extends Error {
     this.status = status;
     this.name = "RembrError";
   }
+  status;
 };
 function parseSseBody(body) {
   const messages = [];

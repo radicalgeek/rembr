@@ -17,6 +17,18 @@ env:
 jobs:
   mcp:
     runs-on: ubuntu-24.04-arm
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17@sha256:7d0a41464797aeb9862dfdc0bbf1526b82cfd324cdd8036df19e3545f4a9ccb8
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: rembr_test
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rembr_test"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/rembr_test
     defaults:
       run:
         working-directory: rembr-mcp
@@ -30,7 +42,10 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run test:unit
-      - run: npm audit --omit=dev --audit-level=moderate
+      - run: node ../scripts/check-test-results.mjs test-results.xml
+      - run: npm run test:integration
+      - run: node ../scripts/check-test-results.mjs test-results.xml
+      - run: npm audit --audit-level=moderate
 
   console:
     runs-on: ubuntu-24.04-arm
@@ -46,7 +61,7 @@ jobs:
           cache-dependency-path: rembr-console/package-lock.json
       - run: npm ci
       - run: npm test
-      - run: npm audit --omit=dev --audit-level=moderate
+      - run: npm audit --audit-level=moderate
 
   vscode:
     runs-on: ubuntu-24.04-arm
@@ -61,7 +76,7 @@ jobs:
           cache: npm
           cache-dependency-path: rembr-vscode/package-lock.json
       - run: npm ci --ignore-scripts
-      - run: npm audit --omit=dev --audit-level=moderate
+      - run: npm audit --audit-level=moderate
 
   integrations:
     runs-on: ubuntu-24.04-arm
@@ -83,7 +98,7 @@ jobs:
             npm --prefix "$component" ci
             npm --prefix "$component" test
             npm --prefix "$component" run --if-present build
-            npm --prefix "$component" audit --omit=dev --audit-level=moderate
+            npm --prefix "$component" audit --audit-level=moderate
           done
 
   compose:
