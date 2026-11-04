@@ -86,6 +86,28 @@ describe("extractLines", () => {
   })
 })
 
+describe("private spans in tool parts", () => {
+  const toolMessage = (input: unknown, output: unknown): SessionMessage[] => [
+    { info: { role: "assistant" }, parts: [{ type: "tool", tool: "fixture_tool", state: { input, output } }] },
+  ]
+
+  it("strips private spans from nested tool inputs", () => {
+    const lines = extractLines(toolMessage({ query: { text: "find <private>fixture-secret</private> now" }, list: ["<private>x</private>ok"] }, ""))
+    expect(lines.join("\n")).not.toContain("fixture-secret")
+    expect(lines.join("\n")).toContain("ok")
+  })
+
+  it("strips before truncating so a long span cannot lose its closing tag", () => {
+    const output = `${"a".repeat(250)}<private>${"fixture-secret ".repeat(20)}</private>tail`
+    const lines = extractLines(toolMessage({}, output))
+    expect(lines.join("\n")).not.toContain("fixture-secret")
+  })
+
+  it("drops an unclosed private span to the end", () => {
+    expect(stripPrivate("keep <private>fixture-secret")).toBe("keep ")
+  })
+})
+
 describe("stripPrivate / looksLikeSecret", () => {
   it("removes private spans", () => {
     expect(stripPrivate("a <private>hidden</private> b")).toBe("a  b")

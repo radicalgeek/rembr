@@ -840,6 +840,7 @@ Do these statements contradict each other? Analyze carefully.`;
         FROM memories m
         LEFT JOIN projects p ON p.id = m.project_id AND p.tenant_id = m.tenant_id
         WHERE m.tenant_id = $1 AND m.id = ANY($2::uuid[])
+          AND ($6::uuid IS NULL OR m.project_id = $6::uuid)
           AND (
             (COALESCE(m.visibility, 'shared') = 'personal' AND m.user_id = $3::uuid)
             OR (COALESCE(m.visibility, 'shared') = 'shared' AND m.project_id IS NULL)
@@ -854,7 +855,14 @@ Do these statements contradict each other? Analyze carefully.`;
         ORDER BY m.created_at ASC
         LIMIT $5::integer
       `;
-      params = [tenantId, memoryIds.slice(0, safeLimit), userId || null, safeContentLimit, safeLimit];
+      params = [
+        tenantId,
+        memoryIds.slice(0, safeLimit),
+        userId || null,
+        safeContentLimit,
+        safeLimit,
+        projectId || null,
+      ];
     } else if (contextId) {
       query = `
         SELECT m.id, LEFT(m.content, $5::integer) AS content, m.category,

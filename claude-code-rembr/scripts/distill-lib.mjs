@@ -305,18 +305,19 @@ export function runDistiller(config, digest) {
     child.stderr.on("data", (d) => (stderr += d))
     child.on("close", (code) => {
       clearTimeout(timer)
+      // Output can echo transcript content, so log sizes rather than text.
       if (code !== 0) {
-        return finish(null, `distiller exited ${code}: ${stderr.trim().slice(0, 300)}`)
+        return finish(null, `distiller exited ${code}: ${stderr.length} chars of stderr`)
       }
       let wrapper
       try {
         wrapper = JSON.parse(stdout)
       } catch {
-        return finish(null, `distiller output not JSON: ${stdout.trim().slice(0, 200)}`)
+        return finish(null, `distiller output not JSON: ${stdout.length} chars`)
       }
       const memories = parseDistillerOutput(wrapper?.result)
       if (memories === null) {
-        return finish(null, `distiller result unusable: ${String(wrapper?.result).slice(0, 200)}`)
+        return finish(null, `distiller result unusable: ${String(wrapper?.result ?? "").length} chars`)
       }
       finish(memories)
     })
@@ -416,15 +417,18 @@ export async function distillTranscript(config, rembrConfig, transcriptPath, ses
   const directory = extractCwd(records)
 
   let failed = false
+  let skippedSecrets = 0
   for (const mem of memories) {
     if (looksLikeSecret(mem.content)) {
-      log(config, `skipped-secret-shape: ${mem.content.slice(0, 80)}`)
+      skippedSecrets++
       continue
     }
     const status = await postMemory(rembrConfig, mem, sessionId, directory)
     log(config, `${status}: ${mem.content.slice(0, 120)}`)
     if (status === "failed") failed = true
   }
+  // Never log rejected content: the filter rejected it because it may be a secret.
+  if (skippedSecrets) log(config, `skipped-secret-shape: ${skippedSecrets} memories, session ${sessionId}`)
   if (failed) {
     log(config, `partial failure, cursor kept at ${cursor}, session ${sessionId}`)
     return

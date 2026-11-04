@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
-import { mkdtempSync } from "node:fs"
+import { mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import RembrPluginDefault, { RembrPlugin } from "./index.js"
@@ -784,13 +784,51 @@ describe("RembrPlugin", () => {
 
       expect(client.session.create).toHaveBeenCalled()
       expect(client.session.prompt).toHaveBeenCalledWith(
-        expect.objectContaining({ path: { id: "ses_side" } }),
+        expect.objectContaining({
+          path: { id: "ses_side" },
+          body: expect.objectContaining({ tools: { "*": false } }),
+        }),
       )
       expect(client.session.delete).toHaveBeenCalled()
       const body = lastMcpBody(vi.mocked(fetch))
       expect(body.params.arguments.content).toBe("Team prefers pnpm")
       expect(body.params.arguments.category).toBe("preferences")
       expect(body.params.arguments.metadata.distilled).toBe(true)
+    })
+
+    it("logs only a count for secret-shaped memories, never their content", async () => {
+      vi.stubEnv("REMBR_DISTILL", "true")
+      const stateDir = mkdtempSync(join(tmpdir(), "rembr-idx-"))
+      vi.stubEnv("REMBR_STATE_DIR", stateDir)
+      const client = makeDistillClient('{"memories": [{"content": "password=fixture-secret-value", "category": "facts"}]}')
+      const hooks = await RembrPlugin(makeInput(client as never), PLUGIN_OPTIONS)
+
+      await hooks.event!({ event: idleEvent as never })
+
+      const log = readFileSync(join(stateDir, "capture.log"), "utf8")
+      expect(log).toContain("skipped-secret-shape: 1 memories")
+      expect(log).not.toContain("fixture-secret-value")
+    })
+
+    it("discards a side-session reply that contains a tool call", async () => {
+      vi.stubEnv("REMBR_DISTILL", "true")
+      vi.stubEnv("REMBR_STATE_DIR", mkdtempSync(join(tmpdir(), "rembr-idx-")))
+      const client = makeDistillClient('{"memories": [{"content": "Fixture fact", "category": "facts"}]}')
+      client.session.prompt.mockResolvedValue({
+        data: {
+          info: { role: "assistant" },
+          parts: [
+            { type: "tool", text: undefined },
+            { type: "text", text: '{"memories": [{"content": "Fixture fact", "category": "facts"}]}' },
+          ],
+        },
+      })
+      const hooks = await RembrPlugin(makeInput(client as never), PLUGIN_OPTIONS)
+
+      await hooks.event!({ event: idleEvent as never })
+
+      expect(client.session.delete).toHaveBeenCalled()
+      expect(lastMcpBody(vi.mocked(fetch))?.params?.arguments?.content).not.toBe("Fixture fact")
     })
 
     it("polls for the assistant when prompt returns the user message", async () => {

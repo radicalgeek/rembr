@@ -240,13 +240,94 @@ export function writeCursor(config: DistillConfig, sessionId: string, value: num
   }
 }
 
+// Codex features that expose tools to the model. The transcript digest is
+// untrusted input, so extraction must not be able to run anything.
+const TOOL_FEATURES = [
+  "shell_tool",
+  "unified_exec",
+  "code_mode_host",
+  "apps",
+  "plugins",
+  "multi_agent",
+  "multi_agent_v2",
+  "browser_use",
+  "computer_use",
+  "image_generation",
+  "view_image",
+  "hooks",
+  "tool_suggest",
+  "sleep_tool",
+  "skill_mcp_dependency_install",
+  "goals",
+]
+
+// JSONL item types that report a tool call. Seeing one means isolation failed,
+// so the whole result is discarded.
+const TOOL_ITEM_TYPES = new Set([
+  "command_execution",
+  "mcp_tool_call",
+  "collab_tool_call",
+  "web_search",
+  "file_change",
+  "todo_list",
+])
+
+export function distillerArgs(config: DistillConfig, workDir: string): string[] {
+  // --skip-git-repo-check: the distiller runs from arbitrary directories.
+  // --ephemeral: do not persist a rollout for the throwaway distillation session.
+  // --ignore-user-config drops user MCP servers, plugins and hooks (auth still
+  // loads); an empty working root keeps project config and files out of reach.
+  // Trade-off: a custom model_provider in config.toml is dropped too, so the
+  // distiller uses Codex's default provider with REMBR_DISTILL_MODEL if set.
+  const args = [
+    "exec",
+    "--json",
+    "--skip-git-repo-check",
+    "--ephemeral",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--sandbox",
+    "read-only",
+    "--cd",
+    workDir,
+    "-c",
+    'web_search="disabled"',
+    // Feature flags alone leave the model's default sub-agent tools in place;
+    // agents.enabled=false forces multi-agent off regardless of model.
+    "-c",
+    "agents.enabled=false",
+  ]
+  for (const feature of TOOL_FEATURES) args.push("--disable", feature)
+  if (config.model) args.push("--model", config.model)
+  return args
+}
+
+export function reportsToolUse(stdout: string): boolean {
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    try {
+      const event = JSON.parse(trimmed) as { item?: { type?: unknown } }
+      if (typeof event.item?.type === "string" && TOOL_ITEM_TYPES.has(event.item.type)) return true
+    } catch {
+      // Non-JSON lines are not Codex JSON events.
+    }
+  }
+  return false
+}
+
 export function runDistiller(config: DistillConfig, digest: string): Promise<DistilledMemory[] | null> {
   return new Promise((resolve) => {
-    // --skip-git-repo-check: the distiller runs from arbitrary directories.
-    // --ephemeral: do not persist a rollout for the throwaway distillation session.
-    const args = ["exec", "--json", "--skip-git-repo-check", "--ephemeral"]
-    if (config.model) args.push("--model", config.model)
-    const child = spawn("codex", args, {
+    let workDir: string
+    try {
+      workDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-rembr-distill-"))
+    } catch (error) {
+      logLine(config, `distiller workdir failed: ${error instanceof Error ? error.message : String(error)}`)
+      resolve(null)
+      return
+    }
+    const child = spawn("codex", distillerArgs(config, workDir), {
+      cwd: workDir,
       shell: process.platform === "win32",
       env: { ...process.env, REMBR_CAPTURE_DISABLE: "1" },
       stdio: ["pipe", "pipe", "pipe"],
@@ -257,6 +338,11 @@ export function runDistiller(config: DistillConfig, digest: string): Promise<Dis
     const finish = (value: DistilledMemory[] | null, note?: string) => {
       if (settled) return
       settled = true
+      try {
+        fs.rmSync(workDir, { recursive: true, force: true })
+      } catch {
+        // A leftover empty temp directory is harmless.
+      }
       if (note) logLine(config, note)
       resolve(value)
     }
@@ -272,10 +358,12 @@ export function runDistiller(config: DistillConfig, digest: string): Promise<Dis
     child.stderr.on("data", (data) => (stderr += data))
     child.on("close", (code) => {
       clearTimeout(timer)
-      if (code !== 0) return finish(null, `distiller exited ${code}: ${stderr.trim().slice(0, 300)}`)
+      // Output can echo transcript content, so log sizes rather than text.
+      if (code !== 0) return finish(null, `distiller exited ${code}: ${stderr.length} chars of stderr`)
+      if (reportsToolUse(stdout)) return finish(null, "distiller attempted a tool call; result discarded")
       const memories = parseDistillerOutput(stdout)
       if (memories === null) {
-        return finish(null, `distiller result unusable: ${stdout.trim().slice(0, 200)}`)
+        return finish(null, `distiller result unusable: ${stdout.length} chars`)
       }
       finish(memories)
     })
@@ -347,9 +435,10 @@ export async function distillTranscript(
   if (memories === null) return false
 
   let failed = false
+  let skippedSecrets = 0
   for (const memory of memories) {
     if (looksLikeSecret(memory.content)) {
-      logLine(config, `skipped-secret-shape: ${memory.content.slice(0, 80)}`)
+      skippedSecrets++
       continue
     }
     try {
@@ -371,6 +460,8 @@ export async function distillTranscript(
       logLine(config, `store failed: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
+  // Never log rejected content: the filter rejected it because it may be a secret.
+  if (skippedSecrets) logLine(config, `skipped-secret-shape: ${skippedSecrets} memories, session ${sessionId}`)
   if (failed) {
     logLine(config, `partial failure, cursor kept at ${cursor}, session ${sessionId}`)
     return false

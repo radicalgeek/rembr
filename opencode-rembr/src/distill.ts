@@ -87,7 +87,18 @@ export function logLine(config: DistillConfig, msg: string): void {
 }
 
 export function stripPrivate(text: string): string {
-  return text.replace(/<private>[\s\S]*?<\/private>/gi, "")
+  // An unclosed span runs to the end: never let a missing tag expose content.
+  return text.replace(/<private>[\s\S]*?(?:<\/private>|$)/gi, "")
+}
+
+/** Strip private spans from every string inside a tool input or output. */
+export function stripPrivateDeep(value: unknown, depth = 0): unknown {
+  if (typeof value === "string") return stripPrivate(value)
+  if (depth > 20 || value === null || typeof value !== "object") return value
+  if (Array.isArray(value)) return value.map((item) => stripPrivateDeep(item, depth + 1))
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, stripPrivateDeep(item, depth + 1)]),
+  )
 }
 
 export function looksLikeSecret(text: string): boolean {
@@ -137,9 +148,10 @@ export function extractLines(messages: SessionMessage[]): string[] {
         const text = stripPrivate(part.text).trim()
         if (text) lines.push(`${role}: ${text}`)
       } else if (part.type === "tool") {
-        const input = summarizeValue(part.state?.input, 200)
+        // Strip before truncating: a cut can remove the closing tag.
+        const input = summarizeValue(stripPrivateDeep(part.state?.input), 200)
         lines.push(`TOOL CALL ${part.tool ?? "?"}: ${input}`)
-        const output = stripPrivate(summarizeValue(part.state?.output, 300))
+        const output = summarizeValue(stripPrivateDeep(part.state?.output), 300)
         if (output) lines.push(`TOOL RESULT: ${output}`)
       }
       // reasoning/file/agent parts deliberately skipped

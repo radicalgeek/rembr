@@ -70,7 +70,7 @@ describe('AdvancedAnalyticsService context graph', () => {
 
     expect(query).toHaveBeenCalledWith(
       expect.stringContaining('id = ANY($2::uuid[])'),
-      ['tenant-1', memoryIds, null, 2048, 100],
+      ['tenant-1', memoryIds, null, 2048, 100, null],
       'tenant-1'
     );
     expect(getEmbeddingSimilarityEdges).toHaveBeenCalledWith('tenant-1', memoryIds, 0.68);
@@ -82,5 +82,19 @@ describe('AdvancedAnalyticsService context graph', () => {
       label: 'strong'
     }]);
     expect(graph.nodes.map(node => node.category)).toEqual(['facts', 'goals']);
+  });
+
+  it('keeps the credential project boundary when explicit memory ids are requested', async () => {
+    const memoryIds = ['a5d8463a-7e30-423d-8fc3-aede3d8ffd0c'];
+    const projectId = 'c5d8463a-7e30-423d-8fc3-aede3d8ffd0c';
+    const query = vi.fn(async () => ({ rows: [] }));
+    const getEmbeddingSimilarityEdges = vi.fn(async () => []);
+    const service = new AdvancedAnalyticsService({ query, getEmbeddingSimilarityEdges } as any, {} as any);
+
+    await service.generateContextGraph('tenant-1', undefined, true, projectId, undefined, 0.68, memoryIds);
+
+    const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
+    expect(sql).toContain('($6::uuid IS NULL OR m.project_id = $6::uuid)');
+    expect(params[5]).toBe(projectId);
   });
 });

@@ -380,11 +380,79 @@ function writeCursor(config, sessionId, value) {
     return false;
   }
 }
+var TOOL_FEATURES = [
+  "shell_tool",
+  "unified_exec",
+  "code_mode_host",
+  "apps",
+  "plugins",
+  "multi_agent",
+  "multi_agent_v2",
+  "browser_use",
+  "computer_use",
+  "image_generation",
+  "view_image",
+  "hooks",
+  "tool_suggest",
+  "sleep_tool",
+  "skill_mcp_dependency_install",
+  "goals"
+];
+var TOOL_ITEM_TYPES = /* @__PURE__ */ new Set([
+  "command_execution",
+  "mcp_tool_call",
+  "collab_tool_call",
+  "web_search",
+  "file_change",
+  "todo_list"
+]);
+function distillerArgs(config, workDir) {
+  const args = [
+    "exec",
+    "--json",
+    "--skip-git-repo-check",
+    "--ephemeral",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--sandbox",
+    "read-only",
+    "--cd",
+    workDir,
+    "-c",
+    'web_search="disabled"',
+    // Feature flags alone leave the model's default sub-agent tools in place;
+    // agents.enabled=false forces multi-agent off regardless of model.
+    "-c",
+    "agents.enabled=false"
+  ];
+  for (const feature of TOOL_FEATURES) args.push("--disable", feature);
+  if (config.model) args.push("--model", config.model);
+  return args;
+}
+function reportsToolUse(stdout) {
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const event = JSON.parse(trimmed);
+      if (typeof event.item?.type === "string" && TOOL_ITEM_TYPES.has(event.item.type)) return true;
+    } catch {
+    }
+  }
+  return false;
+}
 function runDistiller(config, digest) {
   return new Promise((resolve) => {
-    const args = ["exec", "--json", "--skip-git-repo-check", "--ephemeral"];
-    if (config.model) args.push("--model", config.model);
-    const child = spawn("codex", args, {
+    let workDir;
+    try {
+      workDir = fs2.mkdtempSync(path2.join(os2.tmpdir(), "codex-rembr-distill-"));
+    } catch (error) {
+      logLine(config, `distiller workdir failed: ${error instanceof Error ? error.message : String(error)}`);
+      resolve(null);
+      return;
+    }
+    const child = spawn("codex", distillerArgs(config, workDir), {
+      cwd: workDir,
       shell: process.platform === "win32",
       env: { ...process.env, REMBR_CAPTURE_DISABLE: "1" },
       stdio: ["pipe", "pipe", "pipe"]
@@ -395,6 +463,10 @@ function runDistiller(config, digest) {
     const finish = (value, note) => {
       if (settled) return;
       settled = true;
+      try {
+        fs2.rmSync(workDir, { recursive: true, force: true });
+      } catch {
+      }
       if (note) logLine(config, note);
       resolve(value);
     };
@@ -410,10 +482,11 @@ function runDistiller(config, digest) {
     child.stderr.on("data", (data) => stderr += data);
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (code !== 0) return finish(null, `distiller exited ${code}: ${stderr.trim().slice(0, 300)}`);
+      if (code !== 0) return finish(null, `distiller exited ${code}: ${stderr.length} chars of stderr`);
+      if (reportsToolUse(stdout)) return finish(null, "distiller attempted a tool call; result discarded");
       const memories = parseDistillerOutput(stdout);
       if (memories === null) {
-        return finish(null, `distiller result unusable: ${stdout.trim().slice(0, 200)}`);
+        return finish(null, `distiller result unusable: ${stdout.length} chars`);
       }
       finish(memories);
     });
@@ -470,9 +543,10 @@ async function distillTranscript(config, rembrConfig, transcriptPath, client = n
   const memories = await runDistiller(config, buildDigest(lines));
   if (memories === null) return false;
   let failed = false;
+  let skippedSecrets = 0;
   for (const memory of memories) {
     if (looksLikeSecret(memory.content)) {
-      logLine(config, `skipped-secret-shape: ${memory.content.slice(0, 80)}`);
+      skippedSecrets++;
       continue;
     }
     try {
@@ -494,6 +568,7 @@ async function distillTranscript(config, rembrConfig, transcriptPath, client = n
       logLine(config, `store failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  if (skippedSecrets) logLine(config, `skipped-secret-shape: ${skippedSecrets} memories, session ${sessionId}`);
   if (failed) {
     logLine(config, `partial failure, cursor kept at ${cursor}, session ${sessionId}`);
     return false;

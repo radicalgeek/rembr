@@ -519,14 +519,16 @@ export function createRembrCore(host: RembrHost) {
 
     const memories = parseDistillerOutput(reply)
     if (memories === null) {
-      logLine(distillConfig, `distiller result unusable: ${String(reply).slice(0, 200)}`)
+      // The raw reply can carry secret-shaped content, so log only its size.
+      logLine(distillConfig, `distiller result unusable: ${String(reply).length} chars`)
       return
     }
 
     let failed = false
+    let skippedSecrets = 0
     for (const memory of memories) {
       if (looksLikeSecret(memory.content)) {
-        logLine(distillConfig, `skipped-secret-shape: ${memory.content.slice(0, 80)}`)
+        skippedSecrets++
         continue
       }
       try {
@@ -543,6 +545,8 @@ export function createRembrCore(host: RembrHost) {
         logLine(distillConfig, `store failed: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
+    // Never log rejected content: the filter rejected it because it may be a secret.
+    if (skippedSecrets) logLine(distillConfig, `skipped-secret-shape: ${skippedSecrets} memories, session ${sessionID}`)
     if (failed) {
       logLine(distillConfig, `partial failure, cursor kept at ${cursor}, session ${sessionID}`)
       return
@@ -770,17 +774,26 @@ export const RembrPlugin: Plugin = async ({ client, directory, worktree }, optio
       sideSessions.add(sideID)
 
       try {
-        const textFromParts = (parts: Array<{ type?: string; text?: string }> | undefined) =>
-          (parts ?? [])
+        const textFromParts = (parts: Array<{ type?: string; text?: string }> | undefined) => {
+          // The digest is untrusted transcript content. Tools are denied below;
+          // if a tool part still appears, isolation failed and the reply is unusable.
+          if ((parts ?? []).some((part) => part.type === "tool")) {
+            throw new Error("distiller attempted a tool call; result discarded")
+          }
+          return (parts ?? [])
             .filter((part) => part.type === "text" && typeof part.text === "string")
             .map((part) => part.text)
             .join("\n")
+        }
         const deadline = Date.now() + timeoutMs
 
         const response = (await client.session.prompt({
           path: { id: sideID },
           body: {
             ...(modelRef ? { model: modelRef } : {}),
+            // v1 turns this map into session permission rules matched by
+            // wildcard, so "*" denies every built-in and MCP tool.
+            tools: { "*": false },
             parts: [{ type: "text", text: prompt }],
           },
         })) as {
